@@ -18,6 +18,7 @@ therefore needs no CUDA toolkit at runtime, only the driver and cuBLAS runtime l
 | Warp-per-query causal GQA | full-attention fallback (`--legacy-attention`) |
 | Block-per-query causal GQA | original kernel, compiled for A/B only |
 | GDN conv / prepare / rule | gated delta-network linear-attention layers |
+| GDN recurrent (split-dk) | four lanes per value column, f32 state in shared memory; 3.9x faster than the shared-state kernel |
 | SiLU × gate | MLP activation |
 | Add | residual connections |
 | Dequant W4A16 | expand packed `int4` to a BF16 workspace for cuBLAS |
@@ -55,28 +56,30 @@ the reference GPTQ-Marlin repack / scale / zero-point permutations bit-exactly f
 |---|---|---|---|
 | 36 tokens | 174.7 ms | 84.8 ms | **45.1 ms** (3.87x) |
 | 76 tokens | 202.2 ms | 126.4 ms | **73.0 ms** (2.77x) |
-| 1024 tokens | 1261.2 ms | 1261.2 ms | **1144.9 ms** (1.10x) |
+| 1024 tokens | 1261.2 ms | 1261.2 ms | **486.1 ms** (2.59x) |
 
 Marlin resident weights use **13.1 GiB**; preload/repack takes **10.1 s**. Tiled FA2
-attention makes long context **GEMM-bound** at ~0.96 ms/token:
+attention plus split-dk GDN makes long context **GEMM-bound** at ~0.49-0.55 ms/token:
 
-| tokens | full forward (tiled FA2) | previous warp | peak GPU mem |
+| tokens | full forward (tiled FA2 + split GDN) | previous warp | peak GPU mem |
 |---|---|---|---|
-| 4K | **3.99-4.04 s** | 4.65 s | ~17.2 GiB |
-| 8K | **7.95-8.05 s** | 9.88 s | ~17.6 GiB |
-| 16K | **16.10-16.32 s** | 22.88 s | 18.86 GiB |
+| 1K | **0.486 s** | 0.959 s | 13.1 GiB resident |
+| 4K | **2.12-2.18 s** | 4.65 s | ~17.2 GiB |
+| 8K | **4.23-4.32 s** | 9.88 s | ~17.6 GiB |
+| 16K | **8.62-8.85 s** | 22.88 s | 18.86 GiB |
 
 The attention kernel itself is 7-12x faster than warp on identical buffers (kernel-only
-1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms). The remaining 4K/8K/16K time is large-M W4A16 GEMM;
-reaching <2 s at 4K requires a faster large-M path, not faster attention.
+1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms). The split-dk GDN recurrence is 3.9x faster on its
+hot kernel (1K per-layer 13.35 -> 3.41 ms; 1K forward 958 -> 486 ms). Remaining time is
+dominated by W4A16 GEMMs; attention is <1% at 1K and still small at 16K.
 
-Long-context correctness against CPU AWQ/SDPA probes (Marlin + tiled FA2):
+Long-context correctness against CPU AWQ/SDPA probes (Marlin + tiled FA2 + split GDN):
 
 | probe | final rel_rms | cosine | two-way prob delta | top-1 |
 |---|---|---|---|---|
-| 4K | 0.783% | 0.999970 | 1.7e-4 | true |
-| 8K | 0.805% | 0.999967 | 1.5e-4 | true |
-| 16K | 0.731% | 0.999974 | 5.6e-4 | true |
+| 4K | 0.808% | 0.999967 | 3.5e-4 | true |
+| 8K | 0.795% | 0.999968 | 3.0e-4 | true |
+| 16K | 0.692% | 0.999976 | 6.7e-4 | true |
 
 All 10 long-context suite cases are correct.
 

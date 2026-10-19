@@ -44,9 +44,10 @@ Runtime:
   loader path.
 - RTX 4090 / sm_89.
 - ~13.1 GiB free VRAM for Marlin's resident repacked weights plus workspace; long context
-  with tiled FA2 peaks at ~18.86 GiB at 16K.
-- Marlin + tiled FA2 full-forward latency: 4K **3.99-4.04 s**, 8K **7.95-8.05 s**,
-  16K **16.10-16.32 s**. These are GEMM-bound (~0.96 ms/token), not attention-bound.
+  with tiled FA2 peaks at **18.86 GiB** at 16K.
+- Marlin + tiled FA2 + split GDN full-forward latency: 1K **486 ms**, 4K
+  **2.12-2.18 s**, 8K **4.23-4.32 s**, 16K **8.62-8.85 s**. These are GEMM-bound
+  (~0.49-0.55 ms/token); a 16,444-token `/v1/decide` completed in 8.65 s.
 
 `curl` is used by the health check and smoke script. `python3` is optional and only used
 by the development evaluation tooling.
