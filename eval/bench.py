@@ -10,6 +10,12 @@ Every concurrency level gets freshly generated prompts (the tag includes the
 level).  Requests are therefore unique across the whole run, at the cost of a
 cold prefix cache for every level.  Use ``--reuse-short-prompts`` only when you
 explicitly want to measure a warm/shared-prefix case.
+
+Batch mode is the batching/scheduler sweep: each concurrency level sends a
+fixed number of unique decision prompts of approximately ``--batch-tokens``
+tokens (default 69).  When the server exposes ``/metrics``, the result also
+records the ``jev_native_batch_size`` histogram and the
+``jev_native_batch_queue_depth`` gauge (sampled during the level).
 """
 from __future__ import annotations
 
@@ -21,6 +27,8 @@ import os
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -135,6 +143,197 @@ def long_spec(
     }
 
 
+def batch_spec(
+    row: Mapping[str, Any],
+    *,
+    tag: str,
+    target_tokens: int,
+    model: str | None,
+    seed: int,
+    chars_per_token: float,
+) -> dict[str, Any]:
+    """A unique decision request padded to approximately ``target_tokens``.
+
+    The row supplies the decision kind/options so the batch sweep still covers
+    noul/score/choice; the tag makes every prompt unique so the measurement
+    cannot degrade into a prefix-cache test.
+    """
+    kind, state, question, options = row_request(row)
+    state = f"[batch probe {tag}]\n{state}"
+    filler = unique_document(tag, max(4, target_tokens), chars_per_token, seed)
+    position = 0
+    for _ in range(8):
+        text = build_decision_text(kind, state, question, options)
+        missing = target_tokens - estimate_tokens(text, chars_per_token)
+        if missing <= 0:
+            break
+        needed = max(1, int(missing * chars_per_token))
+        if position + needed > len(filler):
+            filler = unique_document(
+                f"{tag}-pad-{_}", max(4, target_tokens), chars_per_token, seed
+            )
+            position = 0
+        state += " " + filler[position : position + needed]
+        position += needed
+    body = build_payload(kind, state, question, options, model=model)
+    text = build_decision_text(kind, state, question, options)
+    return {
+        "kind": kind,
+        "state": state,
+        "question": question,
+        "options": options,
+        "payload": body,
+        "estimated_prompt_tokens": estimate_tokens(text, chars_per_token),
+        "target_tokens": target_tokens,
+    }
+
+
+def select_batch_rows(
+    rows: Sequence[Mapping[str, Any]],
+    *,
+    target_tokens: int,
+    chars_per_token: float,
+) -> list[Mapping[str, Any]]:
+    """Rows whose base prompt leaves room for the batch padding budget."""
+    eligible: list[Mapping[str, Any]] = []
+    for row in rows:
+        kind, state, question, options = row_request(row)
+        text = build_decision_text(kind, state, question, options)
+        if estimate_tokens(text, chars_per_token) <= target_tokens - 8:
+            eligible.append(row)
+    return eligible
+
+
+def scrape_metrics(base_url: str, timeout: float = 2.0) -> str | None:
+    """Return the Prometheus text exposition, or ``None`` when unavailable."""
+    try:
+        with urllib.request.urlopen(
+            f"{base_url.rstrip('/')}/metrics", timeout=timeout
+        ) as response:
+            if response.status != 200:
+                return None
+            return response.read().decode("utf-8", "replace")
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+
+
+def _prometheus_samples(text: str) -> dict[str, list[tuple[dict[str, str], float]]]:
+    samples: dict[str, list[tuple[dict[str, str], float]]] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            name_labels, value_text = line.rsplit(None, 1)
+            value = float(value_text)
+        except ValueError:
+            continue
+        name = name_labels
+        labels: dict[str, str] = {}
+        if "{" in name_labels:
+            name, tail = name_labels.split("{", 1)
+            label_text = tail.rsplit("}", 1)[0]
+            for part in label_text.split(","):
+                if "=" not in part:
+                    continue
+                key, label_value = part.split("=", 1)
+                labels[key.strip()] = label_value.strip().strip('"')
+        samples.setdefault(name, []).append((labels, value))
+    return samples
+
+
+def batch_metrics_snapshot(text: str | None) -> dict[str, Any] | None:
+    """Parse the batch-related Prometheus series from one scrape."""
+    if text is None:
+        return None
+    samples = _prometheus_samples(text)
+    buckets: dict[str, float] = {}
+    for labels, value in samples.get("jev_native_batch_size_bucket", []):
+        buckets[labels.get("le", "")] = buckets.get(labels.get("le", ""), 0.0) + value
+    count = sum(value for _, value in samples.get("jev_native_batch_size_count", []))
+    total = sum(value for _, value in samples.get("jev_native_batch_size_sum", []))
+    queue_values = [value for _, value in samples.get("jev_native_batch_queue_depth", [])]
+    batch_size = (
+        {"count": count, "sum": total, "buckets": buckets}
+        if samples.get("jev_native_batch_size_bucket")
+        or samples.get("jev_native_batch_size_count")
+        or samples.get("jev_native_batch_size_sum")
+        else None
+    )
+    queue_depth = max(queue_values) if queue_values else None
+    return {
+        "available": batch_size is not None or queue_depth is not None,
+        "batch_size": batch_size,
+        "queue_depth": queue_depth,
+    }
+
+
+def batch_metrics_delta(
+    before: dict[str, Any] | None,
+    after: dict[str, Any] | None,
+    *,
+    queue_depth_max: float | None,
+) -> dict[str, Any]:
+    """Per-level delta of the cumulative batch histogram plus gauge summary."""
+    if not after or not after.get("available"):
+        return {
+            "available": False,
+            "batch_size": None,
+            "queue_depth": None,
+            "queue_depth_max": queue_depth_max,
+        }
+    result: dict[str, Any] = {"available": True, "batch_size": None, "queue_depth": None}
+    current = after.get("batch_size")
+    previous = (before or {}).get("batch_size")
+    if current:
+        base = previous or {"count": 0.0, "sum": 0.0, "buckets": {}}
+        count = current["count"] - float(base.get("count", 0.0))
+        total = current["sum"] - float(base.get("sum", 0.0))
+        bucket_delta = {
+            key: value - float(base.get("buckets", {}).get(key, 0.0))
+            for key, value in current["buckets"].items()
+        }
+        result["batch_size"] = {
+            "count": count,
+            "sum": total,
+            "mean": total / count if count > 0 else None,
+            "buckets": bucket_delta,
+        }
+    if after.get("queue_depth") is not None or queue_depth_max is not None:
+        result["queue_depth"] = after.get("queue_depth")
+        result["queue_depth_max"] = queue_depth_max
+    return result
+
+
+class MetricsSampler(threading.Thread):
+    """Lightweight ``/metrics`` poller recording the peak queue depth."""
+
+    def __init__(self, base_url: str, interval: float = 0.2) -> None:
+        super().__init__(daemon=True)
+        self.base_url = base_url
+        self.interval = interval
+        self._stop = threading.Event()
+        self.queue_depth_max: float | None = None
+        self.scrapes = 0
+
+    def run(self) -> None:
+        while not self._stop.wait(self.interval):
+            snapshot = batch_metrics_snapshot(scrape_metrics(self.base_url))
+            if snapshot is None:
+                continue
+            self.scrapes += 1
+            value = snapshot.get("queue_depth")
+            if value is not None:
+                self.queue_depth_max = (
+                    value
+                    if self.queue_depth_max is None
+                    else max(self.queue_depth_max, value)
+                )
+
+    def stop(self) -> None:
+        self._stop.set()
+
+
 def run_warmup(
     url: str,
     specs: Sequence[Mapping[str, Any]],
@@ -177,8 +376,13 @@ def run_level(
     model: str | None,
     timeout: float,
     retries: int,
+    server_metrics: bool = False,
 ) -> dict[str, Any]:
     local = threading.local()
+    metrics_before = batch_metrics_snapshot(scrape_metrics(url)) if server_metrics else None
+    sampler = MetricsSampler(url) if server_metrics else None
+    if sampler is not None:
+        sampler.start()
 
     def init_local() -> None:
         local.client = DecideClient(
@@ -229,6 +433,10 @@ def run_level(
         futures = [executor.submit(one, spec) for spec in specs]
         results = [future.result() for future in futures]
     wall_s = time.perf_counter() - wall_started
+    if sampler is not None:
+        sampler.stop()
+        sampler.join(timeout=2.0)
+    metrics_after = batch_metrics_snapshot(scrape_metrics(url)) if server_metrics else None
 
     successes = [result for result in results if result["ok"]]
     errors = [result for result in results if not result["ok"]]
@@ -264,6 +472,15 @@ def run_level(
             "per_s": completion_tokens / wall_s if wall_s > 0 else None,
         },
         "error_samples": [result.get("error") for result in errors[:5]],
+        "server_metrics": (
+            batch_metrics_delta(
+                metrics_before,
+                metrics_after,
+                queue_depth_max=sampler.queue_depth_max if sampler else None,
+            )
+            if server_metrics
+            else None
+        ),
     }
 
 
@@ -278,11 +495,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default=os.environ.get("JEV_DECIDE_URL", "http://127.0.0.1:8501"))
     parser.add_argument("--model", default=None)
-    parser.add_argument("--mode", choices=["short", "long", "both"], default="short")
+    parser.add_argument(
+        "--mode", choices=["short", "long", "both", "batch"], default="short"
+    )
     parser.add_argument("--concurrency", default="1,4,8,12,16,32")
     parser.add_argument("--requests", type=int, default=64, help="requests per short level")
     parser.add_argument("--long-requests", type=int, default=12, help="requests per long level")
     parser.add_argument("--long-sizes", default="3000,9000", help="target prompt tokens")
+    parser.add_argument(
+        "--batch-concurrency", default="1,2,4,8,16", help="batch mode concurrency levels"
+    )
+    parser.add_argument(
+        "--batch-requests", type=int, default=16, help="unique requests per batch level"
+    )
+    parser.add_argument(
+        "--batch-tokens", type=int, default=69, help="target prompt tokens per batch request"
+    )
     parser.add_argument("--chars-per-token", type=float, default=4.0)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=600.0)
@@ -305,8 +533,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         long_sizes = parse_ints(args.long_sizes)
         if any(size <= 0 for size in long_sizes):
             raise ValueError("long sizes must be positive")
-        if args.requests <= 0 or args.long_requests <= 0:
-            raise ValueError("request counts must be positive")
+        batch_levels = parse_ints(args.batch_concurrency)
+        if any(level <= 0 for level in batch_levels):
+            raise ValueError("batch concurrency values must be positive")
+        if (
+            args.requests <= 0
+            or args.long_requests <= 0
+            or args.batch_requests <= 0
+            or args.batch_tokens <= 0
+        ):
+            raise ValueError("request counts and token targets must be positive")
         rows = load_suite(args.suite)
         health = None
         if not args.skip_health:
@@ -326,6 +562,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "requests_per_short_level": args.requests,
                 "requests_per_long_level": args.long_requests,
                 "long_sizes": long_sizes,
+                "batch_concurrency": batch_levels,
+                "requests_per_batch_level": args.batch_requests,
+                "batch_target_tokens": args.batch_tokens,
                 "chars_per_token": args.chars_per_token,
                 "warmup": args.warmup,
                 "unique_short_prompts": not args.reuse_short_prompts,
@@ -450,6 +689,85 @@ def main(argv: Sequence[str] | None = None) -> int:
                         f"tokens={_fmt(result['prompt_tokens']['mean'], 0)}",
                         flush=True,
                     )
+
+        if args.mode == "batch":
+            batch_pool = select_batch_rows(
+                rows,
+                target_tokens=args.batch_tokens,
+                chars_per_token=args.chars_per_token,
+            ) or list(rows)
+            warmup_specs = [
+                batch_spec(
+                    batch_pool[index % len(batch_pool)],
+                    tag=f"warmup-batch-{args.seed}-{index}",
+                    target_tokens=args.batch_tokens,
+                    model=args.model,
+                    seed=args.seed,
+                    chars_per_token=args.chars_per_token,
+                )
+                for index in range(max(1, min(args.warmup, args.batch_requests)))
+            ]
+            warmup = run_warmup(
+                args.url,
+                warmup_specs,
+                count=args.warmup,
+                model=args.model,
+                timeout=args.timeout,
+                retries=args.retries,
+            )
+            warmup.update({"mode": "batch"})
+            report["warmups"].append(warmup)
+            for concurrency in batch_levels:
+                specs = [
+                    batch_spec(
+                        batch_pool[index % len(batch_pool)],
+                        tag=f"batch-{args.seed}-{concurrency}-{index}",
+                        target_tokens=args.batch_tokens,
+                        model=args.model,
+                        seed=args.seed,
+                        chars_per_token=args.chars_per_token,
+                    )
+                    for index in range(args.batch_requests)
+                ]
+                result = run_level(
+                    args.url,
+                    specs,
+                    concurrency=concurrency,
+                    model=args.model,
+                    timeout=args.timeout,
+                    retries=args.retries,
+                    server_metrics=True,
+                )
+                result.update(
+                    {
+                        "mode": "batch",
+                        "target_tokens": args.batch_tokens,
+                        "estimated_prompt_tokens_mean": (
+                            sum(spec["estimated_prompt_tokens"] for spec in specs)
+                            / len(specs)
+                        ),
+                    }
+                )
+                report["levels"].append(result)
+                metrics = result.get("server_metrics") or {}
+                extra = ""
+                if metrics.get("available") and metrics.get("batch_size"):
+                    extra += (
+                        f" batch_mean={_fmt(metrics['batch_size']['mean'])}"
+                        f" n={_fmt(metrics['batch_size']['count'], 0)}"
+                    )
+                if metrics.get("available") and metrics.get("queue_depth_max") is not None:
+                    extra += f" queue_max={_fmt(metrics['queue_depth_max'])}"
+                print(
+                    f"batch c={concurrency:<3} ok={result['ok']}/{result['requests']} "
+                    f"req/s={_fmt(result['req_per_s'])} "
+                    f"p50={_fmt(result['latency_ms']['p50'], 1)}ms "
+                    f"p95={_fmt(result['latency_ms']['p95'], 1)}ms "
+                    f"p99={_fmt(result['latency_ms']['p99'], 1)}ms "
+                    f"tok/s={_fmt(result['prompt_tokens']['per_s'], 0)} "
+                    f"tokens={_fmt(result['prompt_tokens']['mean'], 0)}{extra}",
+                    flush=True,
+                )
 
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)

@@ -15,7 +15,8 @@ oracle read-out; native-engine numerics are validated against CPU golden tensors
 |---|---|
 | `client.py` | Exact `/v1/decide` client (noul/score/choice, 2..256 options), offline head math, CLI. |
 | `suite.py` | 28-row deterministic suite; live-vs-live or live-vs-saved comparison with KL/MAE/delta/top-1 thresholds. |
-| `bench.py` | Concurrency sweep on short prompts and unique ~3k/~9k-token documents; latency, req/s, error rate, token throughput. |
+| `bench.py` | Concurrency sweep on short prompts and unique ~3k/~9k-token documents; latency, req/s, error rate, token throughput. `--mode batch` is the 69-token batching/scheduler sweep. |
+| `batch_equiv.py` | Compare per-request head logits from individual vs batched calls: request count, top-1 agreement, max absolute delta. |
 | `report.py` | Markdown + JSON summary of suite and bench outputs. |
 | `functional_checks.py` | 256-option choice, `/v1/decisions`, and image-state rejection (400). |
 | `sign_check.py` | HMAC-SHA256 signature verification for `/v1/decide`; confirms `/health` is unsigned. |
@@ -74,6 +75,53 @@ The script runs:
 6. Optional signing when `JEV_EVAL_SIGNING_KEY` is set.
 
 Reports land in `eval/out/`. Override the target with `JEV_EVAL_RUST_URL`.
+
+## Batching sweep
+
+`bench.py --mode batch` sends 16 unique ~69-token decision requests at each
+concurrency level (default `1,2,4,8,16`). Prompts are unique per level, so the
+sweep does not measure a warm prefix cache. Each level reports requests/s,
+p50/p95/p99 latency, prompt tokens/s, and—when the server exposes `/metrics`—a
+per-level delta of the `jev_native_batch_size` histogram (count, mean, buckets)
+plus the peak observed `jev_native_batch_queue_depth` gauge.
+
+```bash
+# From the repository root; server already running on 127.0.0.1:8501.
+./scripts/bench-batch.sh
+# Writes eval/out/bench_batch.json
+```
+
+Override the target and sweep with `JEV_SMOKE_URL`, `JEV_BATCH_OUT`,
+`JEV_BATCH_CONCURRENCY`, `JEV_BATCH_REQUESTS`, `JEV_BATCH_TOKENS`, and
+`JEV_BATCH_WARMUP`. Equivalent direct invocation:
+
+```bash
+cd eval
+python3 bench.py --url http://127.0.0.1:8501 --mode batch \
+  --batch-concurrency 1,2,4,8,16 --batch-requests 16 --batch-tokens 69 \
+  --out out/bench_batch.json
+```
+
+Against the mock server the same command works, but `/metrics` is absent, so
+`server_metrics.available` is `false`.
+
+## Batched vs individual logits
+
+`batch_equiv.py` compares two JSON files of per-request head logits (one from
+individual calls, one from batched calls). It asserts equal request counts,
+per-request top-1 agreement, and a bounded maximum absolute delta. Accepted
+shapes are a list of records, `{"requests"|"results"|"rows"|"items": [...]}`,
+or a mapping of request id to logits; a record is a bare vector or an object
+with `logits`/`head_logits` (plus optional `id`/`request_id`). With explicit ids
+in both files, records are aligned by id.
+
+```bash
+cd eval
+python3 batch_equiv.py individual.json batched.json --max-delta 1e-4
+```
+
+The native worker's `batch` CLI is the intended producer of these JSON files;
+this harness does not call an inference API itself.
 
 ## Tolerances
 
