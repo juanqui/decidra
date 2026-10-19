@@ -37,6 +37,7 @@ pub struct Kernels {
     pub gather_rows: CudaFunction,
     pub quant_fp8: CudaFunction,
     pub quant_int8: CudaFunction,
+    pub quant_int8_bf16: CudaFunction,
     pub dequant_w4a16: CudaFunction,
     pub gemm_w4a16: CudaFunction,
     pub gemm_w4a16_m128: CudaFunction,
@@ -136,6 +137,7 @@ impl Kernels {
             gather_rows: gpu.func("gather_rows_bf16")?,
             quant_fp8: gpu.func("quant_fp8_per_token_f32")?,
             quant_int8: gpu.func("quant_int8_per_token_f32")?,
+            quant_int8_bf16: gpu.func("quant_int8_per_token_bf16")?,
             dequant_w4a16: gpu.func("dequant_w4a16_bf16")?,
             marlin_cfgs: {
                 const NAMES: [&str; 5] = [
@@ -705,6 +707,7 @@ pub fn quant_int8(
     scales: &mut CudaSlice<f32>,
     rows: usize,
     k: usize,
+    global_scale: f32,
 ) -> Result<()> {
     let cfg = LaunchConfig {
         grid_dim: (rows as u32, 1, 1),
@@ -718,6 +721,7 @@ pub fn quant_int8(
     l.arg(scales);
     l.arg(&r_i);
     l.arg(&k_i);
+    l.arg(&global_scale);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }
@@ -745,6 +749,35 @@ pub fn quant_fp8(
     l.arg(scales);
     l.arg(&r_i);
     l.arg(&k_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+/// Per-token symmetric INT8 quantization of bf16 activations.
+#[allow(clippy::too_many_arguments)]
+pub fn quant_int8_bf16(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    out: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    rows: usize,
+    k: usize,
+    global_scale: f32,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 4,
+    };
+    let (k_i, r_i) = (k as i32, rows as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(out);
+    l.arg(scales);
+    l.arg(&r_i);
+    l.arg(&k_i);
+    l.arg(&global_scale);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }

@@ -195,6 +195,10 @@ fn cmd_batch(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--marlin") {
         eng.set_marlin(true);
     }
+    if args.iter().any(|a| a == "--marlin-int8") {
+        eng.set_marlin(true);
+        eng.set_marlin_int8(true);
+    }
     if args.iter().any(|a| a == "--legacy-gdn") {
         eng.set_gdn_shared(false);
         eng.set_gdn_split(false);
@@ -295,6 +299,10 @@ fn cmd_matmul(args: &[String]) -> Result<()> {
     let eng = Engine::new(&model)?;
     if args.iter().any(|a| a == "--marlin") {
         eng.set_marlin(true);
+    }
+    if args.iter().any(|a| a == "--marlin-int8") {
+        eng.set_marlin(true);
+        eng.set_marlin_int8(true);
     }
     let marlin_fp8 = args.iter().any(|a| a == "--marlin-fp8");
     let marlin_int8 = args.iter().any(|a| a == "--marlin-int8");
@@ -411,6 +419,10 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     }
     if args.iter().any(|a| a == "--marlin") {
         eng.set_marlin(true);
+    }
+    if args.iter().any(|a| a == "--marlin-int8") {
+        eng.set_marlin(true);
+        eng.set_marlin_int8(true);
     }
     if args.iter().any(|a| a == "--legacy-gdn") {
         eng.set_gdn_shared(false);

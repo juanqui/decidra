@@ -2107,6 +2107,45 @@ impl Engine {
                 zeros,
                 ..
             } => {
+                if self.marlin_int8.load(Ordering::Relaxed) {
+                    let mut xq = self.gpu.stream.alloc_zeros::<i8>(rows * k)?;
+                    let mut as_ = self.gpu.stream.alloc_zeros::<f32>(rows)?;
+                    kernels::quant_int8_bf16(
+                        &self.gpu,
+                        &self.kernels.quant_int8_bf16,
+                        x,
+                        &mut xq,
+                        &mut as_,
+                        rows,
+                        k,
+                        w.a_global(),
+                    )?;
+                    let mut c = self.alloc_bf16(rows * n)?;
+                    {
+                        let mut g = self.marlin_locks.lock().unwrap();
+                        if g.is_none() {
+                            *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
+                        }
+                    }
+                    let locks_guard = self.marlin_locks.lock().unwrap();
+                    let locks = locks_guard.as_ref().expect("locks initialized");
+                    let mut off = 0usize;
+                    let mut rest = rows;
+                    while rest > 0 {
+                        let par = (rest / 64).min(16);
+                        let pm = if par > 0 { par * 64 } else { rest };
+                        let tmb = pm.div_ceil(16).min(4);
+                        let idx = if pm <= 8 { 0 } else { tmb - 1 };
+                        let f = &self.kernels.marlin_int8_cfgs[idx];
+                        kernels::marlin_gemm_int8(
+                            &self.gpu, f, &xq, qweight, &mut c, scales, zeros, &as_, locks, off,
+                            pm, n, k,
+                        )?;
+                        off += pm;
+                        rest -= pm;
+                    }
+                    return Ok(c);
+                }
                 let mut c = self.alloc_bf16(rows * n)?;
                 {
                     let mut g = self.marlin_locks.lock().unwrap();
@@ -2404,6 +2443,7 @@ impl Engine {
         let prov = self.provider()?;
         let w = prov.linear(module)?;
         let (n, k) = (w.out(), w.in_());
+        eprintln!("int8 a_global = {}", w.a_global());
         if input.len() != rows * k {
             bail!("input has {} values, expected {}", input.len(), rows * k);
         }
@@ -2418,6 +2458,7 @@ impl Engine {
             &mut as_,
             rows,
             k,
+            w.a_global(),
         )?;
         let mut c = self.alloc_bf16(rows * n)?;
         self.marlin_int8_gemm(&w, &xq, &as_, &mut c, rows, n, k)?;

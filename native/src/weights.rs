@@ -28,6 +28,8 @@ pub enum LinearWeight {
         qweight: CudaSlice<i32>,
         scales: CudaSlice<bf16>,
         zeros: CudaSlice<i32>,
+        /// INT8-A global scale folded into activation scales; 0 for W4A16/FP8.
+        a_global: f32,
     },
     /// compressed-tensors pack-quantized W4A16 (AWQ/GPTQ), asymmetric int4.
     /// `packed` is I32 [out, ceil(in/8)] with 8 signed nibbles per word along
@@ -48,6 +50,13 @@ pub enum LinearWeight {
 }
 
 impl LinearWeight {
+    pub fn a_global(&self) -> f32 {
+        match self {
+            LinearWeight::Marlin { a_global, .. } => *a_global,
+            _ => 0.0,
+        }
+    }
+
     pub fn out(&self) -> usize {
         match self {
             LinearWeight::Bf16 { out, .. }
@@ -251,12 +260,15 @@ impl<'a> WeightProvider<'a> {
                     out,
                     sms,
                 )?;
-                let scales = if self.marlin_fp8 {
-                    marlin_permute_scales_a8(&scale, out, groups, 512.0)
+                let (scales, a_global) = if self.marlin_fp8 {
+                    (marlin_permute_scales_a8(&scale, out, groups, 512.0), 0.0)
                 } else if self.marlin_int8 {
-                    marlin_permute_scales_a8(&scale, out, groups, 1.0)
+                    marlin_process_int8_scales(&scale, out, groups)
                 } else {
-                    marlin_permute_scales(&scale, out, groups, in_ / group_size)
+                    (
+                        marlin_permute_scales(&scale, out, groups, in_ / group_size),
+                        0.0,
+                    )
                 };
                 // The transpose/repack temporaries are freed when this branch
                 // returns; synchronize so the async kernels cannot race with
@@ -276,6 +288,7 @@ impl<'a> WeightProvider<'a> {
                     qweight,
                     scales: self.stream.clone_htod(&scales)?,
                     zeros: self.stream.clone_htod(&zeros)?,
+                    a_global,
                 });
             }
             return Ok(LinearWeight::PackedW4A16 {
@@ -418,6 +431,26 @@ fn marlin_permute_scales_a8(ct: &[bf16], out: usize, groups: usize, factor: f32)
         }
     }
     outv
+}
+
+/// `marlin_act_int8_process_scales`: normalize bf16 weight scales to int16
+/// bit patterns in [0,4096] and return `max(scale)/4096`; INT8 activation
+/// scales must be multiplied by that global scale.
+fn marlin_process_int8_scales(ct: &[bf16], out: usize, groups: usize) -> (Vec<bf16>, f32) {
+    let raw = marlin_permute_scales_a8(ct, out, groups, 1.0);
+    let max = raw.iter().map(|v| v.to_f32()).fold(0.0f32, f32::max);
+    if max <= 0.0 {
+        return (raw, 0.0);
+    }
+    let factor = max / 4096.0;
+    let proc = raw
+        .iter()
+        .map(|v| {
+            let q = (v.to_f32() / max * 4096.0).round() as i32;
+            bf16::from_bits(q.clamp(0, 65535) as u16)
+        })
+        .collect();
+    (proc, factor)
 }
 
 /// CT zero points [ceil(out/8), groups] -> Marlin packed zeros [groups, out/8].
