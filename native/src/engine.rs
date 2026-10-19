@@ -224,6 +224,8 @@ pub struct Engine {
     marlin: AtomicBool,
     /// Experimental W4A8-FP8 repack/dispatch (default off).
     marlin_fp8: AtomicBool,
+    /// Experimental W4A8-INT8 repack/dispatch (default off).
+    marlin_int8: AtomicBool,
     /// Marlin split-K barrier workspace (one int per SM), zeroed once.
     marlin_locks: Mutex<Option<CudaSlice<i32>>>,
     /// Warp-per-query attention (fast for long contexts); the original block
@@ -336,6 +338,7 @@ impl Engine {
             fused_tile128: AtomicBool::new(false),
             marlin: AtomicBool::new(false),
             marlin_fp8: AtomicBool::new(false),
+            marlin_int8: AtomicBool::new(false),
             marlin_locks: Mutex::new(None),
             warp_attention: AtomicBool::new(true),
             prof: Prof::new(),
@@ -413,6 +416,10 @@ impl Engine {
         self.marlin_fp8.store(enabled, Ordering::Relaxed);
     }
 
+    pub fn set_marlin_int8(&self, enabled: bool) {
+        self.marlin_int8.store(enabled, Ordering::Relaxed);
+    }
+
     fn prof_begin(&self, _name: &'static str) -> Option<CudaEvent> {
         if !self.prof.enabled {
             return None;
@@ -475,6 +482,7 @@ impl Engine {
         let mut p = WeightProvider::new(&self.store, &self.gpu, &self.kernels)?;
         p.marlin = self.marlin.load(Ordering::Relaxed);
         p.marlin_fp8 = self.marlin_fp8.load(Ordering::Relaxed);
+        p.marlin_int8 = self.marlin_int8.load(Ordering::Relaxed);
         Ok(p)
     }
 
@@ -2339,6 +2347,87 @@ impl Engine {
         }
         let _ = (&mut c16, &mut c8);
         Ok((t16, t8))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn marlin_int8_gemm(
+        &self,
+        w: &LinearWeight,
+        xq: &CudaSlice<i8>,
+        a_scales: &CudaSlice<f32>,
+        c: &mut CudaSlice<bf16>,
+        rows: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        {
+            let mut g = self.marlin_locks.lock().unwrap();
+            if g.is_none() {
+                *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
+            }
+        }
+        let locks_guard = self.marlin_locks.lock().unwrap();
+        let locks = locks_guard.as_ref().expect("locks initialized");
+        let (qweight, scales, zeros) = match w {
+            LinearWeight::Marlin {
+                qweight,
+                scales,
+                zeros,
+                ..
+            } => (qweight, scales, zeros),
+            _ => bail!("INT8 path requires a Marlin-repacked module"),
+        };
+        let mut off = 0usize;
+        let mut rest = rows;
+        while rest > 0 {
+            let par = (rest / 64).min(16);
+            let pm = if par > 0 { par * 64 } else { rest };
+            let tmb = pm.div_ceil(16).min(4);
+            let idx = if pm <= 8 { 0 } else { tmb - 1 };
+            let f = &self.kernels.marlin_int8_cfgs[idx];
+            kernels::marlin_gemm_int8(
+                &self.gpu, f, xq, qweight, c, scales, zeros, a_scales, locks, off, pm, n, k,
+            )?;
+            off += pm;
+            rest -= pm;
+        }
+        Ok(())
+    }
+
+    /// Experimental W4A8-INT8 path for one module.
+    pub fn matmul_module_int8(
+        &self,
+        module: &str,
+        input: &[f32],
+        rows: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let prov = self.provider()?;
+        let w = prov.linear(module)?;
+        let (n, k) = (w.out(), w.in_());
+        if input.len() != rows * k {
+            bail!("input has {} values, expected {}", input.len(), rows * k);
+        }
+        let xf = self.gpu.stream.clone_htod(input)?;
+        let mut xq = self.gpu.stream.alloc_zeros::<i8>(rows * k)?;
+        let mut as_ = self.gpu.stream.alloc_zeros::<f32>(rows)?;
+        kernels::quant_int8(
+            &self.gpu,
+            &self.kernels.quant_int8,
+            &xf,
+            &mut xq,
+            &mut as_,
+            rows,
+            k,
+        )?;
+        let mut c = self.alloc_bf16(rows * n)?;
+        self.marlin_int8_gemm(&w, &xq, &as_, &mut c, rows, n, k)?;
+        let got = self.to_f32(&c, rows * n)?;
+        let was8 = self.marlin_int8.swap(false, Ordering::Relaxed);
+        let wasf = self.marlin_fp8.swap(false, Ordering::Relaxed);
+        let reference = self.matmul_module(module, input, rows, false);
+        self.marlin_int8.store(was8, Ordering::Relaxed);
+        self.marlin_fp8.store(wasf, Ordering::Relaxed);
+        Ok((got, reference?))
     }
 
     /// Experimental W4A8-FP8 path for one module: per-token FP8 activation

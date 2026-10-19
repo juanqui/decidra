@@ -36,12 +36,14 @@ pub struct Kernels {
     pub conv1d_silu_tiled_batched: CudaFunction,
     pub gather_rows: CudaFunction,
     pub quant_fp8: CudaFunction,
+    pub quant_int8: CudaFunction,
     pub dequant_w4a16: CudaFunction,
     pub gemm_w4a16: CudaFunction,
     pub gemm_w4a16_m128: CudaFunction,
     /// Marlin kernels indexed by thread_m_blocks - 1 (1..4).
     pub marlin_cfgs: Vec<CudaFunction>,
     pub marlin_fp8_cfgs: Vec<CudaFunction>,
+    pub marlin_int8_cfgs: Vec<CudaFunction>,
     pub marlin_repack: CudaFunction,
     pub marlin_repack_a8: CudaFunction,
     pub awq_fp8_transform: CudaFunction,
@@ -133,6 +135,7 @@ impl Kernels {
             conv1d_silu_tiled_batched: gpu.func("conv1d_silu_tiled_batched_bf16")?,
             gather_rows: gpu.func("gather_rows_bf16")?,
             quant_fp8: gpu.func("quant_fp8_per_token_f32")?,
+            quant_int8: gpu.func("quant_int8_per_token_f32")?,
             dequant_w4a16: gpu.func("dequant_w4a16_bf16")?,
             marlin_cfgs: {
                 const NAMES: [&str; 5] = [
@@ -159,6 +162,24 @@ impl Kernels {
                     "_ZN6marlin6MarlinILl2814749767172868ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
                     "_ZN6marlin6MarlinILl2814749767172868ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
                     "_ZN6marlin6MarlinILl2814749767172868ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                ];
+                let mut v = Vec::with_capacity(NAMES.len());
+                for name in NAMES {
+                    let f = gpu.func_marlin(name)?;
+                    f.set_attribute(
+                        CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        MR_SHARED,
+                    )?;
+                    v.push(f);
+                }
+                v
+            },
+            marlin_int8_cfgs: {
+                const NAMES: [&str; 4] = [
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
                 ];
                 let mut v = Vec::with_capacity(NAMES.len());
                 for name in NAMES {
@@ -674,6 +695,33 @@ pub fn awq_fp8_transform(
     Ok(())
 }
 
+/// Per-token symmetric INT8 quantization of f32 activations [rows, k].
+#[allow(clippy::too_many_arguments)]
+pub fn quant_int8(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &CudaSlice<f32>,
+    out: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    rows: usize,
+    k: usize,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 4,
+    };
+    let (k_i, r_i) = (k as i32, rows as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(out);
+    l.arg(scales);
+    l.arg(&r_i);
+    l.arg(&k_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
 /// Per-token FP8 E4M3 quantization of f32 activations [rows, k].
 #[allow(clippy::too_many_arguments)]
 pub fn quant_fp8(
@@ -697,6 +745,65 @@ pub fn quant_fp8(
     l.arg(scales);
     l.arg(&r_i);
     l.arg(&k_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+/// INT8-activation Marlin tile group (signed i8 A, f32 per-row scales).
+#[allow(clippy::too_many_arguments)]
+pub fn marlin_gemm_int8(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &CudaSlice<i8>,
+    qweight: &CudaSlice<i32>,
+    out: &mut CudaSlice<bf16>,
+    scales: &CudaSlice<bf16>,
+    zp: &CudaSlice<i32>,
+    a_scales: &CudaSlice<f32>,
+    locks: &CudaSlice<i32>,
+    row_off: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<()> {
+    let (a_base, _ra) = x.device_ptr(&gpu.stream);
+    let a_addr = a_base + row_off as u64;
+    let (c_base, _r0) = out.device_ptr_mut(&gpu.stream);
+    let c_addr = c_base + (row_off * n * 2) as u64;
+    let (b, _r1) = qweight.device_ptr(&gpu.stream);
+    let (s, _r2) = scales.device_ptr(&gpu.stream);
+    let (z, _r3) = zp.device_ptr(&gpu.stream);
+    let (as_, _r4) = a_scales.device_ptr(&gpu.stream);
+    let as_addr = as_ + (row_off * 4) as u64;
+    let (l, _r5) = locks.device_ptr(&gpu.stream);
+    let (b_addr, s_addr, z_addr, l_addr) = (b, s, z, l);
+    let (m_i, n_i, k_i) = (m as i32, n as i32, k as i32);
+    let (lda, zero) = (k as i32, 0u64);
+    let (f_bias, f_atomic, f_reduce) = (false, false, false);
+    let cfg = LaunchConfig {
+        grid_dim: (128, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: MR_SHARED as u32,
+    };
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(&a_addr);
+    l.arg(&b_addr);
+    l.arg(&c_addr);
+    l.arg(&zero);
+    l.arg(&zero);
+    l.arg(&as_addr);
+    l.arg(&s_addr);
+    l.arg(&zero);
+    l.arg(&z_addr);
+    l.arg(&m_i);
+    l.arg(&n_i);
+    l.arg(&k_i);
+    l.arg(&lda);
+    l.arg(&l_addr);
+    l.arg(&f_bias);
+    l.arg(&f_atomic);
+    l.arg(&f_reduce);
+    l.arg(&MR_SHARED);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }

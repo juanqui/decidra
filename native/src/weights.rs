@@ -106,6 +106,8 @@ pub struct WeightProvider<'a> {
     pub marlin: bool,
     /// FP8-activation Marlin repack (8-bit A layout; default off).
     pub marlin_fp8: bool,
+    /// INT8-activation Marlin repack (raw AWQ qweight, 8-bit A layout).
+    pub marlin_int8: bool,
     stream: Arc<CudaStream>,
     gpu: &'a crate::cuda::Gpu,
     kernels: &'a crate::kernels::Kernels,
@@ -131,6 +133,7 @@ impl<'a> WeightProvider<'a> {
             prefix,
             marlin: false,
             marlin_fp8: false,
+            marlin_int8: false,
             stream: gpu.stream.clone(),
             gpu,
             kernels,
@@ -197,7 +200,7 @@ impl<'a> WeightProvider<'a> {
                 bail!("{module}: scale/zp size mismatch");
             }
             if self.marlin && out % 64 == 0 && in_ % 64 == 0 {
-                if self.marlin_fp8 && group_size != 64 {
+                if (self.marlin_fp8 || self.marlin_int8) && group_size != 64 {
                     bail!("W4A8 transform requires group_size 64, got {group_size}");
                 }
                 let dbg = std::env::var("JEV_MARLIN_DEBUG").is_ok();
@@ -234,7 +237,7 @@ impl<'a> WeightProvider<'a> {
                     eprintln!("  transpose ok");
                 }
                 let mut qweight = self.stream.alloc_zeros::<i32>((in_ / 16) * (out * 2))?;
-                let repack_kernel = if self.marlin_fp8 {
+                let repack_kernel = if self.marlin_fp8 || self.marlin_int8 {
                     &self.kernels.marlin_repack_a8
                 } else {
                     &self.kernels.marlin_repack
@@ -249,7 +252,9 @@ impl<'a> WeightProvider<'a> {
                     sms,
                 )?;
                 let scales = if self.marlin_fp8 {
-                    marlin_permute_scales_a8(&scale, out, groups)
+                    marlin_permute_scales_a8(&scale, out, groups, 512.0)
+                } else if self.marlin_int8 {
+                    marlin_permute_scales_a8(&scale, out, groups, 1.0)
                 } else {
                     marlin_permute_scales(&scale, out, groups, in_ / group_size)
                 };
@@ -260,7 +265,7 @@ impl<'a> WeightProvider<'a> {
                 if dbg {
                     eprintln!("  repack ok");
                 }
-                let zeros = if self.marlin_fp8 {
+                let zeros = if self.marlin_fp8 || self.marlin_int8 {
                     marlin_permute_zeros_a8(&zp, out, groups)
                 } else {
                     marlin_permute_zeros(&zp, out, groups)
@@ -397,7 +402,7 @@ fn scale_perm_single() -> [usize; 32] {
 
 /// [out, groups] CT scales -> Marlin a8 scale layout; vLLM uses the single
 /// permutation (32-element blocks) whenever is_a_8bit is true.
-fn marlin_permute_scales_a8(ct: &[bf16], out: usize, groups: usize) -> Vec<bf16> {
+fn marlin_permute_scales_a8(ct: &[bf16], out: usize, groups: usize, factor: f32) -> Vec<bf16> {
     let n = out * groups;
     let mut transposed = vec![bf16::ZERO; n];
     for o in 0..out {
@@ -409,7 +414,7 @@ fn marlin_permute_scales_a8(ct: &[bf16], out: usize, groups: usize) -> Vec<bf16>
     let mut outv = vec![bf16::ZERO; n];
     for b in 0..n / 32 {
         for i in 0..32 {
-            outv[b * 32 + i] = bf16::from_f32(transposed[b * 32 + perm[i]].to_f32() * 512.0);
+            outv[b * 32 + i] = bf16::from_f32(transposed[b * 32 + perm[i]].to_f32() * factor);
         }
     }
     outv
@@ -517,7 +522,7 @@ mod tests {
         // out=64, groups=1, scale[o]=o. vLLM with is_a_8bit uses the 32-entry
         // "single" permutation on flattened [groups, out].
         let ct: Vec<bf16> = (0..64).map(|i| bf16::from_f32(i as f32)).collect();
-        let got = marlin_permute_scales_a8(&ct, 64, 1);
+        let got = marlin_permute_scales_a8(&ct, 64, 1, 512.0);
         let perm = [
             0usize, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21,
             28, 29, 6, 7, 14, 15, 22, 23, 30, 31,
@@ -529,6 +534,21 @@ mod tests {
                     ((b * 32 + perm[i]) as f32) * 512.0,
                     "block {b} index {i}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a8_scale_permutation_no_fp8_factor() {
+        let ct: Vec<bf16> = (0..64).map(|i| bf16::from_f32(i as f32)).collect();
+        let got = marlin_permute_scales_a8(&ct, 64, 1, 1.0);
+        let perm = [
+            0usize, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21,
+            28, 29, 6, 7, 14, 15, 22, 23, 30, 31,
+        ];
+        for b in 0..2 {
+            for i in 0..32 {
+                assert_eq!(got[b * 32 + i].to_f32(), (b * 32 + perm[i]) as f32);
             }
         }
     }

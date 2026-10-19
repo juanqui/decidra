@@ -23,7 +23,34 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
   return scratch[0];
 }
 
-// Canonical AWQ -> W4A8 transform. Input is CT packed [N, K/8] (nibble k =
+// Per-token symmetric INT8 quantization of an f32 activation matrix.
+extern "C" __global__ void quant_int8_per_token_f32(
+    const float* __restrict__ x, int8_t* __restrict__ out,
+    float* __restrict__ scales, int rows, int k) {
+  extern __shared__ float red[];
+  int row = blockIdx.x;
+  if (row >= rows) return;
+  const float* xr = x + (size_t)row * k;
+  float m = 0.f;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) m = fmaxf(m, fabsf(xr[i]));
+  red[threadIdx.x] = m;
+  __syncthreads();
+  for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+    if (threadIdx.x < off) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + off]);
+    __syncthreads();
+  }
+  float scale = fmaxf(red[0], 1e-10f) / 127.f;
+  if (threadIdx.x == 0) scales[row] = scale;
+  __syncthreads();
+  int8_t* orow = out + (size_t)row * k;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) {
+    int v = (int)roundf(xr[i] / scale);
+    v = max(-127, min(127, v));
+    orow[i] = (int8_t)v;
+  }
+}
+
+// Canonical AWQ -> W4A8 transform.// Canonical AWQ -> W4A8 transform. Input is CT packed [N, K/8] (nibble k =
 // K index 8j+k) and CT packed zero points [N/8, groups] (nibble n%8 = output
 // column). Output is the transformed q2 in the same CT layout [K/8, N].
 //   q2 = q - z;  if (q2 < 0) q2 = 15 - q
