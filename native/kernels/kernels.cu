@@ -888,6 +888,83 @@ extern "C" __global__ void gdn_recurrent_split(
 // [offsets[s], offsets[s] + lens[s]) in the flattened [total, ...] buffers.
 // ---------------------------------------------------------------------------
 
+// Time-tiled depthwise causal conv + SiLU. Each thread owns one channel and
+// TILE consecutive positions, keeping the 3-token history in registers. Grid
+// is (ceil(ch/256), ceil(seq/16)); the accumulation order (j=0..3), BF16 round
+// and SiLU are identical to conv1d_silu_bf16.
+#define CONV_TILE 16
+
+extern "C" __global__ void conv1d_silu_tiled_bf16(
+    const bf16* __restrict__ x, const bf16* __restrict__ w,
+    bf16* __restrict__ out, int seq, int ch) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= ch) return;
+  int t0 = blockIdx.y * CONV_TILE;
+  int t1 = min(t0 + CONV_TILE, seq);
+  if (t0 >= t1) return;
+
+  const float w0 = bf2f(w[c * 4 + 0]);
+  const float w1 = bf2f(w[c * 4 + 1]);
+  const float w2 = bf2f(w[c * 4 + 2]);
+  const float w3 = bf2f(w[c * 4 + 3]);
+  float xm3 = t0 >= 3 ? bf2f(x[(size_t)(t0 - 3) * ch + c]) : 0.f;
+  float xm2 = t0 >= 2 ? bf2f(x[(size_t)(t0 - 2) * ch + c]) : 0.f;
+  float xm1 = t0 >= 1 ? bf2f(x[(size_t)(t0 - 1) * ch + c]) : 0.f;
+
+  for (int t = t0; t < t1; ++t) {
+    float xt = bf2f(x[(size_t)t * ch + c]);
+    float acc = 0.f;
+    acc = fmaf(xm3, w0, acc);
+    acc = fmaf(xm2, w1, acc);
+    acc = fmaf(xm1, w2, acc);
+    acc = fmaf(xt, w3, acc);
+    float v = rb(acc);
+    out[(size_t)t * ch + c] = f2bf(v / (1.0f + expf(-v)));
+    xm3 = xm2;
+    xm2 = xm1;
+    xm1 = xt;
+  }
+}
+
+// Same as above for a flattened batch of sequences; the causal window restarts
+// at each sequence offset. grid.y must cover the longest sequence.
+extern "C" __global__ void conv1d_silu_tiled_batched_bf16(
+    const bf16* __restrict__ x, const bf16* __restrict__ w,
+    bf16* __restrict__ out, const int* __restrict__ offsets,
+    const int* __restrict__ lens, int batch, int ch) {
+  int s = blockIdx.z;
+  if (s >= batch) return;
+  int l = lens[s];
+  int t0 = blockIdx.y * CONV_TILE;
+  int t1 = min(t0 + CONV_TILE, l);
+  if (t0 >= t1) return;
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= ch) return;
+  int o = offsets[s];
+
+  const float w0 = bf2f(w[c * 4 + 0]);
+  const float w1 = bf2f(w[c * 4 + 1]);
+  const float w2 = bf2f(w[c * 4 + 2]);
+  const float w3 = bf2f(w[c * 4 + 3]);
+  float xm3 = t0 >= 3 ? bf2f(x[(size_t)(o + t0 - 3) * ch + c]) : 0.f;
+  float xm2 = t0 >= 2 ? bf2f(x[(size_t)(o + t0 - 2) * ch + c]) : 0.f;
+  float xm1 = t0 >= 1 ? bf2f(x[(size_t)(o + t0 - 1) * ch + c]) : 0.f;
+
+  for (int t = t0; t < t1; ++t) {
+    float xt = bf2f(x[(size_t)(o + t) * ch + c]);
+    float acc = 0.f;
+    acc = fmaf(xm3, w0, acc);
+    acc = fmaf(xm2, w1, acc);
+    acc = fmaf(xm1, w2, acc);
+    acc = fmaf(xt, w3, acc);
+    float v = rb(acc);
+    out[(size_t)(o + t) * ch + c] = f2bf(v / (1.0f + expf(-v)));
+    xm3 = xm2;
+    xm2 = xm1;
+    xm1 = xt;
+  }
+}
+
 // Depthwise causal conv + SiLU with a causal restart per sequence.
 extern "C" __global__ void conv1d_silu_batched_bf16(
     const bf16* __restrict__ x, const bf16* __restrict__ w,

@@ -26,6 +26,59 @@ struct PoolState {
 }
 type BufferPool = Arc<PoolState>;
 
+struct F32PoolState {
+    free: Mutex<HashMap<usize, Vec<CudaSlice<f32>>>>,
+    /// Mirrors `PoolState::low_mem`: at very long prefills, dropped f32 scratch
+    /// is released instead of retained so the 24 GiB budget holds.
+    low_mem: AtomicBool,
+}
+type F32Pool = Arc<F32PoolState>;
+
+/// Recycled f32 scratch (GDN q/k/v/g/beta and recurrent state). These are
+/// fully overwritten every layer (except `state`, which is explicitly zeroed),
+/// so reuse avoids the per-layer cuMemAlloc/memset churn of the prefill path.
+pub struct F32Buf {
+    slice: Option<CudaSlice<f32>>,
+    pool: F32Pool,
+}
+
+impl F32Buf {
+    pub fn len(&self) -> usize {
+        self.slice.as_ref().map(|s| s.len()).unwrap_or(0)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::ops::Deref for F32Buf {
+    type Target = CudaSlice<f32>;
+    fn deref(&self) -> &Self::Target {
+        self.slice.as_ref().expect("buffer taken")
+    }
+}
+
+impl std::ops::DerefMut for F32Buf {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.slice.as_mut().expect("buffer taken")
+    }
+}
+
+impl Drop for F32Buf {
+    fn drop(&mut self) {
+        if let Some(s) = self.slice.take() {
+            if self.pool.low_mem.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut pool = self.pool.free.lock().unwrap();
+            let keep = pool.get(&s.len()).map(|v| v.len() < 2).unwrap_or(true);
+            if keep {
+                pool.entry(s.len()).or_default().push(s);
+            }
+        }
+    }
+}
+
 /// Recycled device buffer. Returning outputs to the pool avoids per-GEMM
 /// cuMemAlloc: on this driver a fresh allocation of some sizes costs ~0.6 ms,
 /// which dwarfed the kernel for large-N projections. Slices are reused on the
@@ -152,6 +205,7 @@ pub struct Engine {
     dequant_ws: Mutex<Option<CudaSlice<bf16>>>,
     logits_opts: Mutex<LogitsOpts>,
     pool: BufferPool,
+    f32_pool: F32Pool,
     /// Stream layers instead of keeping them resident. Needed to run the merged
     /// BF16 checkpoint (51 GiB) on a 24 GiB card; the shipped AWQ path keeps
     /// every packed layer resident instead.
@@ -178,6 +232,9 @@ pub struct Engine {
     gdn_shared: AtomicBool,
     gdn_chunks: std::sync::atomic::AtomicUsize,
     gdn_split: AtomicBool,
+    /// Time-tiled causal conv (default); `--legacy-conv` selects the original
+    /// channel-only kernel.
+    conv_tiled: AtomicBool,
     /// Below this sequence length the accurate single-column shared GDN
     /// recurrence is used; the split reduction is only enabled for long
     /// prefills where its f32 reordering cannot affect decision gates.
@@ -262,6 +319,10 @@ impl Engine {
                 free: Mutex::new(HashMap::new()),
                 low_mem: AtomicBool::new(false),
             }),
+            f32_pool: Arc::new(F32PoolState {
+                free: Mutex::new(HashMap::new()),
+                low_mem: AtomicBool::new(false),
+            }),
             cache_weights: AtomicBool::new(true),
             fused_w4a16: AtomicBool::new(false),
             fused_min_n: std::sync::atomic::AtomicUsize::new(5120),
@@ -274,6 +335,7 @@ impl Engine {
             gdn_shared: AtomicBool::new(true),
             gdn_chunks: std::sync::atomic::AtomicUsize::new(2),
             gdn_split: AtomicBool::new(true),
+            conv_tiled: AtomicBool::new(true),
             gdn_split_min_seq: std::sync::atomic::AtomicUsize::new(512),
         })
     }
@@ -320,6 +382,10 @@ impl Engine {
 
     pub fn set_gdn_chunks(&self, chunks: usize) {
         self.gdn_chunks.store(chunks, Ordering::Relaxed);
+    }
+
+    pub fn set_conv_tiled(&self, enabled: bool) {
+        self.conv_tiled.store(enabled, Ordering::Relaxed);
     }
 
     pub fn set_marlin(&self, enabled: bool) {
@@ -479,6 +545,37 @@ impl Engine {
         })
     }
 
+    /// Reusable f32 scratch; contents are undefined. GDN q/k/v/g/beta are
+    /// completely overwritten by `gdn_prepare` before use.
+    fn alloc_f32(&self, n: usize) -> Result<F32Buf> {
+        {
+            let mut pool = self.f32_pool.free.lock().unwrap();
+            if pool.len() > 128 {
+                pool.clear();
+            }
+        }
+        if let Some(v) = self.f32_pool.free.lock().unwrap().get_mut(&n) {
+            if let Some(s) = v.pop() {
+                return Ok(F32Buf {
+                    slice: Some(s),
+                    pool: self.f32_pool.clone(),
+                });
+            }
+        }
+        let s = unsafe { self.gpu.stream.alloc::<f32>(n)? };
+        Ok(F32Buf {
+            slice: Some(s),
+            pool: self.f32_pool.clone(),
+        })
+    }
+
+    /// Reusable f32 scratch, explicitly zeroed (used for the GDN state).
+    fn alloc_f32_zeros(&self, n: usize) -> Result<F32Buf> {
+        let mut b = self.alloc_f32(n)?;
+        self.gpu.stream.memset_zeros(&mut *b)?;
+        Ok(b)
+    }
+
     pub fn embed(&self, tokens: &[u32]) -> Result<Buf> {
         let h = self.cfg.hidden_size;
         let name = self.provider()?.embedding();
@@ -508,6 +605,7 @@ impl Engine {
         stage: Stage,
         last_only: bool,
     ) -> Result<Vec<f32>> {
+        self.prof.entries.lock().unwrap().clear();
         let x = timed!(self, "embed", self.embed(tokens)?);
         self.forward_dev(x, tokens.len(), 0, layer, stage, last_only)
     }
@@ -536,6 +634,7 @@ impl Engine {
         if layer < 0 {
             bail!("--input requires --layer >= 0");
         }
+        self.prof.entries.lock().unwrap().clear();
         self.forward_dev(x, seq, layer as usize, layer, stage, last_only)
     }
 
@@ -558,11 +657,14 @@ impl Engine {
                 self.cfg.num_hidden_layers
             );
         }
-        self.prof.entries.lock().unwrap().clear();
         let low_mem = seq >= 24_576;
         let was_low = self.pool.low_mem.swap(low_mem, Ordering::Relaxed);
+        let was_low_f32 = self.f32_pool.low_mem.swap(low_mem, Ordering::Relaxed);
         if low_mem && !was_low {
             self.pool.free.lock().unwrap().clear();
+        }
+        if low_mem && !was_low_f32 {
+            self.f32_pool.free.lock().unwrap().clear();
         }
         let mut x = x;
         for i in start..=last {
@@ -725,8 +827,12 @@ impl Engine {
         let total = b.total;
         let low_mem = total >= 24_576;
         let was_low = self.pool.low_mem.swap(low_mem, Ordering::Relaxed);
+        let was_low_f32 = self.f32_pool.low_mem.swap(low_mem, Ordering::Relaxed);
         if low_mem && !was_low {
             self.pool.free.lock().unwrap().clear();
+        }
+        if low_mem && !was_low_f32 {
+            self.f32_pool.free.lock().unwrap().clear();
         }
         let mut x = timed!(self, "embed", self.embed(&flat)?);
         for i in 0..self.cfg.num_hidden_layers {
@@ -988,9 +1094,21 @@ impl Engine {
 
         let qkv = timed!(self, "gemm.in_qkv", self.gemm(h, total, &w.in_proj_qkv)?);
         let mut conv = self.alloc_bf16(total * conv_dim)?;
-        timed!(
-            self,
-            "gdn.conv",
+        let max_len = b.lens.iter().copied().max().unwrap_or(0);
+        let conv_out = if self.conv_tiled.load(Ordering::Relaxed) {
+            kernels::conv1d_silu_tiled_batched(
+                &self.gpu,
+                &self.kernels.conv1d_silu_tiled_batched,
+                &qkv,
+                &w.conv1d,
+                &mut conv,
+                &b.offsets_dev,
+                &b.lens_dev,
+                b.batch(),
+                conv_dim,
+                max_len,
+            )
+        } else {
             kernels::conv1d_silu_batched(
                 &self.gpu,
                 &self.kernels.conv1d_silu_batched,
@@ -1001,17 +1119,18 @@ impl Engine {
                 &b.lens_dev,
                 b.batch(),
                 conv_dim,
-            )?
-        );
+            )
+        };
+        timed!(self, "gdn.conv", conv_out?);
         let z = timed!(self, "gemm.z", self.gemm(h, total, &w.in_proj_z)?);
         let bb = timed!(self, "gemm.b", self.gemm(h, total, &w.in_proj_b)?);
         let aa = timed!(self, "gemm.a", self.gemm(h, total, &w.in_proj_a)?);
 
-        let mut qf = self.gpu.stream.alloc_zeros::<f32>(total * nv * dk)?;
-        let mut kf = self.gpu.stream.alloc_zeros::<f32>(total * nv * dk)?;
-        let mut vf = self.gpu.stream.alloc_zeros::<f32>(total * nv * dv)?;
-        let mut gg = self.gpu.stream.alloc_zeros::<f32>(total * nv)?;
-        let mut beta = self.gpu.stream.alloc_zeros::<f32>(total * nv)?;
+        let mut qf = self.alloc_f32(total * nv * dk)?;
+        let mut kf = self.alloc_f32(total * nv * dk)?;
+        let mut vf = self.alloc_f32(total * nv * dv)?;
+        let mut gg = self.alloc_f32(total * nv)?;
+        let mut beta = self.alloc_f32(total * nv)?;
         timed!(
             self,
             "gdn.prepare",
@@ -1040,10 +1159,7 @@ impl Engine {
         drop(bb);
         drop(aa);
 
-        let mut state = self
-            .gpu
-            .stream
-            .alloc_zeros::<f32>(b.batch() * nv * dk * dv)?;
+        let mut state = self.alloc_f32_zeros(b.batch() * nv * dk * dv)?;
         let mut core = self.alloc_bf16(total * nv * dv)?;
         let min_seq = self.gdn_split_min_seq.load(Ordering::Relaxed);
         let all_long = b.lens.iter().all(|&l| l >= min_seq);
@@ -1631,9 +1747,17 @@ impl Engine {
             );
         }
         let mut conv = self.alloc_bf16(seq * conv_dim)?;
-        timed!(
-            self,
-            "gdn.conv",
+        let conv_out = if self.conv_tiled.load(Ordering::Relaxed) {
+            kernels::conv1d_silu_tiled(
+                &self.gpu,
+                &self.kernels.conv1d_silu_tiled,
+                &qkv,
+                &w.conv1d,
+                &mut conv,
+                seq,
+                conv_dim,
+            )
+        } else {
             kernels::conv1d_silu(
                 &self.gpu,
                 &self.kernels.conv1d_silu,
@@ -1642,8 +1766,9 @@ impl Engine {
                 &mut conv,
                 seq,
                 conv_dim,
-            )?
-        );
+            )
+        };
+        timed!(self, "gdn.conv", conv_out?);
         if capture {
             self.dump_dev("gdn_mixed_qkv_conv", &conv, seq, conv_dim)?;
         }
@@ -1657,16 +1782,11 @@ impl Engine {
             self.dump_dev("gdn_a", &a, seq, nv)?;
         }
 
-        let qf = self.gpu.stream.alloc_zeros::<f32>(seq * nv * dk)?;
-        let kf = self.gpu.stream.alloc_zeros::<f32>(seq * nv * dk)?;
-        let vf = self.gpu.stream.alloc_zeros::<f32>(seq * nv * dv)?;
-        let g = self.gpu.stream.alloc_zeros::<f32>(seq * nv)?;
-        let beta = self.gpu.stream.alloc_zeros::<f32>(seq * nv)?;
-        let mut qf = qf;
-        let mut kf = kf;
-        let mut vf = vf;
-        let mut g = g;
-        let mut beta = beta;
+        let mut qf = self.alloc_f32(seq * nv * dk)?;
+        let mut kf = self.alloc_f32(seq * nv * dk)?;
+        let mut vf = self.alloc_f32(seq * nv * dv)?;
+        let mut g = self.alloc_f32(seq * nv)?;
+        let mut beta = self.alloc_f32(seq * nv)?;
         timed!(
             self,
             "gdn.prepare",
@@ -1695,11 +1815,11 @@ impl Engine {
         drop(b);
         drop(a);
         if capture {
-            let qfv = self.gpu.stream.clone_dtoh(&qf)?;
-            let kfv = self.gpu.stream.clone_dtoh(&kf)?;
-            let vfv = self.gpu.stream.clone_dtoh(&vf)?;
-            let gv = self.gpu.stream.clone_dtoh(&g)?;
-            let bv = self.gpu.stream.clone_dtoh(&beta)?;
+            let qfv = self.gpu.stream.clone_dtoh(&*qf)?;
+            let kfv = self.gpu.stream.clone_dtoh(&*kf)?;
+            let vfv = self.gpu.stream.clone_dtoh(&*vf)?;
+            let gv = self.gpu.stream.clone_dtoh(&*g)?;
+            let bv = self.gpu.stream.clone_dtoh(&*beta)?;
             self.dump_f32("gdn_qf", &qfv, seq * nv, dk)?;
             self.dump_f32("gdn_kf", &kfv, seq * nv, dk)?;
             self.dump_f32("gdn_vf", &vfv, seq * nv, dv)?;
@@ -1707,7 +1827,7 @@ impl Engine {
             self.dump_f32("gdn_beta", &bv, seq, nv)?;
         }
 
-        let mut state = self.gpu.stream.alloc_zeros::<f32>(nv * dk * dv)?;
+        let mut state = self.alloc_f32_zeros(nv * dk * dv)?;
         let mut core = self.alloc_bf16(seq * nv * dv)?;
         let min_seq = self.gdn_split_min_seq.load(Ordering::Relaxed);
         if self.gdn_split.load(Ordering::Relaxed) && seq >= min_seq {
@@ -1717,12 +1837,12 @@ impl Engine {
                 kernels::gdn_recurrent_split(
                     &self.gpu,
                     &self.kernels.gdn_recurrent_split,
-                    &qf,
-                    &kf,
-                    &vf,
-                    &g,
-                    &beta,
-                    &mut state,
+                    &*qf,
+                    &*kf,
+                    &*vf,
+                    &*g,
+                    &*beta,
+                    &mut *state,
                     &mut *core,
                     seq,
                     nv,
@@ -1742,12 +1862,12 @@ impl Engine {
                 kernels::gdn_recurrent_shared(
                     &self.gpu,
                     &self.kernels.gdn_recurrent_shared,
-                    &qf,
-                    &kf,
-                    &vf,
-                    &g,
-                    &beta,
-                    &mut state,
+                    &*qf,
+                    &*kf,
+                    &*vf,
+                    &*g,
+                    &*beta,
+                    &mut *state,
                     &mut *core,
                     seq,
                     nv,
@@ -1763,12 +1883,12 @@ impl Engine {
                 kernels::gdn_recurrent(
                     &self.gpu,
                     &self.kernels.gdn_recurrent,
-                    &qf,
-                    &kf,
-                    &vf,
-                    &g,
-                    &beta,
-                    &mut state,
+                    &*qf,
+                    &*kf,
+                    &*vf,
+                    &*g,
+                    &*beta,
+                    &mut *state,
                     &mut *core,
                     seq,
                     nv,
@@ -1784,7 +1904,7 @@ impl Engine {
         drop(beta);
         if capture {
             self.dump_dev("gdn_recurrent_out", &core, seq, nv * dv)?;
-            let sv = self.gpu.stream.clone_dtoh(&state)?;
+            let sv = self.gpu.stream.clone_dtoh(&*state)?;
             self.dump_f32("gdn_state", &sv, nv * dk, dv)?;
         }
 

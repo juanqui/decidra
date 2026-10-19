@@ -30,6 +30,8 @@ pub struct Kernels {
     pub gdn_recurrent_shared_batched: CudaFunction,
     pub gdn_recurrent_split_batched: CudaFunction,
     pub conv1d_silu_batched: CudaFunction,
+    pub conv1d_silu_tiled: CudaFunction,
+    pub conv1d_silu_tiled_batched: CudaFunction,
     pub gather_rows: CudaFunction,
     pub dequant_w4a16: CudaFunction,
     pub gemm_w4a16: CudaFunction,
@@ -105,6 +107,8 @@ impl Kernels {
                 f
             },
             conv1d_silu_batched: gpu.func("conv1d_silu_batched_bf16")?,
+            conv1d_silu_tiled: gpu.func("conv1d_silu_tiled_bf16")?,
+            conv1d_silu_tiled_batched: gpu.func("conv1d_silu_tiled_batched_bf16")?,
             gather_rows: gpu.func("gather_rows_bf16")?,
             dequant_w4a16: gpu.func("dequant_w4a16_bf16")?,
             marlin_cfgs: {
@@ -974,6 +978,69 @@ pub fn conv1d_silu_batched(
     ch: usize,
 ) -> Result<()> {
     let cfg = cfg_1d(ch, 128);
+    let (b_i, ch_i) = (batch as i32, ch as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(w);
+    l.arg(out);
+    l.arg(offsets);
+    l.arg(lens);
+    l.arg(&b_i);
+    l.arg(&ch_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+/// Time tile of `conv1d_silu_tiled_bf16`; must match `CONV_TILE` in kernels.cu.
+pub const CONV_TILE: usize = 16;
+
+pub fn conv1d_silu_tiled(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    w: &CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+    seq: usize,
+    ch: usize,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (ch.div_ceil(256) as u32, seq.div_ceil(CONV_TILE) as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (seq_i, ch_i) = (seq as i32, ch as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(w);
+    l.arg(out);
+    l.arg(&seq_i);
+    l.arg(&ch_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_silu_tiled_batched(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    w: &CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+    offsets: &CudaSlice<i32>,
+    lens: &CudaSlice<i32>,
+    batch: usize,
+    ch: usize,
+    max_len: usize,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (
+            ch.div_ceil(256) as u32,
+            max_len.div_ceil(CONV_TILE) as u32,
+            batch as u32,
+        ),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
     let (b_i, ch_i) = (batch as i32, ch as i32);
     let mut l = gpu.stream.launch_builder(f);
     l.arg(x);

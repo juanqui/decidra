@@ -205,6 +205,9 @@ fn cmd_batch(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--legacy-attention") {
         eng.set_warp_attention(false);
     }
+    if args.iter().any(|a| a == "--legacy-conv") {
+        eng.set_conv_tiled(false);
+    }
     if args.iter().any(|a| a == "--no-cache") {
         eng.set_cache_weights(false);
     }
@@ -388,6 +391,9 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     }
     if args.iter().any(|a| a == "--legacy-attention") {
         eng.set_warp_attention(false);
+    }
+    if args.iter().any(|a| a == "--legacy-conv") {
+        eng.set_conv_tiled(false);
     }
     if args.iter().any(|a| a == "--no-cache") {
         eng.set_cache_weights(false);
