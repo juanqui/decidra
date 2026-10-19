@@ -243,8 +243,18 @@ the two dot products are reduced with two `__shfl_xor` steps. Grid is
 `heads * (dv/32)`, block is 128 threads, shared is `dk*(vc+1)*4` (16.9 KiB for
 dk=128). Per-layer cost at 1K drops from 13.35 ms to 3.41 ms (3.9x) and the
 end-to-end 1K forward from 958 ms to 486 ms. The decay + `kv` accumulation are
-fused into one pass; the math order is preserved (1K outputs are bit-identical
-to the previous kernel, 36-token golden unchanged).
+fused into one pass.
+
+The split reduction is only used for **seq >= `gdn_split_min_seq` (default
+512)**. Short prompts use the accurate single-column shared recurrence: the
+four-way f32 summation reorders the state dot products enough to shift a rare
+short-prompt logit. Reproduced on suite row `r22` (54 tokens):
+split raw logits [2.7344, 1.7813] vs CPU golden [2.6719, 1.7891] (two-way delta
+1.43e-2, fails the suite gate); shared raw logits [2.6875, 1.7734] (delta
+6.43e-3, passes; the pre-split Marlin suite max was 6.03e-3). The 36-token
+golden head logits use the shared path (max 0.109). Configure with
+`--gdn-split-min-seq N`; `--gdn-shared` forces the accurate path and
+`--legacy-gdn` the original global-state kernel.
 
 1K breakdown (486 ms forward): MLP GEMMs 204 ms (42%), GDN recurrence 164 ms
 (34%), other GEMMs 88 ms (18%), GDN conv 8.8 ms, MLP activation 6.7 ms,

@@ -169,6 +169,10 @@ pub struct Engine {
     gdn_shared: AtomicBool,
     gdn_chunks: std::sync::atomic::AtomicUsize,
     gdn_split: AtomicBool,
+    /// Below this sequence length the accurate single-column shared GDN
+    /// recurrence is used; the split reduction is only enabled for long
+    /// prefills where its f32 reordering cannot affect decision gates.
+    gdn_split_min_seq: std::sync::atomic::AtomicUsize,
 }
 
 const _: fn() = || {
@@ -205,6 +209,7 @@ impl Engine {
             gdn_shared: AtomicBool::new(true),
             gdn_chunks: std::sync::atomic::AtomicUsize::new(2),
             gdn_split: AtomicBool::new(true),
+            gdn_split_min_seq: std::sync::atomic::AtomicUsize::new(512),
         })
     }
 
@@ -242,6 +247,10 @@ impl Engine {
 
     pub fn set_gdn_split(&self, enabled: bool) {
         self.gdn_split.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_gdn_split_min_seq(&self, seq: usize) {
+        self.gdn_split_min_seq.store(seq, Ordering::Relaxed);
     }
 
     pub fn set_gdn_chunks(&self, chunks: usize) {
@@ -959,7 +968,8 @@ impl Engine {
 
         let mut state = self.gpu.stream.alloc_zeros::<f32>(nv * dk * dv)?;
         let mut core = self.alloc_bf16(seq * nv * dv)?;
-        if self.gdn_split.load(Ordering::Relaxed) {
+        let min_seq = self.gdn_split_min_seq.load(Ordering::Relaxed);
+        if self.gdn_split.load(Ordering::Relaxed) && seq >= min_seq {
             timed!(
                 self,
                 "gdn.recurrent",

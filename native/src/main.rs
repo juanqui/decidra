@@ -159,6 +159,12 @@ fn cmd_matmul(args: &[String]) -> Result<()> {
     if let Some(c) = opt(args, "--gdn-chunks") {
         eng.set_gdn_chunks(c.parse().context("--gdn-chunks must be an integer")?);
     }
+    if let Some(n) = opt(args, "--gdn-split-min-seq") {
+        eng.set_gdn_split_min_seq(
+            n.parse()
+                .context("--gdn-split-min-seq must be an integer")?,
+        );
+    }
     if args.iter().any(|a| a == "--legacy-attention") {
         eng.set_warp_attention(false);
     }
