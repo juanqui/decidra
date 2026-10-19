@@ -110,3 +110,84 @@ fn chunked_matches_sequential() {
     assert!(out_mean < 2.0e-4, "output mean {out_mean}");
     assert!(st_max < 2.0e-3, "state max {st_max}");
 }
+
+#[test]
+#[ignore = "requires a CUDA device (GPU1)"]
+fn tc_chunked_matches_f32_chunked() {
+    for seq in [32usize, 512] {
+        let heads = 48usize;
+        let dk = 128usize;
+        let dv = 128usize;
+        let gpu = Gpu::new(0).expect("cuda context");
+        let kernels = Kernels::load(&gpu).expect("kernels");
+        let q = host_data(seq * heads * dk, 0.12, 0.03);
+        let k = host_data(seq * heads * dk, 0.10, -0.02);
+        let v = host_data(seq * heads * dv, 0.5, 0.1);
+        let g: Vec<f32> = (0..seq * heads)
+            .map(|i| -0.005 - 0.02 * (i as f32 * 0.11).sin().abs())
+            .collect();
+        let beta: Vec<f32> = (0..seq * heads)
+            .map(|i| 0.1 + 0.8 * (i as f32 * 0.07).sin().abs())
+            .collect();
+        let dq = gpu.stream.clone_htod(&q).unwrap();
+        let dk_h = gpu.stream.clone_htod(&k).unwrap();
+        let dv_h = gpu.stream.clone_htod(&v).unwrap();
+        let dg = gpu.stream.clone_htod(&g).unwrap();
+        let db = gpu.stream.clone_htod(&beta).unwrap();
+        let mut st_a = gpu.stream.alloc_zeros::<f32>(heads * dk * dv).unwrap();
+        let mut out_a = gpu.stream.alloc_zeros::<bf16>(seq * heads * dv).unwrap();
+        let mut st_b = gpu.stream.alloc_zeros::<f32>(heads * dk * dv).unwrap();
+        let mut out_b = gpu.stream.alloc_zeros::<bf16>(seq * heads * dv).unwrap();
+        kernels::gdn_chunked(
+            &gpu,
+            &kernels.gdn_chunked,
+            &dq,
+            &dk_h,
+            &dv_h,
+            &dg,
+            &db,
+            &mut st_a,
+            &mut out_a,
+            seq,
+            heads,
+            dk,
+            dv,
+        )
+        .unwrap();
+        kernels::gdn_chunked(
+            &gpu,
+            &kernels.gdn_chunked_tc,
+            &dq,
+            &dk_h,
+            &dv_h,
+            &dg,
+            &db,
+            &mut st_b,
+            &mut out_b,
+            seq,
+            heads,
+            dk,
+            dv,
+        )
+        .unwrap();
+        gpu.synchronize().unwrap();
+        let oa = gpu.stream.clone_dtoh(&out_a).unwrap();
+        let ob = gpu.stream.clone_dtoh(&out_b).unwrap();
+        let sa = gpu.stream.clone_dtoh(&st_a).unwrap();
+        let sb = gpu.stream.clone_dtoh(&st_b).unwrap();
+        let omax = oa
+            .iter()
+            .zip(ob.iter())
+            .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+            .fold(0f32, f32::max);
+        let smax = sa
+            .iter()
+            .zip(sb.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        let sscale = sa.iter().map(|x| x.abs()).fold(0f32, f32::max);
+        println!(
+            "T={seq}: tc-vs-f32 out max {omax:.3e}, state max {smax:.3e} (state scale {sscale:.3e})"
+        );
+    }
+}

@@ -1069,6 +1069,252 @@ extern "C" __global__ void gdn_chunked_f32(
 }
 
 // ---------------------------------------------------------------------------
+// TF32 WMMA helpers for the chunked GDN path (16x16x8, f32 accumulate).
+// Three layout combinations are used:
+//   rr: A row-major, B row-major
+//   rc: A row-major, B col-major
+//   cr: A col-major, B row-major
+// Pointers passed here are the base of the 16-row / 16-col tile; kdim is the
+// contraction length (multiple of 8).
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ void tf32_tile_rr(const float* a, int lda,
+                                             const float* b, int ldb, float* c,
+                                             int ldc, int kdim) {
+  using namespace nvcuda;
+  wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc;
+  wmma::fill_fragment(acc, 0.f);
+  for (int kk = 0; kk < kdim; kk += 8) {
+    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32,
+                   wmma::row_major>
+        af;
+    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32,
+                   wmma::row_major>
+        bf;
+    wmma::load_matrix_sync(af, a + kk, lda);
+    wmma::load_matrix_sync(bf, b + (size_t)kk * ldb, ldb);
+    wmma::mma_sync(acc, af, bf, acc);
+  }
+  wmma::store_matrix_sync(c, acc, ldc, wmma::mem_row_major);
+}
+
+__device__ __forceinline__ void tf32_tile_rc(const float* a, int lda,
+                                             const float* b, int ldb, float* c,
+                                             int ldc, int kdim) {
+  using namespace nvcuda;
+  wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc;
+  wmma::fill_fragment(acc, 0.f);
+  for (int kk = 0; kk < kdim; kk += 8) {
+    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32,
+                   wmma::row_major>
+        af;
+    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32,
+                   wmma::col_major>
+        bf;
+    wmma::load_matrix_sync(af, a + kk, lda);
+    wmma::load_matrix_sync(bf, b + (size_t)kk, ldb);
+    wmma::mma_sync(acc, af, bf, acc);
+  }
+  wmma::store_matrix_sync(c, acc, ldc, wmma::mem_row_major);
+}
+
+__device__ __forceinline__ void tf32_tile_cr(const float* a, int lda,
+                                             const float* b, int ldb, float* c,
+                                             int ldc, int kdim) {
+  using namespace nvcuda;
+  wmma::fragment<wmma::accumulator, 16, 16, 8, float> acc;
+  wmma::fill_fragment(acc, 0.f);
+  for (int kk = 0; kk < kdim; kk += 8) {
+    wmma::fragment<wmma::matrix_a, 16, 16, 8, wmma::precision::tf32,
+                   wmma::col_major>
+        af;
+    wmma::fragment<wmma::matrix_b, 16, 16, 8, wmma::precision::tf32,
+                   wmma::row_major>
+        bf;
+    wmma::load_matrix_sync(af, a + (size_t)kk * lda, lda);
+    wmma::load_matrix_sync(bf, b + (size_t)kk * ldb, ldb);
+    wmma::mma_sync(acc, af, bf, acc);
+  }
+  wmma::store_matrix_sync(c, acc, ldc, wmma::mem_row_major);
+}
+
+// Tensor-core version of gdn_chunked_f32. Same C/VC/layout and f32 state,
+// solve, gates and output; the five chunk GEMMs use TF32 WMMA with f32
+// accumulation. NCU note: one CTA per (value-column block, head).
+extern "C" __global__ void gdn_chunked_tc(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc) {
+  constexpr int C = GDN_CHUNK_C;
+  extern __shared__ float sm[];
+  float* S = sm;                       // [dk, vc]
+  float* Kb = S + dk * vc;             // [C, dk]
+  float* WQ = Kb + C * dk;             // [C, dk] (W, later Q)
+  float* Vb = WQ + C * dk;             // [C, vc] (V, later WS/QS, then scratch)
+  float* Ub = Vb + C * vc;             // [C, vc] (U, later Vnew)
+  float* Ab = Ub + C * vc;             // [C, C]
+  float* Gb = Ab + C * C;              // [C]
+  float* Bb = Gb + C;                  // [C]
+  float* ExpG = Bb + C;                // [C]
+  float* Dg = ExpG + C;                // [C] exp(G_last - G_i)
+
+  const int h = blockIdx.y;
+  const int j0 = blockIdx.x * vc;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int nchunks = (seq + C - 1) / C;
+
+  for (int i = tid; i < dk * vc; i += blockDim.x) S[i] = 0.f;
+
+  for (int c = 0; c < nchunks; ++c) {
+    const int t0 = c * C;
+    const int L = min(C, seq - t0);
+
+    for (int idx = tid; idx < C * dk; idx += blockDim.x) {
+      int i = idx / dk, d = idx - i * dk;
+      float val = 0.f;
+      if (i < L) val = k[((size_t)(t0 + i) * heads + h) * dk + d];
+      Kb[idx] = val;
+    }
+    for (int idx = tid; idx < C * vc; idx += blockDim.x) {
+      int i = idx / vc, j = idx - i * vc;
+      float val = 0.f;
+      if (i < L) val = v[((size_t)(t0 + i) * heads + h) * dv + j0 + j];
+      Vb[idx] = val;
+    }
+    if (tid < C) {
+      if (tid < L) {
+        Gb[tid] = g[(t0 + tid) * heads + h];
+        Bb[tid] = beta[(t0 + tid) * heads + h];
+      } else {
+        Gb[tid] = 0.f;
+        Bb[tid] = 0.f;
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      for (int i = 1; i < C; ++i) Gb[i] += Gb[i - 1];
+    }
+    __syncthreads();
+    if (tid < C) {
+      ExpG[tid] = expf(Gb[tid]);
+      Dg[tid] = expf(Gb[C - 1] - Gb[tid]);
+    }
+    __syncthreads();
+
+    // A = K K^T (2x2 16x16 tiles), then strict-lower mask + beta + decay.
+    if (warp < 4) {
+      int mi = warp >> 1, nj = warp & 1;
+      tf32_tile_rc(Kb + mi * 16 * dk, dk, Kb + nj * 16 * dk, dk,
+                   Ab + mi * 16 * C + nj * 16, C, dk);
+    }
+    __syncthreads();
+    for (int i = tid; i < C * C; i += blockDim.x) {
+      int r = i / C, col = i - r * C;
+      if (r > col)
+        Ab[i] *= Bb[r] * expf(Gb[r] - Gb[col]);
+      else
+        Ab[i] = 0.f;
+    }
+    __syncthreads();
+
+    // Scalar f32 forward substitution (unchanged from the prototype).
+    const int cols = vc + dk;
+    for (int i = 0; i < C; ++i) {
+      for (int col = tid; col < cols; col += blockDim.x) {
+        float rhs = (col < vc)
+                        ? Bb[i] * Vb[i * vc + col]
+                        : Bb[i] * ExpG[i] * Kb[i * dk + (col - vc)];
+        float acc = 0.f;
+        for (int j = 0; j < i; ++j) {
+          float x = (col < vc) ? Ub[j * vc + col] : WQ[j * dk + (col - vc)];
+          acc += Ab[i * C + j] * x;
+        }
+        if (col < vc)
+          Ub[i * vc + col] = rhs - acc;
+        else
+          WQ[i * dk + (col - vc)] = rhs - acc;
+      }
+      __syncthreads();
+    }
+
+    // Vnew = U - W S (WMMA into Vb, then elementwise subtract into Ub).
+    if (warp < 8) {
+      int mi = warp >> 2, nj = warp & 3;
+      tf32_tile_rr(WQ + mi * 16 * dk, dk, S + nj * 16, vc,
+                   Vb + mi * 16 * vc + nj * 16, vc, dk);
+    }
+    __syncthreads();
+    for (int idx = tid; idx < C * vc; idx += blockDim.x) Ub[idx] -= Vb[idx];
+    __syncthreads();
+
+    // Q into the free W buffer.
+    for (int idx = tid; idx < C * dk; idx += blockDim.x) {
+      int i = idx / dk, d = idx - i * dk;
+      float val = 0.f;
+      if (i < L) val = q[((size_t)(t0 + i) * heads + h) * dk + d];
+      WQ[idx] = val;
+    }
+    __syncthreads();
+
+    // QS into Vb.
+    if (warp < 8) {
+      int mi = warp >> 2, nj = warp & 3;
+      tf32_tile_rr(WQ + mi * 16 * dk, dk, S + nj * 16, vc,
+                   Vb + mi * 16 * vc + nj * 16, vc, dk);
+    }
+    __syncthreads();
+
+    // QK^T (2x2) into Ab, then inclusive-lower decay mask.
+    if (warp < 4) {
+      int mi = warp >> 1, nj = warp & 1;
+      tf32_tile_rc(WQ + mi * 16 * dk, dk, Kb + nj * 16 * dk, dk,
+                   Ab + mi * 16 * C + nj * 16, C, dk);
+    }
+    __syncthreads();
+    for (int i = tid; i < C * C; i += blockDim.x) {
+      int r = i / C, col = i - r * C;
+      Ab[i] = (r >= col) ? Ab[i] * expf(Gb[r] - Gb[col]) : 0.f;
+    }
+    __syncthreads();
+
+    // Am @ Vnew into WQ (Q is dead now), then combine with QS.
+    if (warp < 8) {
+      int mi = warp >> 2, nj = warp & 3;
+      tf32_tile_rr(Ab + mi * 16 * C, C, Ub + nj * 16, vc,
+                   WQ + mi * 16 * vc + nj * 16, vc, C);
+    }
+    __syncthreads();
+    for (int idx = tid; idx < C * vc; idx += blockDim.x) {
+      int i = idx / vc, j = idx - i * vc;
+      if (i >= L) continue;
+      float o = ExpG[i] * Vb[idx] + WQ[idx];
+      out[((size_t)(t0 + i) * heads + h) * dv + j0 + j] = f2bf(o);
+    }
+    __syncthreads();
+
+    // S_new = exp(gl) S + K^T (exp(gl-G) Vnew). The 128x64x32 GEMM is small
+    // enough that the f32 SIMT loop is faster than 32 WMMA tiles + shadow.
+    const float egl = ExpG[C - 1];
+    for (int idx = tid; idx < dk * vc; idx += blockDim.x) {
+      int d = idx / vc, j = idx - d * vc;
+      float acc = egl * S[idx];
+#pragma unroll 4
+      for (int i = 0; i < C; ++i)
+        acc += Kb[i * dk + d] * Dg[i] * Ub[i * vc + j];
+      S[idx] = acc;
+    }
+    __syncthreads();
+  }
+
+  for (int idx = tid; idx < dk * vc; idx += blockDim.x) {
+    int d = idx / vc, j = idx - d * vc;
+    state[((size_t)h * dk + d) * dv + j0 + j] = S[idx];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Batched variants: every sequence is a contiguous row range
 // [offsets[s], offsets[s] + lens[s]) in the flattened [total, ...] buffers.
 // ---------------------------------------------------------------------------

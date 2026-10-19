@@ -30,6 +30,7 @@ pub struct Kernels {
     pub gdn_recurrent_shared_batched: CudaFunction,
     pub gdn_recurrent_split_batched: CudaFunction,
     pub gdn_chunked: CudaFunction,
+    pub gdn_chunked_tc: CudaFunction,
     pub conv1d_silu_batched: CudaFunction,
     pub conv1d_silu_tiled: CudaFunction,
     pub conv1d_silu_tiled_batched: CudaFunction,
@@ -109,6 +110,14 @@ impl Kernels {
             },
             gdn_chunked: {
                 let f = gpu.func("gdn_chunked_f32")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    90112,
+                )?;
+                f
+            },
+            gdn_chunked_tc: {
+                let f = gpu.func("gdn_chunked_tc")?;
                 f.set_attribute(
                     CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     90112,
