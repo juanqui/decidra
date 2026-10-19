@@ -56,22 +56,28 @@ the reference GPTQ-Marlin repack / scale / zero-point permutations bit-exactly f
 |---|---|---|---|
 | 36 tokens | 174.7 ms | 84.8 ms | **45.1 ms** (3.87x) |
 | 76 tokens | 202.2 ms | 126.4 ms | **73.0 ms** (2.77x) |
-| 1024 tokens | 1261.2 ms | 1261.2 ms | **486.1 ms** (2.59x) |
+| 1024 tokens | 1261.2 ms | 1261.2 ms | **488 ms** (2.58x) |
 
 Marlin resident weights use **13.1 GiB**; preload/repack takes **10.1 s**. Tiled FA2
-attention plus split-dk GDN makes long context **GEMM-bound** at ~0.49-0.55 ms/token:
+attention plus gated split-dk GDN makes long context **GEMM-bound** at ~0.49-0.55 ms/token:
 
 | tokens | full forward (tiled FA2 + split GDN) | previous warp | peak GPU mem |
 |---|---|---|---|
-| 1K | **0.486 s** | 0.959 s | 13.1 GiB resident |
+| 1K | **0.488 s** | 0.959 s | 13.1 GiB resident |
 | 4K | **2.12-2.18 s** | 4.65 s | ~17.2 GiB |
 | 8K | **4.23-4.32 s** | 9.88 s | ~17.6 GiB |
-| 16K | **8.62-8.85 s** | 22.88 s | 18.86 GiB |
+| 16K | **8.62-8.97 s** | 22.88 s | 18.86 GiB |
 
 The attention kernel itself is 7-12x faster than warp on identical buffers (kernel-only
 1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms). The split-dk GDN recurrence is 3.9x faster on its
-hot kernel (1K per-layer 13.35 -> 3.41 ms; 1K forward 958 -> 486 ms). Remaining time is
+hot kernel (1K per-layer 13.35 -> 3.41 ms; 1K forward 958 -> 488 ms). Remaining time is
 dominated by W4A16 GEMMs; attention is <1% at 1K and still small at 16K.
+
+Split GDN is used only for **seq >= `gdn_split_min_seq` (default 512)**. Short prompts
+use the accurate single-column shared recurrence: the four-way f32 reduction reorders
+the state dot products enough to shift a rare short-prompt logit. Suite row `r22`
+(54 tokens) measured split two-way delta **1.43e-2** (fails) versus shared **6.43e-3**
+(passes). Long sequences keep the 3.9x split path; 16K remains 8.62-8.97 s and passes.
 
 Long-context correctness against CPU AWQ/SDPA probes (Marlin + tiled FA2 + split GDN):
 
