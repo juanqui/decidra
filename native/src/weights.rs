@@ -197,6 +197,9 @@ impl<'a> WeightProvider<'a> {
                 bail!("{module}: scale/zp size mismatch");
             }
             if self.marlin && out % 64 == 0 && in_ % 64 == 0 {
+                if self.marlin_fp8 && group_size != 64 {
+                    bail!("W4A8 transform requires group_size 64, got {group_size}");
+                }
                 let dbg = std::env::var("JEV_MARLIN_DEBUG").is_ok();
                 if dbg {
                     eprintln!("marlin repack {module}: out={out} in={in_}");
@@ -204,14 +207,28 @@ impl<'a> WeightProvider<'a> {
                 let sms = 128usize;
                 let src = self.stream.clone_htod(&packed)?;
                 let mut gptq = self.stream.alloc_zeros::<i32>(out * packed_words)?;
-                crate::kernels::marlin_transpose(
-                    self.gpu,
-                    &self.kernels.marlin_transpose,
-                    &src,
-                    &mut gptq,
-                    out,
-                    packed_words,
-                )?;
+                if self.marlin_fp8 {
+                    let zp_dev = self.stream.clone_htod(&zp)?;
+                    crate::kernels::awq_fp8_transform(
+                        self.gpu,
+                        &self.kernels.awq_fp8_transform,
+                        &src,
+                        &zp_dev,
+                        &mut gptq,
+                        in_,
+                        out,
+                        groups,
+                    )?;
+                } else {
+                    crate::kernels::marlin_transpose(
+                        self.gpu,
+                        &self.kernels.marlin_transpose,
+                        &src,
+                        &mut gptq,
+                        out,
+                        packed_words,
+                    )?;
+                }
                 if dbg {
                     self.stream.synchronize()?;
                     eprintln!("  transpose ok");
@@ -392,7 +409,7 @@ fn marlin_permute_scales_a8(ct: &[bf16], out: usize, groups: usize) -> Vec<bf16>
     let mut outv = vec![bf16::ZERO; n];
     for b in 0..n / 32 {
         for i in 0..32 {
-            outv[b * 32 + i] = transposed[b * 32 + perm[i]];
+            outv[b * 32 + i] = bf16::from_f32(transposed[b * 32 + perm[i]].to_f32() * 512.0);
         }
     }
     outv
@@ -470,6 +487,28 @@ fn marlin_permute_zeros_a8(ct: &[i32], out: usize, groups: usize) -> Vec<i32> {
 }
 
 #[cfg(test)]
+fn awq_transform_host(packed: &[i32], zp: &[i32], k: usize, n: usize, groups: usize) -> Vec<i32> {
+    let words_k = k / 8;
+    let mut out = vec![0i32; words_k * n];
+    for kk in 0..words_k {
+        for col in 0..n {
+            let word = packed[col * words_k + kk] as u32;
+            let zword = zp[(col / 8) * groups + (kk * 8) / 64] as u32;
+            let z = (zword >> (4 * (col % 8))) & 0xF;
+            let mut outw = 0u32;
+            for j in 0..8 {
+                let q = (word >> (4 * j)) & 0xF;
+                let v = q as i32 - z as i32;
+                let t = if v < 0 { 15 - q } else { v as u32 };
+                outw |= t << (4 * j);
+            }
+            out[kk * n + col] = outw as i32;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -487,7 +526,7 @@ mod tests {
             for i in 0..32 {
                 assert_eq!(
                     got[b * 32 + i].to_f32(),
-                    (b * 32 + perm[i]) as f32,
+                    ((b * 32 + perm[i]) as f32) * 512.0,
                     "block {b} index {i}"
                 );
             }
@@ -517,5 +556,57 @@ mod tests {
             -134744073,
         ];
         assert_eq!(got, want.to_vec());
+    }
+
+    #[test]
+    fn awq_fp8_transform_matches_canonical_rule() {
+        let k = 128usize; // groups = 2
+        let n = 64usize;
+        let groups = k / 64;
+        let words_k = k / 8;
+        // q[k,n] = (9*k + 5*n + 3) % 16; z[g,n] = (7*g + 11*n + 2) % 16.
+        let mut q = vec![0u8; k * n];
+        let mut z = vec![0u8; groups * n];
+        for kk in 0..k {
+            for col in 0..n {
+                q[kk * n + col] = ((9 * kk + 5 * col + 3) % 16) as u8;
+            }
+        }
+        for g in 0..groups {
+            for col in 0..n {
+                z[g * n + col] = ((7 * g + 11 * col + 2) % 16) as u8;
+            }
+        }
+        // CT packed [N, K/8] and zp [N/8, groups].
+        let mut packed = vec![0i32; n * words_k];
+        for col in 0..n {
+            for kk in 0..words_k {
+                let mut w = 0u32;
+                for j in 0..8 {
+                    w |= (q[(kk * 8 + j) * n + col] as u32) << (4 * j);
+                }
+                packed[col * words_k + kk] = w as i32;
+            }
+        }
+        let zp_words = n / 8;
+        let mut zp = vec![0i32; zp_words * groups];
+        for g in 0..groups {
+            for col in 0..n {
+                let w = &mut zp[(col / 8) * groups + g];
+                *w |= (z[g * n + col] as i32) << (4 * (col % 8));
+            }
+        }
+        let got = awq_transform_host(&packed, &zp, k, n, groups);
+        for kk in 0..k {
+            for col in 0..n {
+                let word = got[(kk / 8) * n + col] as u32;
+                let t = (word >> (4 * (kk % 8))) & 0xF;
+                let orig = q[kk * n + col] as i32;
+                let zz = z[(kk / 64) * n + col] as i32;
+                let v = orig - zz;
+                let want = if v < 0 { 15 - orig } else { v } as u32;
+                assert_eq!(t, want, "k={kk} n={col}");
+            }
+        }
     }
 }

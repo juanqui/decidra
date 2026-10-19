@@ -23,6 +23,33 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
   return scratch[0];
 }
 
+// Canonical AWQ -> W4A8 transform. Input is CT packed [N, K/8] (nibble k =
+// K index 8j+k) and CT packed zero points [N/8, groups] (nibble n%8 = output
+// column). Output is the transformed q2 in the same CT layout [K/8, N].
+//   q2 = q - z;  if (q2 < 0) q2 = 15 - q
+// The zero point is constant for each 8-K word because groups are 64-aligned.
+extern "C" __global__ void awq_fp8_transform_q4(
+    const int* __restrict__ packed, const int* __restrict__ zp,
+    int* __restrict__ out, int k, int n, int groups) {
+  int words_k = k / 8;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= words_k * n) return;
+  int kk = idx / n;
+  int col = idx - kk * n;
+  int word = packed[col * words_k + kk];
+  int zword = zp[(col / 8) * groups + (kk * 8) / 64];
+  int z = (zword >> (4 * (col % 8))) & 0xF;
+  int outw = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    int q = (word >> (4 * j)) & 0xF;
+    int v = q - z;
+    int t = v < 0 ? 15 - q : v;
+    outw |= t << (4 * j);
+  }
+  out[kk * n + col] = outw;
+}
+
 // Per-token FP8 E4M3 quantization of an f32 activation matrix [rows, k].
 // One CTA per row; scale = max_abs / 448 (E4M3 max finite).
 extern "C" __global__ void quant_fp8_per_token_f32(

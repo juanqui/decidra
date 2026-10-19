@@ -44,6 +44,7 @@ pub struct Kernels {
     pub marlin_fp8_cfgs: Vec<CudaFunction>,
     pub marlin_repack: CudaFunction,
     pub marlin_repack_a8: CudaFunction,
+    pub awq_fp8_transform: CudaFunction,
     pub marlin_transpose: CudaFunction,
 }
 
@@ -183,6 +184,7 @@ impl Kernels {
             marlin_repack_a8: gpu.func_marlin(
                 "_ZN6marlin29jev_gptq_marlin_repack_kernelILi256ELi4ELb1EEEvPKjPjii",
             )?,
+            awq_fp8_transform: gpu.func("awq_fp8_transform_q4")?,
             marlin_transpose: gpu.func_marlin("_Z26transpose_packed_q4_kernelPKjPjii")?,
             gemm_w4a16: gpu.func("gemm_w4a16_bf16")?,
             gemm_w4a16_m128: {
@@ -639,6 +641,36 @@ pub fn marlin_gemm(
         gpu.synchronize()?;
         eprintln!("marlin gemm ok: m={m} n={n} k={k} off={row_off}");
     }
+    Ok(())
+}
+
+/// Canonical AWQ -> W4A8 transform: CT packed [N,K/8] + CT zp -> q2 [K/8,N].
+#[allow(clippy::too_many_arguments)]
+pub fn awq_fp8_transform(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    packed: &CudaSlice<i32>,
+    zp: &CudaSlice<i32>,
+    out: &mut CudaSlice<i32>,
+    k: usize,
+    n: usize,
+    groups: usize,
+) -> Result<()> {
+    let total = (k / 8) * n;
+    let cfg = LaunchConfig {
+        grid_dim: (total.div_ceil(256) as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (k_i, n_i, g_i) = (k as i32, n as i32, groups as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(packed);
+    l.arg(zp);
+    l.arg(out);
+    l.arg(&k_i);
+    l.arg(&n_i);
+    l.arg(&g_i);
+    unsafe { l.launch(cfg) }?;
     Ok(())
 }
 
