@@ -235,10 +235,7 @@ fn tc_batched_matches_per_sequence() {
         .stream
         .alloc_zeros::<f32>(batch * heads * dk * dv)
         .unwrap();
-    let mut out_b = gpu
-        .stream
-        .alloc_zeros::<bf16>(total * heads * dv)
-        .unwrap();
+    let mut out_b = gpu.stream.alloc_zeros::<bf16>(total * heads * dv).unwrap();
     kernels::gdn_chunked_batched(
         &gpu,
         &kernels.gdn_chunked_tc_batched,
@@ -262,15 +259,16 @@ fn tc_batched_matches_per_sequence() {
         .stream
         .alloc_zeros::<f32>(batch * heads * dk * dv)
         .unwrap();
-    let mut out_s = gpu
-        .stream
-        .alloc_zeros::<bf16>(total * heads * dv)
-        .unwrap();
+    let mut out_s = gpu.stream.alloc_zeros::<bf16>(total * heads * dv).unwrap();
     for (s, &l) in lens.iter().enumerate() {
         let o = offsets[s] as usize;
         let qv = dq.try_slice(o * heads * dk..(o + l) * heads * dk).unwrap();
-        let kv = dk_h.try_slice(o * heads * dk..(o + l) * heads * dk).unwrap();
-        let vv = dv_h.try_slice(o * heads * dv..(o + l) * heads * dv).unwrap();
+        let kv = dk_h
+            .try_slice(o * heads * dk..(o + l) * heads * dk)
+            .unwrap();
+        let vv = dv_h
+            .try_slice(o * heads * dv..(o + l) * heads * dv)
+            .unwrap();
         let gv = dg.try_slice(o * heads..(o + l) * heads).unwrap();
         let bv = db.try_slice(o * heads..(o + l) * heads).unwrap();
         let mut sv = st_s

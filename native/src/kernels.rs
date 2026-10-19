@@ -1395,8 +1395,8 @@ where
     ST: DevicePtrMut<f32>,
     O: DevicePtrMut<bf16>,
 {
-    if dv % GDN_CHUNK_VC != 0 {
-        anyhow::bail!("dv={dv} not divisible by chunked VC={GDN_CHUNK_VC}");
+    if dk != 128 || dv != 128 {
+        anyhow::bail!("chunked GDN kernel requires dk=dv=128, got dk={dk} dv={dv}");
     }
     let smem = (dk * GDN_CHUNK_VC
         + 2 * GDN_CHUNK_C * dk
@@ -1470,8 +1470,8 @@ where
     OF: DevicePtr<i32>,
     LN: DevicePtr<i32>,
 {
-    if dv % GDN_CHUNK_VC != 0 {
-        anyhow::bail!("dv={dv} not divisible by chunked VC={GDN_CHUNK_VC}");
+    if dk != 128 || dv != 128 {
+        anyhow::bail!("chunked GDN kernel requires dk=dv=128, got dk={dk} dv={dv}");
     }
     let smem = (dk * GDN_CHUNK_VC
         + 2 * GDN_CHUNK_C * dk
@@ -1480,11 +1480,7 @@ where
         + 4 * GDN_CHUNK_C)
         * std::mem::size_of::<f32>();
     let cfg = LaunchConfig {
-        grid_dim: (
-            (dv / GDN_CHUNK_VC) as u32,
-            heads as u32,
-            batch as u32,
-        ),
+        grid_dim: ((dv / GDN_CHUNK_VC) as u32, heads as u32, batch as u32),
         block_dim: (256, 1, 1),
         shared_mem_bytes: smem as u32,
     };

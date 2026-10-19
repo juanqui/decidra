@@ -274,29 +274,39 @@ Measured at 54 tokens on GPU1 (suite `r22`): shared [2.6875, 1.7734],
 chunked TF32 [2.7031, 1.7891], CPU golden [2.6719, 1.7891]. Suite28 with the
 chunked path on every row: top-1 28/28, max delta 6.37e-3, MAE 6.48e-4
 (shared: 1.03e-2 / 9.97e-4), so `r22` stays inside the 0.011 gate. The
-36-token golden head logits are max 0.125 (shared 0.109), top-1 36/36; the
-4K/8K/16K probes keep their documented deltas.
+36-token golden head logits are max 0.109, top-1 36/36; the 4K/8K/16K probes
+are bit-identical to the previous chunked kernel and keep their documented
+deltas.
+
+The chunked kernel uses 128-bit vector loads/stores, a 4-column register-tiled
+triangular solve without per-row barriers, and a 4x4 register-tiled state
+update (64 registers, no spills). It requires `dk=dv=128`; other head dims
+fall back to the shared/split recurrence.
 
 Full forward, warm, RTX 4090 / GPU1:
 
-| tokens | shared GDN | chunked TF32 | GDN per layer (shared -> chunked) |
+| tokens | shared GDN | chunked TF32 | GDN stage (shared -> chunked) |
 |---|---|---|---|
-| 76 | 69.5 ms | **52.0 ms** (1.34x) | 0.575 -> 0.151 ms |
-| 128 | 97.8 ms | **64.9 ms** (1.51x) | 0.966 -> 0.205 ms |
-| 1K | 478 ms | **394 ms** (1.21x) | 3.32 -> 1.57 ms |
+| 76 | 69.5 ms | **52.0 ms** (1.34x) | 27.6 -> 7.3 ms |
+| 128 | 97.8 ms | **64.9 ms** (1.51x) | 46.4 -> 9.8 ms |
+| 1K | 478 ms | **355 ms** (1.35x) | 75.3 -> 30.6 ms |
+| 16K | 8.26 s | **7.53 s** (1.10x) | 1200 -> 485 ms (2.47x) |
 
-1K chunked breakdown (494 ms sum of regions, 394 ms warm forward): MLP GEMMs
-214 ms (43%), `gemm.b` 81 ms, GDN recurrence 81 ms (16%, 2.1x less than
-shared), other GEMMs 90 ms (18%), GDN conv 1.0 ms, MLP activation 6.8 ms,
-attention 4.2 ms.
+The 1K and 16K rows are same-session A/Bs against the pre-optimization chunked
+kernel (old: 400 ms / 8.26 s); absolute latency tracks GPU clocks.
+
+1K chunked breakdown (452 ms sum of regions, 355 ms warm forward): MLP GEMMs
+211 ms (47%), `gemm.b` 84 ms (host launch gap), GDN recurrence 32 ms (7%),
+`in_proj_qkv` 35 ms, `out_proj` 19 ms, `in_proj_z` 19 ms, attention 4.2 ms,
+MLP activation 6.8 ms.
 
 The batched path launches one chunked CTA grid `(dv/VC, heads, batch)` over the
 flattened offsets/lens (`gdn_chunked_tc_batched`) whenever every sequence is
 >= the threshold; mixed batches keep the per-sequence loop. Outputs and state
 are bit-identical to one launch per sequence (covered by the `gdn_chunked`
-test). Batch of 8 x 73 tokens: GDN recurrence 70.3 -> 39.1 ms, warm forward
-256 -> 232 ms (34.5 req/s, 2.3k tok/s). The remaining 232 ms is MLP GEMMs
-119 ms (at ~165 TFLOP/s, i.e. tensor-core peak), non-MLP projections ~55 ms,
+test). Batch of 8 x 73 tokens: GDN recurrence 54.6 -> 19.6 ms and warm forward
+247 -> 212 ms (37.7 req/s, 2.5k tok/s). The remaining 212 ms is MLP GEMMs
+119 ms (at ~165 TFLOP/s, i.e. tensor-core peak), non-MLP projections ~40 ms,
 attention 2.4 ms; `gemm.b` in the profile is host-side launch gap, not GPU
 work.
 

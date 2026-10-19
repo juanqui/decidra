@@ -1210,11 +1210,15 @@ impl Engine {
         let chunked_tc = self.gdn_chunked_tc.load(Ordering::Relaxed);
         let chunked = self.gdn_chunked.load(Ordering::Relaxed);
         let chunk_min = self.gdn_chunked_min_seq.load(Ordering::Relaxed);
-        let chunked_any = (chunked || chunked_tc) && b.lens.iter().any(|&l| l >= chunk_min);
+        let chunked_any = (chunked || chunked_tc)
+            && dk == 128
+            && dv == 128
+            && b.lens.iter().any(|&l| l >= chunk_min);
         // One batched TF32 launch when every sequence is long enough; mixed
         // batches keep the per-sequence loop so short items stay on the
         // accurate shared recurrence.
-        let all_chunked = chunked_tc && b.lens.iter().all(|&l| l >= chunk_min);
+        let all_chunked =
+            chunked_tc && dk == 128 && dv == 128 && b.lens.iter().all(|&l| l >= chunk_min);
         let dv_chunks = if dv >= 64 {
             self.gdn_chunks.load(Ordering::Relaxed).max(1).min(dv / 16)
         } else {
@@ -1303,7 +1307,7 @@ impl Engine {
                     let mut ov = core
                         .try_slice_mut(o * nv * dv..(o + l) * nv * dv)
                         .context("gdn out view")?;
-                    if (chunked || chunked_tc) && l >= chunk_min {
+                    if (chunked || chunked_tc) && l >= chunk_min && dk == 128 && dv == 128 {
                         kernels::gdn_chunked(
                             &self.gpu,
                             if chunked_tc {
@@ -1921,7 +1925,8 @@ impl Engine {
         let mut core = self.alloc_bf16(seq * nv * dv)?;
         let min_seq = self.gdn_split_min_seq.load(Ordering::Relaxed);
         let chunk_min = self.gdn_chunked_min_seq.load(Ordering::Relaxed);
-        if self.gdn_chunked_tc.load(Ordering::Relaxed) && seq >= chunk_min {
+        if self.gdn_chunked_tc.load(Ordering::Relaxed) && seq >= chunk_min && dk == 128 && dv == 128
+        {
             timed!(
                 self,
                 "gdn.recurrent",

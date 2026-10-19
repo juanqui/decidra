@@ -1244,54 +1244,155 @@ __device__ __forceinline__ void tf32_tile_cr(const float* a, int lda,
   wmma::store_matrix_sync(c, acc, ldc, wmma::mem_row_major);
 }
 
+// Forward substitution for four adjacent RHS columns of one chunk. XS is the
+// row stride of X (VC for the U columns, DK for the W columns) and ISV selects
+// the beta*V or beta*exp(G)*K right-hand side. The 32 rows are a serial chain,
+// so the inner j loop carries four independent accumulators.
+template <int XS, bool ISV>
+__device__ __forceinline__ void gdn_solve4(float* __restrict__ X,
+                                           const float* __restrict__ Ab,
+                                           const float* __restrict__ Vb,
+                                           const float* __restrict__ Kb,
+                                           const float* __restrict__ Bb,
+                                           const float* __restrict__ ExpG,
+                                           int off) {
+  constexpr int C = GDN_CHUNK_C;
+  constexpr int VC = 64;
+  constexpr int DK = 128;
+#pragma unroll 4
+  for (int i = 0; i < C; ++i) {
+    const float* arow = Ab + i * C;
+    float4 rhs;
+    if (ISV) {
+      float4 vv = *reinterpret_cast<const float4*>(Vb + i * VC + off);
+      float b = Bb[i];
+      rhs = make_float4(b * vv.x, b * vv.y, b * vv.z, b * vv.w);
+    } else {
+      float4 kk = *reinterpret_cast<const float4*>(Kb + i * DK + off);
+      float b = Bb[i] * ExpG[i];
+      rhs = make_float4(b * kk.x, b * kk.y, b * kk.z, b * kk.w);
+    }
+    float4 ac = make_float4(0.f, 0.f, 0.f, 0.f);
+    int j = 0;
+#pragma unroll 4
+    for (; j + 4 <= i; j += 4) {
+      float4 av = *reinterpret_cast<const float4*>(arow + j);
+      float4 x0 = *reinterpret_cast<const float4*>(X + (j + 0) * XS + off);
+      float4 x1 = *reinterpret_cast<const float4*>(X + (j + 1) * XS + off);
+      float4 x2 = *reinterpret_cast<const float4*>(X + (j + 2) * XS + off);
+      float4 x3 = *reinterpret_cast<const float4*>(X + (j + 3) * XS + off);
+      // Strictly increasing j order per column: the four components are
+      // independent, so this keeps 4-way ILP and the prototype's rounding.
+      ac.x += av.x * x0.x;
+      ac.x += av.y * x1.x;
+      ac.x += av.z * x2.x;
+      ac.x += av.w * x3.x;
+      ac.y += av.x * x0.y;
+      ac.y += av.y * x1.y;
+      ac.y += av.z * x2.y;
+      ac.y += av.w * x3.y;
+      ac.z += av.x * x0.z;
+      ac.z += av.y * x1.z;
+      ac.z += av.z * x2.z;
+      ac.z += av.w * x3.z;
+      ac.w += av.x * x0.w;
+      ac.w += av.y * x1.w;
+      ac.w += av.z * x2.w;
+      ac.w += av.w * x3.w;
+    }
+    for (; j < i; ++j) {
+      float a = arow[j];
+      float4 x0 = *reinterpret_cast<const float4*>(X + j * XS + off);
+      ac.x += a * x0.x;
+      ac.y += a * x0.y;
+      ac.z += a * x0.z;
+      ac.w += a * x0.w;
+    }
+    *reinterpret_cast<float4*>(X + i * XS + off) =
+        make_float4(rhs.x - ac.x, rhs.y - ac.y, rhs.z - ac.z, rhs.w - ac.w);
+  }
+}
+
 // Tensor-core version of gdn_chunked_f32. Same C/VC/layout and f32 state,
 // solve, gates and output; the five chunk GEMMs use TF32 WMMA with f32
 // accumulation. NCU note: one CTA per (value-column block, head).
 //
-// The body is shared by the single-sequence entry point and the batched
-// variant: the batched launcher offsets q/k/v/g/beta/out to the sequence's
-// row range and points state at its slot, leaving blockIdx.x/.y unchanged.
-__device__ __forceinline__ void gdn_chunked_tc_impl(
+// `gdn_chunked_tc_prof` runs the identical code with clock64() phase counters.
+// Phase indices: 0 load, 1 KK^T, 2 A mask, 3 solve, 4 Vnew, 5 Q load, 6 QS,
+// 7 QK+mask, 8 output, 9 state update. One counter per phase per block.
+template <bool PROF>
+__device__ __forceinline__ void gdn_chunked_tc_body(
     const float* __restrict__ q, const float* __restrict__ k,
     const float* __restrict__ v, const float* __restrict__ g,
     const float* __restrict__ beta, float* __restrict__ state,
-    bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc) {
+    bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc,
+    unsigned long long* __restrict__ prof) {
   constexpr int C = GDN_CHUNK_C;
+  // The chunked path is only launched for DK=DV=128, VC=64. Making these
+  // compile-time constants lets every loop below fully unroll.
+  constexpr int DK = 128;
+  constexpr int DV = 128;
+  constexpr int VC = 64;
+  constexpr int THREADS = 256;
+  constexpr int P = 10;
+  unsigned long long acc[P];
+  if (PROF) {
+#pragma unroll
+    for (int p = 0; p < P; ++p) acc[p] = 0;
+  }
   extern __shared__ float sm[];
-  float* S = sm;                       // [dk, vc]
-  float* Kb = S + dk * vc;             // [C, dk]
-  float* WQ = Kb + C * dk;             // [C, dk] (W, later Q)
-  float* Vb = WQ + C * dk;             // [C, vc] (V, later WS/QS, then scratch)
-  float* Ub = Vb + C * vc;             // [C, vc] (U, later Vnew)
-  float* Ab = Ub + C * vc;             // [C, C]
+  float* S = sm;                       // [DK, VC]
+  float* Kb = S + DK * VC;             // [C, DK]
+  float* WQ = Kb + C * DK;             // [C, DK] (W, later Q)
+  float* Vb = WQ + C * DK;             // [C, VC] (V, later WS/QS, then scratch)
+  float* Ub = Vb + C * VC;             // [C, VC] (U, later Vnew)
+  float* Ab = Ub + C * VC;             // [C, C]
   float* Gb = Ab + C * C;              // [C]
   float* Bb = Gb + C;                  // [C]
   float* ExpG = Bb + C;                // [C]
   float* Dg = ExpG + C;                // [C] exp(G_last - G_i)
 
   const int h = blockIdx.y;
-  const int j0 = blockIdx.x * vc;
+  const int j0 = blockIdx.x * VC;
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int nchunks = (seq + C - 1) / C;
 
-  for (int i = tid; i < dk * vc; i += blockDim.x) S[i] = 0.f;
+  unsigned long long pt0 = PROF ? clock64() : 0ull;
+#define PH_MARK(p)                          \
+  if (PROF) {                               \
+    unsigned long long now = clock64();     \
+    if (tid == 0) acc[p] += now - pt0;      \
+    pt0 = now;                              \
+  }
+
+  for (int i = tid; i < DK * VC; i += blockDim.x) S[i] = 0.f;
 
   for (int c = 0; c < nchunks; ++c) {
     const int t0 = c * C;
     const int L = min(C, seq - t0);
 
-    for (int idx = tid; idx < C * dk; idx += blockDim.x) {
-      int i = idx / dk, d = idx - i * dk;
-      float val = 0.f;
-      if (i < L) val = k[((size_t)(t0 + i) * heads + h) * dk + d];
-      Kb[idx] = val;
+    // Vectorised, fully unrolled loads: 16 bytes per thread per step keeps
+    // several loads in flight instead of paying one latency per element.
+#pragma unroll
+    for (int it = 0; it < (C * DK) / (4 * THREADS); ++it) {
+      int e = (it * THREADS + tid) * 4;
+      int i = e / DK, d = e - i * DK;
+      float4 val = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (i < L)
+        val = *reinterpret_cast<const float4*>(
+            k + ((size_t)(t0 + i) * heads + h) * DK + d);
+      *reinterpret_cast<float4*>(Kb + e) = val;
     }
-    for (int idx = tid; idx < C * vc; idx += blockDim.x) {
-      int i = idx / vc, j = idx - i * vc;
-      float val = 0.f;
-      if (i < L) val = v[((size_t)(t0 + i) * heads + h) * dv + j0 + j];
-      Vb[idx] = val;
+#pragma unroll
+    for (int it = 0; it < (C * VC) / (4 * THREADS); ++it) {
+      int e = (it * THREADS + tid) * 4;
+      int i = e / VC, j = e - i * VC;
+      float4 val = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (i < L)
+        val = *reinterpret_cast<const float4*>(
+            v + ((size_t)(t0 + i) * heads + h) * DV + j0 + j);
+      *reinterpret_cast<float4*>(Vb + e) = val;
     }
     if (tid < C) {
       if (tid < L) {
@@ -1313,14 +1414,16 @@ __device__ __forceinline__ void gdn_chunked_tc_impl(
       Dg[tid] = expf(Gb[C - 1] - Gb[tid]);
     }
     __syncthreads();
+    PH_MARK(0);
 
     // A = K K^T (2x2 16x16 tiles), then strict-lower mask + beta + decay.
     if (warp < 4) {
       int mi = warp >> 1, nj = warp & 1;
-      tf32_tile_rc(Kb + mi * 16 * dk, dk, Kb + nj * 16 * dk, dk,
-                   Ab + mi * 16 * C + nj * 16, C, dk);
+      tf32_tile_rc(Kb + mi * 16 * DK, DK, Kb + nj * 16 * DK, DK,
+                   Ab + mi * 16 * C + nj * 16, C, DK);
     }
     __syncthreads();
+    PH_MARK(1);
     for (int i = tid; i < C * C; i += blockDim.x) {
       int r = i / C, col = i - r * C;
       if (r > col)
@@ -1329,59 +1432,65 @@ __device__ __forceinline__ void gdn_chunked_tc_impl(
         Ab[i] = 0.f;
     }
     __syncthreads();
+    PH_MARK(2);
 
-    // Scalar f32 forward substitution (unchanged from the prototype).
-    const int cols = vc + dk;
-    for (int i = 0; i < C; ++i) {
-      for (int col = tid; col < cols; col += blockDim.x) {
-        float rhs = (col < vc)
-                        ? Bb[i] * Vb[i * vc + col]
-                        : Bb[i] * ExpG[i] * Kb[i * dk + (col - vc)];
-        float acc = 0.f;
-        for (int j = 0; j < i; ++j) {
-          float x = (col < vc) ? Ub[j * vc + col] : WQ[j * dk + (col - vc)];
-          acc += Ab[i * C + j] * x;
-        }
-        if (col < vc)
-          Ub[i * vc + col] = rhs - acc;
-        else
-          WQ[i * dk + (col - vc)] = rhs - acc;
-      }
-      __syncthreads();
+    // Four adjacent columns per thread; warp 0 owns the 128 W columns and the
+    // first half of warp 1 the 64 U columns. Columns are independent, so the
+    // substitution needs no per-row __syncthreads.
+    if (tid < DK / 4) {
+      gdn_solve4<DK, false>(WQ, Ab, Vb, Kb, Bb, ExpG, tid * 4);
+    } else if (tid < (DK + VC) / 4) {
+      gdn_solve4<VC, true>(Ub, Ab, Vb, Kb, Bb, ExpG, (tid - DK / 4) * 4);
     }
+    __syncthreads();
+    PH_MARK(3);
 
     // Vnew = U - W S (WMMA into Vb, then elementwise subtract into Ub).
     if (warp < 8) {
       int mi = warp >> 2, nj = warp & 3;
-      tf32_tile_rr(WQ + mi * 16 * dk, dk, S + nj * 16, vc,
-                   Vb + mi * 16 * vc + nj * 16, vc, dk);
+      tf32_tile_rr(WQ + mi * 16 * DK, DK, S + nj * 16, VC,
+                   Vb + mi * 16 * VC + nj * 16, VC, DK);
     }
     __syncthreads();
-    for (int idx = tid; idx < C * vc; idx += blockDim.x) Ub[idx] -= Vb[idx];
+#pragma unroll
+    for (int it = 0; it < (C * VC) / (4 * THREADS); ++it) {
+      int e = (it * THREADS + tid) * 4;
+      float4 a = *reinterpret_cast<const float4*>(Ub + e);
+      float4 b = *reinterpret_cast<const float4*>(Vb + e);
+      a.x -= b.x; a.y -= b.y; a.z -= b.z; a.w -= b.w;
+      *reinterpret_cast<float4*>(Ub + e) = a;
+    }
     __syncthreads();
+    PH_MARK(4);
 
     // Q into the free W buffer.
-    for (int idx = tid; idx < C * dk; idx += blockDim.x) {
-      int i = idx / dk, d = idx - i * dk;
-      float val = 0.f;
-      if (i < L) val = q[((size_t)(t0 + i) * heads + h) * dk + d];
-      WQ[idx] = val;
+#pragma unroll
+    for (int it = 0; it < (C * DK) / (4 * THREADS); ++it) {
+      int e = (it * THREADS + tid) * 4;
+      int i = e / DK, d = e - i * DK;
+      float4 val = make_float4(0.f, 0.f, 0.f, 0.f);
+      if (i < L)
+        val = *reinterpret_cast<const float4*>(
+            q + ((size_t)(t0 + i) * heads + h) * DK + d);
+      *reinterpret_cast<float4*>(WQ + e) = val;
     }
     __syncthreads();
+    PH_MARK(5);
 
     // QS into Vb.
     if (warp < 8) {
       int mi = warp >> 2, nj = warp & 3;
-      tf32_tile_rr(WQ + mi * 16 * dk, dk, S + nj * 16, vc,
-                   Vb + mi * 16 * vc + nj * 16, vc, dk);
+      tf32_tile_rr(WQ + mi * 16 * DK, DK, S + nj * 16, VC,
+                   Vb + mi * 16 * VC + nj * 16, VC, DK);
     }
     __syncthreads();
+    PH_MARK(6);
 
     // QK^T (2x2) into Ab, then inclusive-lower decay mask.
     if (warp < 4) {
       int mi = warp >> 1, nj = warp & 1;
-      tf32_tile_rc(WQ + mi * 16 * dk, dk, Kb + nj * 16 * dk, dk,
-                   Ab + mi * 16 * C + nj * 16, C, dk);
+      tf32_tile_rc(WQ + mi * 16 * DK, DK, Kb + nj * 16 * DK, DK,
+                   Ab + mi * 16 * C + nj * 16, C, DK);
     }
     __syncthreads();
     for (int i = tid; i < C * C; i += blockDim.x) {
@@ -1389,40 +1498,91 @@ __device__ __forceinline__ void gdn_chunked_tc_impl(
       Ab[i] = (r >= col) ? Ab[i] * expf(Gb[r] - Gb[col]) : 0.f;
     }
     __syncthreads();
+    PH_MARK(7);
 
     // Am @ Vnew into WQ (Q is dead now), then combine with QS.
     if (warp < 8) {
       int mi = warp >> 2, nj = warp & 3;
-      tf32_tile_rr(Ab + mi * 16 * C, C, Ub + nj * 16, vc,
-                   WQ + mi * 16 * vc + nj * 16, vc, C);
+      tf32_tile_rr(Ab + mi * 16 * C, C, Ub + nj * 16, VC,
+                   WQ + mi * 16 * VC + nj * 16, VC, C);
     }
     __syncthreads();
-    for (int idx = tid; idx < C * vc; idx += blockDim.x) {
-      int i = idx / vc, j = idx - i * vc;
+#pragma unroll
+    for (int it = 0; it < (C * VC) / (4 * THREADS); ++it) {
+      int e = (it * THREADS + tid) * 4;
+      int i = e / VC, j = e - i * VC;
       if (i >= L) continue;
-      float o = ExpG[i] * Vb[idx] + WQ[idx];
-      out[((size_t)(t0 + i) * heads + h) * dv + j0 + j] = f2bf(o);
+      float4 qs = *reinterpret_cast<const float4*>(Vb + e);
+      float4 am = *reinterpret_cast<const float4*>(WQ + e);
+      float eg = ExpG[i];
+      bf16* dst = out + ((size_t)(t0 + i) * heads + h) * DV + j0 + j;
+      dst[0] = f2bf(eg * qs.x + am.x);
+      dst[1] = f2bf(eg * qs.y + am.y);
+      dst[2] = f2bf(eg * qs.z + am.z);
+      dst[3] = f2bf(eg * qs.w + am.w);
     }
     __syncthreads();
+    PH_MARK(8);
 
-    // S_new = exp(gl) S + K^T (exp(gl-G) Vnew). The 128x64x32 GEMM is small
-    // enough that the f32 SIMT loop is faster than 32 WMMA tiles + shadow.
+    // S_new = exp(gl) S + K^T (exp(gl-G) Vnew). Pre-scale K by the per-row
+    // decay (Kb is dead after the output), then run the 128x64x32 GEMM as a
+    // 4x4 register tile per thread: two LDS.128 per k step feed 16 f32 FMAs.
+    // Scaling K rather than Vnew keeps the prototype's (Kb*Dg)*Vnew rounding.
+    for (int it = 0; it < (C * DK) / (4 * THREADS); ++it) {
+      int e = (it * THREADS + tid) * 4;
+      float dgi = Dg[e / DK];
+      float4 kk = *reinterpret_cast<const float4*>(Kb + e);
+      *reinterpret_cast<float4*>(Kb + e) =
+          make_float4(dgi * kk.x, dgi * kk.y, dgi * kk.z, dgi * kk.w);
+    }
+    __syncthreads();
     const float egl = ExpG[C - 1];
-    for (int idx = tid; idx < dk * vc; idx += blockDim.x) {
-      int d = idx / vc, j = idx - d * vc;
-      float acc = egl * S[idx];
-#pragma unroll 4
-      for (int i = 0; i < C; ++i)
-        acc += Kb[i * dk + d] * Dg[i] * Ub[i * vc + j];
-      S[idx] = acc;
+    constexpr int JT = VC / 4;
+#pragma unroll
+    for (int it = 0; it < (DK * VC) / (16 * THREADS); ++it) {
+      int tile = it * THREADS + tid;
+      int dt = tile / JT, jt = tile - dt * JT;
+      int d0 = dt * 4, jc = jt * 4;
+      float4 s0 = *reinterpret_cast<const float4*>(S + (d0 + 0) * VC + jc);
+      float4 s1 = *reinterpret_cast<const float4*>(S + (d0 + 1) * VC + jc);
+      float4 s2 = *reinterpret_cast<const float4*>(S + (d0 + 2) * VC + jc);
+      float4 s3 = *reinterpret_cast<const float4*>(S + (d0 + 3) * VC + jc);
+      float4 a0 = make_float4(egl * s0.x, egl * s0.y, egl * s0.z, egl * s0.w);
+      float4 a1 = make_float4(egl * s1.x, egl * s1.y, egl * s1.z, egl * s1.w);
+      float4 a2 = make_float4(egl * s2.x, egl * s2.y, egl * s2.z, egl * s2.w);
+      float4 a3 = make_float4(egl * s3.x, egl * s3.y, egl * s3.z, egl * s3.w);
+#pragma unroll
+      for (int i = 0; i < C; ++i) {
+        float4 kk = *reinterpret_cast<const float4*>(Kb + i * DK + d0);
+        float4 u = *reinterpret_cast<const float4*>(Ub + i * VC + jc);
+        a0.x += kk.x * u.x; a0.y += kk.x * u.y; a0.z += kk.x * u.z; a0.w += kk.x * u.w;
+        a1.x += kk.y * u.x; a1.y += kk.y * u.y; a1.z += kk.y * u.z; a1.w += kk.y * u.w;
+        a2.x += kk.z * u.x; a2.y += kk.z * u.y; a2.z += kk.z * u.z; a2.w += kk.z * u.w;
+        a3.x += kk.w * u.x; a3.y += kk.w * u.y; a3.z += kk.w * u.z; a3.w += kk.w * u.w;
+      }
+      *reinterpret_cast<float4*>(S + (d0 + 0) * VC + jc) = a0;
+      *reinterpret_cast<float4*>(S + (d0 + 1) * VC + jc) = a1;
+      *reinterpret_cast<float4*>(S + (d0 + 2) * VC + jc) = a2;
+      *reinterpret_cast<float4*>(S + (d0 + 3) * VC + jc) = a3;
     }
     __syncthreads();
+    PH_MARK(9);
   }
 
-  for (int idx = tid; idx < dk * vc; idx += blockDim.x) {
-    int d = idx / vc, j = idx - d * vc;
-    state[((size_t)h * dk + d) * dv + j0 + j] = S[idx];
+  for (int idx = tid; idx < DK * VC; idx += blockDim.x) {
+    int d = idx / VC, j = idx - d * VC;
+    state[((size_t)h * DK + d) * DV + j0 + j] = S[idx];
   }
+
+  if (PROF) {
+    __syncthreads();
+    if (tid == 0) {
+      unsigned long long* o =
+          prof + (size_t)(blockIdx.y * gridDim.x + blockIdx.x) * P;
+      for (int p = 0; p < P; ++p) o[p] = acc[p];
+    }
+  }
+#undef PH_MARK
 }
 
 extern "C" __global__ void gdn_chunked_tc(
@@ -1430,7 +1590,18 @@ extern "C" __global__ void gdn_chunked_tc(
     const float* __restrict__ v, const float* __restrict__ g,
     const float* __restrict__ beta, float* __restrict__ state,
     bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc) {
-  gdn_chunked_tc_impl(q, k, v, g, beta, state, out, seq, heads, dk, dv, vc);
+  gdn_chunked_tc_body<false>(q, k, v, g, beta, state, out, seq, heads, dk, dv,
+                             vc, nullptr);
+}
+
+extern "C" __global__ void gdn_chunked_tc_prof(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc,
+    unsigned long long* __restrict__ prof) {
+  gdn_chunked_tc_body<true>(q, k, v, g, beta, state, out, seq, heads, dk, dv,
+                            vc, prof);
 }
 
 // One launch for a batch of sequences. Grid is (dv/VC, heads, batch); each
@@ -1448,10 +1619,10 @@ extern "C" __global__ void gdn_chunked_tc_batched(
   const int l = lens[z];
   const size_t krow = (size_t)heads * dk;
   const size_t vrow = (size_t)heads * dv;
-  gdn_chunked_tc_impl(q + o * krow, k + o * krow, v + o * vrow,
-                      g + (size_t)o * heads, beta + (size_t)o * heads,
-                      state + (size_t)z * krow * dv, out + o * vrow, l,
-                      heads, dk, dv, vc);
+  gdn_chunked_tc_body<false>(q + o * krow, k + o * krow, v + o * vrow,
+                             g + (size_t)o * heads, beta + (size_t)o * heads,
+                             state + (size_t)z * krow * dv, out + o * vrow, l,
+                             heads, dk, dv, vc, nullptr);
 }
 
 // ---------------------------------------------------------------------------

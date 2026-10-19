@@ -122,8 +122,7 @@ impl Config {
             native_batch_window_us = 0;
         }
         let native_gdn_chunked = env_bool("JEV_NATIVE_GDN_CHUNKED")?.unwrap_or(true);
-        let native_gdn_chunked_min_seq =
-            env_usize("JEV_NATIVE_GDN_CHUNKED_MIN_SEQ")?.unwrap_or(64);
+        let native_gdn_chunked_min_seq = env_usize("JEV_NATIVE_GDN_CHUNKED_MIN_SEQ")?.unwrap_or(64);
         let decision_cache_size =
             env_usize("JEV_DECISION_CACHE_SIZE")?.unwrap_or(DEFAULT_DECISION_CACHE_SIZE);
 
