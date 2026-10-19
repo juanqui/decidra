@@ -14,7 +14,9 @@ therefore needs no CUDA toolkit at runtime, only the driver and cuBLAS runtime l
 |---|---|
 | RMSNorm | zero-centered Qwen3.5 norms (`(1 + w)`); plain norm for GDN gated norm |
 | RoPE | partial rotary factors on full-attention Q/K |
-| Causal GQA attention | full-attention layers |
+| Tiled FA2-style causal GQA | full-attention layers (default; 64-query CTAs, 32-key tiles, cp.async, BF16 WMMA) |
+| Warp-per-query causal GQA | full-attention fallback (`--legacy-attention`) |
+| Block-per-query causal GQA | original kernel, compiled for A/B only |
 | GDN conv / prepare / rule | gated delta-network linear-attention layers |
 | SiLU × gate | MLP activation |
 | Add | residual connections |
@@ -55,9 +57,28 @@ the reference GPTQ-Marlin repack / scale / zero-point permutations bit-exactly f
 | 76 tokens | 202.2 ms | 126.4 ms | **73.0 ms** (2.77x) |
 | 1024 tokens | 1261.2 ms | 1261.2 ms | **1144.9 ms** (1.10x) |
 
-Marlin resident weights use **13.1 GiB**; preload/repack takes **10.1 s**. Long context is
-attention/prefill-bound: 4K **4.65 s**, 8K **9.88 s**, 16K **22.88 s** (18.9 GiB peak).
-The 1K gain is limited by the fixed 64-row M tile; a persistent M-loop is the next step.
+Marlin resident weights use **13.1 GiB**; preload/repack takes **10.1 s**. Tiled FA2
+attention makes long context **GEMM-bound** at ~0.96 ms/token:
+
+| tokens | full forward (tiled FA2) | previous warp | peak GPU mem |
+|---|---|---|---|
+| 4K | **3.99-4.04 s** | 4.65 s | ~17.2 GiB |
+| 8K | **7.95-8.05 s** | 9.88 s | ~17.6 GiB |
+| 16K | **16.10-16.32 s** | 22.88 s | 18.86 GiB |
+
+The attention kernel itself is 7-12x faster than warp on identical buffers (kernel-only
+1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms). The remaining 4K/8K/16K time is large-M W4A16 GEMM;
+reaching <2 s at 4K requires a faster large-M path, not faster attention.
+
+Long-context correctness against CPU AWQ/SDPA probes (Marlin + tiled FA2):
+
+| probe | final rel_rms | cosine | two-way prob delta | top-1 |
+|---|---|---|---|---|
+| 4K | 0.783% | 0.999970 | 1.7e-4 | true |
+| 8K | 0.805% | 0.999967 | 1.5e-4 | true |
+| 16K | 0.731% | 0.999974 | 5.6e-4 | true |
+
+All 10 long-context suite cases are correct.
 
 ### Fallback paths (`JEV_NATIVE_MARLIN=false`)
 

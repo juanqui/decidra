@@ -114,17 +114,32 @@ and use ~12.7 GiB. Init 0.2 s. At 36 tokens Marlin runs at 100% GPU utilization.
 golden checks: layer 0 mean 1.58e-4 / rel_rms 0.347%; final norm rel_rms 1.23%,
 cosine 0.999924.
 
-Long-context latency (Marlin resident, warp-per-query attention):
+Long-context latency (Marlin resident, tiled FA2 attention, default):
 
-| tokens | latency | peak GPU mem |
-|---|---|---|
-| 4K | 4.65 s | 17.2 GiB |
-| 8K | 9.88 s | 17.6 GiB |
-| 16K | 22.88 s | 18.9 GiB |
+| tokens | full forward | previous warp | peak GPU mem |
+|---|---|---|---|
+| 4K | **3.99-4.04 s** | 4.65 s | ~17.2 GiB |
+| 8K | **7.95-8.05 s** | 9.88 s | ~17.6 GiB |
+| 16K | **16.10-16.32 s** | 22.88 s | 18.86 GiB |
 
-Long context is attention/prefill-bound. At 1K the Marlin gain is only 1.10x: that case
-is compute-bound and the fixed 64-row M tile limits large-M benefit. A persistent M-loop
-or larger tile is the next step.
+The standalone attention kernel is 7-12x faster than warp on identical buffers
+(1K **0.276 ms**, 4K **2.85 ms**, 8K **9.68 ms**). The full forward is now **GEMM-bound**
+at ~0.96 ms/token (1K 0.96 s, 4K 4.0 s, 8K 8.0 s, 16K 16.3 s). Reaching <2 s at 4K needs
+a faster large-M W4A16 path, not a faster attention kernel.
+
+Long-context quality gate against CPU AWQ/SDPA probes (Marlin + tiled FA2):
+
+| probe | final rel_rms | cosine | two-way prob delta | top-1 |
+|---|---|---|---|---|
+| 4K | 0.783% | 0.999970 | 1.7e-4 | true |
+| 8K | 0.805% | 0.999967 | 1.5e-4 | true |
+| 16K | 0.731% | 0.999974 | 5.6e-4 | true |
+
+All **10/10** long-context suite cases are correct. Deltas are BF16 accumulation noise;
+the warp kernel has slightly smaller final-hidden deltas but is slower.
+
+At 1K the Marlin gain is 1.10x: that case is compute-bound and the fixed 64-row M tile
+limits large-M benefit. A persistent M-loop or larger tile is the next step.
 
 API-level behavior: short benchmark on the live Marlin server (16 unique requests per
 level) measured c=1 **14.589 req/s**, p50 **68.0 ms**; c=4 **14.992 req/s**, p50

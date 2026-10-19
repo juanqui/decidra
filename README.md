@@ -326,6 +326,9 @@ Correctness (native engine, from `native/README.md`, validated against CPU golde
 - Top-1 token and last logit identical to golden (`867`, `3.578125`); two-way softmax
   **0.8568** vs golden **0.8559**.
 - Merged-BF16 tiny model: every stage at the bf16 rounding floor.
+- Long-context CPU AWQ gate (Marlin + tiled FA2): final rel_rms **0.783% / 0.805% /
+  0.731%** at 4K/8K/16K, two-way probability delta **1.7e-4 / 1.5e-4 / 5.6e-4**, top-1
+  **true** at every length; **10/10** long-context suite cases correct.
 
 Single-forward native measurements on GPU 1 with resident packed weights
 (`native/README.md`):
@@ -338,9 +341,12 @@ Single-forward native measurements on GPU 1 with resident packed weights
 
 Marlin preload is **10.1 s** (repack) and uses **13.1 GiB** resident; the fallback paths
 use 5.8 s / 12.7 GiB. Init is 0.2 s. At 36 tokens Marlin runs at 100% GPU utilization.
-Long-context latency with Marlin + warp attention: **4K 4.65 s**, **8K 9.88 s**,
-**16K 22.88 s** (peak 18.9 GiB at 16K). Those cases are attention/prefill-bound; 1K is
-still ~1.14 s because the fixed 64-row M tile limits Marlin's large-M benefit.
+Long-context latency with Marlin + tiled FA2 attention: **4K 3.99-4.04 s**,
+**8K 7.95-8.05 s**, **16K 16.10-16.32 s** (peak 18.86 GiB at 16K). The standalone
+attention kernel is 7-12x faster than the previous warp kernel on identical buffers, but
+the full forward is now **GEMM-bound** at ~0.96 ms/token (1K 0.96 s), so long context is
+no longer attention-quadratic. Reaching <2 s at 4K needs a faster large-M W4A16 path, not
+a faster attention kernel.
 
 With `JEV_NATIVE_MARLIN=false`, the fallback hybrid policy uses fused only for
 `N >= 5120 && M <= 256` and falls back to dequant + cuBLAS otherwise. Marlin is the
@@ -415,8 +421,10 @@ WantedBy=multi-user.target
   include a checkpoint upload.
 - One forward produces one decision read-out position. Latency is dominated by prefill;
   nothing is decoded. Marlin single-forward timings: **45.1 ms** (36 tokens),
-  **73.0 ms** (76 tokens), **1144.9 ms** (1024 tokens). Long context is
-  attention/prefill-bound: 4K **4.65 s**, 8K **9.88 s**, 16K **22.88 s**.
+  **73.0 ms** (76 tokens), **1144.9 ms** (1024 tokens). Long context is now GEMM-bound:
+  4K **3.99-4.04 s**, 8K **7.95-8.05 s**, 16K **16.10-16.32 s** (~0.96 ms/token; peak
+  18.86 GiB). Tiled FA2 attention is 7-12x faster than the warp kernel on identical
+  buffers (kernel-only 1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms).
 - Wide choices multiply forwards: a 256-option tournament makes 16 group passes plus one
   final pass; a permute makes 4 passes. The engine serializes them, so `permute` and
   `tournament` scale roughly linearly with pass count.
