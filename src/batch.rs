@@ -32,6 +32,10 @@ pub struct PendingRequest {
     pub ids: Vec<u32>,
     pub reply: oneshot::Sender<ExecResult>,
     enqueued_at: Instant,
+    /// Pushed back from a sealed batch (`Full`/`NoFit`). The next batch starts
+    /// immediately instead of waiting for the window again: the request has
+    /// already paid its batching latency.
+    deferred: bool,
 }
 
 /// Batching policy. `window` is the maximum time the worker waits after the
@@ -123,6 +127,7 @@ impl BatchHandle {
             ids,
             reply,
             enqueued_at: Instant::now(),
+            deferred: false,
         };
         {
             let mut state = self.shared.lock();
@@ -174,31 +179,53 @@ impl Drop for BatchHandle {
     }
 }
 
-/// Add one request if it fits. Returns `false` when the batch is sealed (the
-/// request was pushed back or a limit was reached); `true` to continue.
+/// Outcome of trying to add one request to the current batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddOutcome {
+    /// The request joined the batch.
+    Added,
+    /// A hard cap was reached; seal the batch.
+    Full,
+    /// The request would exceed the token cap; it was pushed back and the
+    /// batch must be sealed (waiting cannot help: the head can never fit).
+    NoFit,
+}
+
+/// Add one request if it fits. `Full` and `NoFit` both mean the batch is
+/// sealed; `NoFit` guarantees the batch is non-empty (a lone oversize request
+/// is accepted).
 fn add_to_batch(
     state: &mut QueueState,
     batch: &mut Vec<PendingRequest>,
     batch_tokens: &mut usize,
     request: PendingRequest,
     options: &BatchOptions,
-) -> bool {
-    if batch.len() >= options.max_batch {
-        state.pending.push_front(request);
-        return false;
-    }
+) -> AddOutcome {
     if request.reply.is_closed() {
-        return true;
+        // Dropped client: discard it and keep the batch open.
+        return AddOutcome::Added;
+    }
+    if batch.len() >= options.max_batch {
+        let mut request = request;
+        request.deferred = true;
+        state.pending.push_front(request);
+        return AddOutcome::Full;
     }
     let tokens = request.tokens.len();
     if !batch.is_empty() && *batch_tokens + tokens > options.max_batch_tokens {
         // FIFO: keep it at the head of the queue for the next batch.
+        let mut request = request;
+        request.deferred = true;
         state.pending.push_front(request);
-        return false;
+        return AddOutcome::NoFit;
     }
     *batch_tokens += tokens;
     batch.push(request);
-    true
+    if batch.len() >= options.max_batch || *batch_tokens >= options.max_batch_tokens {
+        AddOutcome::Full
+    } else {
+        AddOutcome::Added
+    }
 }
 
 /// Take everything that fits from `state` starting with `first`. A request that
@@ -215,10 +242,8 @@ fn take_batch(
     let mut batch_tokens = 0usize;
     let mut candidate = Some(first);
     while let Some(request) = candidate.take() {
-        if !add_to_batch(state, &mut batch, &mut batch_tokens, request, options) {
-            break;
-        }
-        if batch.len() >= options.max_batch || batch_tokens >= options.max_batch_tokens {
+        if add_to_batch(state, &mut batch, &mut batch_tokens, request, options) != AddOutcome::Added
+        {
             break;
         }
         candidate = state.pending.pop_front();
@@ -247,24 +272,30 @@ fn run_worker<E: BatchExecutor>(
         };
         metrics::gauge!("jev_native_batch_queue_depth").set(state.pending.len() as f64);
 
-        let deadline = Instant::now() + options.window;
+        let deadline = Instant::now()
+            + if first.deferred {
+                Duration::ZERO
+            } else {
+                options.window
+            };
         let mut batch = Vec::with_capacity(options.max_batch);
         let mut batch_tokens = 0usize;
         let mut candidate = Some(first);
-        loop {
-            // Drain whatever is already queued.
+        let mut open = true;
+        while open {
+            // Drain whatever is already queued. A hard cap, a no-fit head, or
+            // stopping all seal the batch immediately: waiting cannot make the
+            // head fit, it only adds latency.
             while let Some(request) = candidate.take().or_else(|| state.pending.pop_front()) {
-                if !add_to_batch(&mut state, &mut batch, &mut batch_tokens, request, &options) {
-                    break;
-                }
-                if batch.len() >= options.max_batch || batch_tokens >= options.max_batch_tokens {
-                    break;
+                match add_to_batch(&mut state, &mut batch, &mut batch_tokens, request, &options) {
+                    AddOutcome::Added => {}
+                    AddOutcome::Full | AddOutcome::NoFit => {
+                        open = false;
+                        break;
+                    }
                 }
             }
-            if batch.len() >= options.max_batch
-                || batch_tokens >= options.max_batch_tokens
-                || state.stopping
-            {
+            if !open || state.stopping {
                 break;
             }
             // Wait for arrivals until the window expires.
@@ -335,7 +366,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{BatchExecutor, BatchHandle, BatchOptions, ExecResult, PendingRequest, QueueState};
+    use super::{
+        AddOutcome, BatchExecutor, BatchHandle, BatchOptions, ExecResult, PendingRequest,
+        QueueState,
+    };
     use tokio::sync::oneshot;
 
     #[derive(Clone, Default)]
@@ -397,6 +431,7 @@ mod tests {
                 ids: vec![1],
                 reply,
                 enqueued_at: Instant::now(),
+                deferred: false,
             },
             receiver,
         )
@@ -549,6 +584,60 @@ mod tests {
         assert_eq!(second.await.unwrap().unwrap(), vec![2.0]);
         let batches = recorder.batches();
         assert_eq!(batches.len(), 2, "separate arrivals form separate batches");
+    }
+
+    #[test]
+    fn no_fit_seals_the_batch_immediately() {
+        let (first, _r1) = request(vec![1; 600]);
+        let (next, _r2) = request(vec![2; 600]);
+        let mut state = state_with(vec![next]);
+        let options = BatchOptions::new(8, 1000, Duration::from_millis(1));
+        let mut batch = Vec::new();
+        let mut batch_tokens = 0usize;
+        assert_eq!(
+            super::add_to_batch(&mut state, &mut batch, &mut batch_tokens, first, &options),
+            AddOutcome::Added
+        );
+        let head = state.pending.pop_front().unwrap();
+        assert_eq!(
+            super::add_to_batch(&mut state, &mut batch, &mut batch_tokens, head, &options),
+            AddOutcome::NoFit
+        );
+        assert_eq!(batch.len(), 1);
+        assert_eq!(
+            state.pending.len(),
+            1,
+            "second request stays for the next batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_fit_pair_does_not_wait_for_the_window() {
+        let recorder = Recorder::default();
+        // A long window would add 500 ms per batch if the no-fit head did not
+        // seal it immediately.
+        let handle = BatchHandle::spawn(
+            fake(&recorder, None),
+            BatchOptions::new(8, 1000, Duration::from_millis(500)),
+        );
+        let started = Instant::now();
+        let first = handle.submit(vec![1; 600], vec![1]).unwrap();
+        let second = handle.submit(vec![2; 600], vec![1]).unwrap();
+        assert_eq!(first.await.unwrap().unwrap().len(), 600);
+        assert_eq!(second.await.unwrap().unwrap().len(), 600);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "no-fit pair waited for the window: {elapsed:?}"
+        );
+        let batches = recorder.batches();
+        assert_eq!(
+            batches.len(),
+            2,
+            "600 + 600 cannot share a 1000-token batch"
+        );
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[1].len(), 1);
     }
 
     #[test]

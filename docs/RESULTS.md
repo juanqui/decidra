@@ -93,14 +93,27 @@ measurement files are kept only for drift context.
 - `/metrics`: HTTP and backend counters/histograms exposed.
 - Preload with Marlin: 10.1 s clean, 13.1 GiB resident (10.06 s observed in the gated
   run); 13,358 MiB in-process.
-- 16,444-token `/v1/decide`: **200 in 8.69 s**, choice `true`; no timeout/OOM.
-- 32,763-token CPU-AWQ probe `/v1/decide`: **200 in 18.656 s**, choice `true`
-  (0.98378), peak **19.09 GiB**; no timeout/OOM. This is the verified 24 GB maximum.
-- Short benchmark (16 unique requests/level, gated build): c=1 **16.444 req/s**, p50
-  **60.9 ms**, p95 **75.6 ms**, p99 **82.9 ms**, ~**1,143 tok/s**; c=4 **16.826 req/s**,
-  p50 **225.7 ms**, p95 **263.3 ms**, ~**1,169 tok/s**. Throughput does not scale with
-  concurrency because the native engine serializes forwards; c=4 latency is queueing,
-  not batching.
+- 16,444-token `/v1/decide`: **200 in 8.60 s** (batched build), choice `true`; no
+  timeout/OOM. Long requests exceed the token cap and run alone.
+- 32,763-token CPU-AWQ probe `/v1/decide`: **200 in 18.53 s**, choice `true`
+  (0.98378); no timeout/OOM. This is the verified 24 GB maximum.
+- Short benchmark, serialized build (16 unique requests/level, gated): c=1
+  **16.444 req/s**, p50 **60.9 ms**; c=4 **16.826 req/s**, p50 **225.7 ms**. Throughput
+  was flat because forwards were serialized; c=4 latency was queueing.
+- Short benchmark, batched build (16 unique ~69-token requests/level; `scripts/bench-batch.sh`):
+  c=1 **15.828 req/s**, p50 **61.9 ms**, p95 **75.7 ms**, ~**1,121 tok/s**;
+  c=2 **23.409 req/s**, p50 **83.1 ms**, p95 **99.0 ms**, ~**1,658 tok/s**;
+  c=4 **30.117 req/s**, p50 **133.8 ms**, p95 **139.1 ms**, ~**2,133 tok/s**;
+  c=8 **29.693 req/s**, p50 **218.7 ms**, p95 **356.7 ms**, ~**2,101 tok/s**;
+  c=16 **30.642 req/s**, p50 **378.9 ms**, p95 **516.3 ms**, ~**2,204 tok/s**.
+  Versus the serialized build: c=4 **1.79x throughput** and p50 **225.7 -> 133.8 ms**
+  (1.69x lower); c=1 is unchanged within run-to-run noise. c=8/16 throughput plateaus at
+  ~30 req/s because the worker executes one batch at a time; extra concurrency only
+  queues.
+- Batch metrics observed during the sweep: `jev_native_batch_size` p50 1 / p90 4 /
+  p95 5, `jev_native_batch_wait_seconds` p50 2.06 ms (the window), p90 124 ms at high
+  concurrency (queueing behind earlier batches), and `jev_native_batch_queue_depth`
+  peaked at 4.
 
 ## Request batching
 

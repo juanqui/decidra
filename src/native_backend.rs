@@ -30,21 +30,56 @@ struct EngineExecutor {
 
 impl BatchExecutor for EngineExecutor {
     fn execute(&mut self, tokens: &[&[u32]], ids: &[&[u32]]) -> Vec<ExecResult> {
-        debug_assert_eq!(tokens.len(), ids.len());
-        // Native batch API (Engine::decision_logits_batch) is not available in
-        // this checkout yet. Until it lands, execute the batch in FIFO order
-        // with the single-request call. The queue, limits, metrics, and error
-        // semantics are already final; only this adapter changes.
-        let _ = self.batch_enabled;
-        tokens
-            .iter()
-            .zip(ids)
-            .map(|(tokens, ids)| {
-                self.engine
-                    .decision_logits(tokens, ids)
-                    .map_err(|error| error.to_string())
-            })
-            .collect()
+        if tokens.len() != ids.len() {
+            return vec![
+                Err(format!(
+                    "batch has {} token sequences but {} id sets",
+                    tokens.len(),
+                    ids.len()
+                ));
+                tokens.len()
+            ];
+        }
+        if !self.batch_enabled || tokens.len() == 1 {
+            // Single-call path: used when batching is disabled, and for the
+            // one-item batches that form under low load. The native batch API
+            // documents a batch of one as bit-identical to this path.
+            return tokens
+                .iter()
+                .zip(ids)
+                .map(|(tokens, ids)| {
+                    self.engine
+                        .decision_logits(tokens, ids)
+                        .map_err(|error| error.to_string())
+                })
+                .collect();
+        }
+        match self.engine.decision_logits_batch(tokens, ids) {
+            Ok(results) if results.len() == tokens.len() => results
+                .into_iter()
+                .zip(ids)
+                .map(|(logits, ids)| {
+                    if logits.len() == ids.len() {
+                        Ok(logits)
+                    } else {
+                        Err(format!(
+                            "native batch returned {} logits for {} requested ids",
+                            logits.len(),
+                            ids.len()
+                        ))
+                    }
+                })
+                .collect(),
+            Ok(results) => vec![
+                Err(format!(
+                    "native batch returned {} results for {} requests",
+                    results.len(),
+                    tokens.len()
+                ));
+                tokens.len()
+            ],
+            Err(error) => vec![Err(error.to_string()); tokens.len()],
+        }
     }
 }
 

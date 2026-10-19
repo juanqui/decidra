@@ -373,12 +373,16 @@ MAE: choice 2.35e-4 / noul 1.237e-3 / score 1.441e-3. The historical production-
 baseline is context only: it itself differs from CPU golden by max 0.01377 / mean MAE
 0.00156. See `docs/RESULTS.md` for per-kind tables.
 
-Short live benchmark (16 unique requests/level, final build, forwards serialized):
-c=1 **16.444 req/s**, p50 **60.9 ms**, p95 **75.6 ms**, p99 **82.9 ms**, ~**1,143 tok/s**;
-c=4 **16.826 req/s**, p50 **225.7 ms**, p95 **263.3 ms**, ~**1,169 tok/s**. c=4 latency
-is queueing, not batching. A 16,444-token `/v1/decide` completed in **8.69 s**, and the
-32,763-token CPU-AWQ probe completed in **18.66 s** at peak **19.09 GiB**, choice `true`
-(0.98378), with no timeout/OOM.
+Short live benchmark, batched build (16 unique ~69-token requests/level; `scripts/bench-batch.sh`):
+c=1 **15.83 req/s**, p50 **61.9 ms**; c=2 **23.41 req/s**, p50 **83.1 ms**; c=4
+**30.12 req/s**, p50 **133.8 ms**, p95 **139.1 ms**, ~**2,133 tok/s**; c=8 **29.69 req/s**,
+p50 **218.7 ms**; c=16 **30.64 req/s**, p50 **378.9 ms**, ~**2,204 tok/s**. Versus the
+serialized build, c=4 throughput is **1.79x** and p50 drops from **225.7 ms to 133.8 ms**;
+c=1 is unchanged within noise. Above c=4 throughput plateaus near 30 req/s because the
+worker runs one batch at a time.
+
+A 16,444-token `/v1/decide` completed in **8.60 s**, and the 32,763-token CPU-AWQ probe
+completed in **18.53 s**, choice `true` (0.98378), with no timeout/OOM.
 
 ## One-GPU deployment example (GPU 1 only)
 
