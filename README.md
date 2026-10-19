@@ -393,6 +393,10 @@ Long context runs alone (it exceeds the 16,384-token batch cap): **17,668 tokens
 result is the verified maximum on the 24 GB GPU). Repeated runs (10x 17.7K, 3x 35.3K)
 all returned 200 with zero backend errors and no timeout/OOM.
 
+A controlled same-GPU comparison against vLLM 0.31.0 (throughput, latency, long
+prefill, startup, memory, and kernel stacks) is in
+[`docs/VLLM-COMPARISON.md`](docs/VLLM-COMPARISON.md).
+
 ## One-GPU deployment example (GPU 1 only)
 
 The HTTP server is CPU-side; the native engine uses **GPU 1** inside the same process.

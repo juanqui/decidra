@@ -162,6 +162,10 @@ Metrics: `jev_native_batch_size`, `jev_native_batch_queue_depth`,
 
 ## Performance
 
+For a controlled same-GPU comparison against vLLM 0.31.0 (short concurrency sweep,
+long prefill, startup, memory, KV cache, and kernel stacks), see
+[`VLLM-COMPARISON.md`](VLLM-COMPARISON.md).
+
 Resident native engine on GPU 1 (`--preload`, Marlin repacked layout 13.1 GiB), measured
 in `native/README.md`:
 
