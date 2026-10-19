@@ -165,7 +165,8 @@ or `./scripts/run-native.sh` (sets `CUDA_VISIBLE_DEVICES=1`, builds with
 - `scripts/run-server.sh` — compatibility wrapper around `run-native.sh`.
 - `scripts/smoke.sh` — health/models/info plus one real decision.
 - `scripts/run-eval.sh` — saved-baseline suite, benchmark, functional and signing checks.
-- `Dockerfile` — CUDA devel builder + CUDA runtime image; no weights.
+- `Dockerfile` — CUDA devel builder + CUDA runtime image; copies cuBLAS/cuBLASLt into the
+  runtime, reserves no GPU itself, bakes no weights.
 - `docker-compose.yml` — one process, model mounted read-only, GPU 1 reserved.
 - `eval/` — independent Python evaluation harness and saved baselines (dev tooling).
 - `docs/` — contract, kernel stack, results, deployment.
@@ -440,7 +441,8 @@ WantedBy=multi-user.target
   `tournament` scale roughly linearly with pass count.
 - The `single` strategy is the lowest-latency option for ≤16 choices.
 - `JEV_NATIVE_MARLIN=true` is the default and uses the repacked Marlin W4A16 kernel. At 1K
-  tokens the gain is only 1.10x because the fixed 64-row M tile is the bottleneck.
+  the gain is 2.58x (1261 -> 488 ms) after the gated split-GDN work; short prompts keep
+  the accurate shared GDN.
 - With Marlin off, `JEV_NATIVE_FUSED_W4A16=true` selects the hybrid fused policy (fused for
   `N >= 5120 && M <= 256`), and the remaining path dequantizes into a BF16 workspace for
   cuBLAS BF16 GEMM.

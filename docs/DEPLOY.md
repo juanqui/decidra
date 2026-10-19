@@ -106,8 +106,12 @@ those steps to succeed; there is no partial serving.
 
 ## Docker
 
-The image builds the native kernels with `nvcc` from a CUDA devel image and runs on a CUDA
-runtime image (driver API + cuBLAS). Weights are mounted, never baked in.
+The image builds the native kernels with `nvcc` from a CUDA devel image. The runtime image
+is not guaranteed to ship cuBLAS, so the build copies the real `libcublas.so.13` and
+`libcublasLt.so.13` (versioned files plus stable symlinks) from the devel builder into
+`/opt/jev/cudalibs/` and prepends that directory to `LD_LIBRARY_PATH`; it does not
+overwrite the base image's CUDA libraries or require `ldconfig`. Weights are mounted,
+never baked in; Marlin is the default (`JEV_NATIVE_FUSED_W4A16` is not set in the image).
 
 ```bash
 docker build -t jev-engine:0.2.0 .
@@ -121,6 +125,21 @@ docker run --rm \
   -e JEV_SIGNING_KEY \
   jev-engine:0.2.0
 ```
+
+No-GPU image checks:
+
+```bash
+docker run --rm jev-engine:0.2.0 --help
+docker run --rm -v /srv/models/jev-awq:/models:ro \
+  -e JEV_NATIVE_MODEL=/models/awq-w4a16-v2 \
+  -e JEV_CHECKPOINT=/models/awq-w4a16-v2 \
+  jev-engine:0.2.0 --check-config
+docker run --rm --entrypoint sh jev-engine:0.2.0 \
+  -c "ls -l /opt/jev/cudalibs && test -f /opt/jev/cudalibs/libcublas.so.13 && test -f /opt/jev/cudalibs/libcublasLt.so.13"
+```
+
+To use the fallback path instead of Marlin, set
+`-e JEV_NATIVE_MARLIN=false -e JEV_NATIVE_FUSED_W4A16=true`.
 
 Inside the container the runtime exposes the reserved device as ordinal 0, so do not set
 `CUDA_VISIBLE_DEVICES` yourself.
