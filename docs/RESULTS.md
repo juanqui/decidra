@@ -122,7 +122,7 @@ Long-context latency (Marlin resident, tiled FA2 + gated split-dk GDN, default):
 
 | tokens | full forward | previous warp | peak GPU mem |
 |---|---|---|---|
-| 1K | **0.488 s** | 0.959 s | 13.1 GiB resident |
+| 1K | **0.488 s** | 0.959 s | 18.15 GiB |
 | 4K | **2.12-2.18 s** | 4.65 s | ~17.2 GiB |
 | 8K | **4.23-4.32 s** | 9.88 s | ~17.6 GiB |
 | 16K | **8.62-8.97 s** | 22.88 s | 18.86 GiB |
