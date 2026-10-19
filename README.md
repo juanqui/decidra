@@ -190,6 +190,7 @@ GPU 0 is not used by this stack. Inside a container, reserve GPU 1
 | `JEV_NATIVE_MAX_BATCH` | `8` | Maximum requests per batch (`>= 1`); effective value is `1` when batching is disabled. Throughput saturates at batch 4, so 8 is a burst-draining cap, not a throughput knob. |
 | `JEV_NATIVE_BATCH_WINDOW_US` | `2000` | Microseconds the worker waits after a batch's first request for more work (max `50000`); effective value is `0` when batching is disabled. 2 ms keeps a lone request near 62 ms p50. |
 | `JEV_NATIVE_MAX_BATCH_TOKENS` | `16384` | Maximum total prompt tokens per batch (`>= 512`). A single larger request runs alone. |
+| `JEV_NATIVE_GDN_CHUNKED` | `true` | Chunked TF32 WMMA GDN prefill for sequences `>= 512` tokens; shorter prompts keep the shared/split recurrence. Set `false` for the legacy path. |
 | `JEV_TOKENIZER` | checkpoint `tokenizer.json` | Tokenizer file or directory override. |
 | `JEV_CALIBRATION` | discovered | `calibration.json` override. |
 | `JEV_CALIBRATION_FITTED` | unset | Optional `fit_bias.py` output. Unset/absent disables it. |
@@ -388,10 +389,12 @@ Batch correctness: a batch of one is bit-identical to the single-call path. Batc
 their single-request probabilities by at most **4.2e-5** with identical top-1, and the
 28-row suite max delta is **1.010e-2**, inside the 0.011 gate.
 
-Long context runs alone (it exceeds the 16,384-token batch cap): **17,668 tokens ->
-200 in 9.3 s** and **35,310 tokens -> 200 in 20.2 s**, both choice `true` (the 35K
-result is the verified maximum on the 24 GB GPU). Repeated runs (10x 17.7K, 3x 35.3K)
-all returned 200 with zero backend errors and no timeout/OOM.
+Long context runs alone (it exceeds the 16,384-token batch cap). With chunked GDN on
+by default: **4,032 tokens -> 200 in 1.63 s**, **8,029 -> 3.27 s**, **16,024 -> 6.77 s**,
+and **35,310 -> 16.67 s**, all choice `true` (the 35K result is the verified maximum on
+the 24 GB GPU). The legacy path measured 2.12-2.18 s / 4.23-4.32 s / 8.62-8.97 s /
+20.15 s at those lengths. The 10-row long-context suite is **10/10 top-1**, and repeated
+16K/35K runs returned 200 with no timeout/OOM.
 
 A controlled same-GPU comparison against vLLM 0.31.0 (throughput, latency, long
 prefill, startup, memory, and kernel stacks) is in
@@ -455,15 +458,21 @@ WantedBy=multi-user.target
   include a checkpoint upload.
 - One forward produces one decision read-out position. Latency is dominated by prefill;
   nothing is decoded. Marlin single-forward timings: **45.1 ms** (36 tokens),
-  **73.0 ms** (76 tokens), **488 ms** (1024 tokens). Long context is GEMM-bound:
-  4K **2.12-2.18 s**, 8K **4.23-4.32 s**, 16K **8.62-8.97 s**, 32K **18.60-19.03 s**
-  (~0.49-0.58 ms/token; peak **18.86 GiB at 16K / 19.09 GiB at 32K**). For
-  seq >= 24,576 the low-memory buffer-pool mode drops intermediates early; 1K/16K
-  timings are unchanged.
+  **73.0 ms** (76 tokens), **488 ms** (1024 tokens). Long context is GEMM-bound.
+  The default chunked GDN path cuts the recurrent stage 2.1x and the full forward
+  **1K to 395 ms (-17.7%)** and **16K to 6.94 s (-16.4%)**; server probes measure
+  4K **1.63 s**, 8K **3.27 s**, 16K **6.77 s**, 35.3K **16.67 s** (legacy:
+  2.12-2.18 / 4.23-4.32 / 8.62-8.97 / 20.15 s). Peak memory remains **18.86 GiB at
+  16K / 19.09 GiB at 32K**. For seq >= 24,576 the low-memory buffer-pool mode drops
+  intermediates early.
 - The split-dk GDN recurrence is 3.9x faster than the previous shared-state kernel
   (1K per-layer 13.35 -> 3.41 ms) but is gated to sequences >= 512 tokens; shorter
   prompts keep the accurate shared recurrence. Tiled FA2 attention is 7-12x faster than
   warp on identical buffers (kernel-only 1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms).
+- `JEV_NATIVE_GDN_CHUNKED=true` (default) uses the chunked TF32 WMMA GDN prefill for
+  sequences >= 512 tokens: 2.1x on the GDN stage, **1K -17.7%** and **16K -16.4%**
+  end-to-end. Prompts below 512 tokens keep the shared/split path, so short-request
+  latency is unchanged; `false` restores the legacy recurrence everywhere.
 - Requests are batched. A single engine thread owns the CUDA context; the HTTP
   reactor tokenizes and enqueues, then awaits a oneshot reply. The worker blocks for
   the first request and drains more until the **2 ms** window expires, `MAX_BATCH`

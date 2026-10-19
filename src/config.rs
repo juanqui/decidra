@@ -53,6 +53,10 @@ pub struct Config {
     /// Maximum total prompt tokens per batch (`JEV_NATIVE_MAX_BATCH_TOKENS`).
     /// A single larger request runs alone.
     pub native_max_batch_tokens: usize,
+    /// Use the chunked TF32 GDN prefill for sequences >= 512 tokens
+    /// (`JEV_NATIVE_GDN_CHUNKED`). Shorter sequences keep the existing
+    /// shared/split recurrence.
+    pub native_gdn_chunked: bool,
     pub signing_key: Option<Vec<u8>>,
     pub metrics_enabled: bool,
     pub max_body_bytes: usize,
@@ -109,6 +113,7 @@ impl Config {
             native_max_batch = 1;
             native_batch_window_us = 0;
         }
+        let native_gdn_chunked = env_bool("JEV_NATIVE_GDN_CHUNKED")?.unwrap_or(true);
 
         let signing_key = match std::env::var("JEV_SIGNING_KEY") {
             Ok(key) if !key.is_empty() => Some(key.into_bytes()),
@@ -139,6 +144,7 @@ impl Config {
             native_max_batch,
             native_batch_window_us,
             native_max_batch_tokens,
+            native_gdn_chunked,
             signing_key,
             metrics_enabled,
             max_body_bytes,

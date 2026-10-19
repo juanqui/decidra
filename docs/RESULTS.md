@@ -93,14 +93,18 @@ measurement files are kept only for drift context.
 - `/metrics`: HTTP and backend counters/histograms exposed.
 - Preload with Marlin: 10.1 s clean, 13.1 GiB resident (10.06 s observed in the gated
   run); 13,358 MiB in-process.
-- Long context, single request (exceeds the 16,384-token batch cap, so it runs alone):
-  **17,668 tokens -> 200 in 9.27-9.38 s**, choice `true`; **35,310 tokens -> 200 in
-  20.15-20.16 s**, choice `true` (0.9884); no timeout/OOM. The verified maximum is
-  **35,310 tokens** on the 24 GB GPU. Stability: **10 consecutive 17.7K runs and 3
-  consecutive 35.3K runs all returned 200 with choice `true`**, and
-  `jev_backend_requests_total{status="error"}` stayed at **0** (no error series
-  exported). One earlier 17.7K probe returned a single 502; it did not reproduce in
-  these 13 runs nor in six prior 16K/32K runs, and the root cause was not captured.
+- Long context, single request (exceeds the 16,384-token batch cap, so it runs alone),
+  chunked GDN on (default): **4,032 tokens -> 200 in 1.63 s**, **8,029 -> 3.27 s**,
+  **16,024 -> 6.77-6.80 s** (5 consecutive runs), **35,310 -> 16.67 s** (3 consecutive
+  runs); all choice `true` (0.9894 at 16K, 0.9884 at 35.3K). The verified maximum is
+  **35,310 tokens** on the 24 GB GPU. The 10-row long-context suite is **10/10 top-1**
+  (including choice rows `billing` and `301`) at ~1.2-1.6 s for 3-4K and 3.26 s for 8K.
+  Short-request latency is unchanged because those prompts stay on the shared/split
+  path: c=1 **16.05 req/s / 60.9 ms**, c=4 **30.88 / 130.5 ms**, c=8
+  **30.35-31.41 / 218.9-254.3 ms**. One 16K probe returned a single 502 during the
+  first long-context run; it did not reproduce in seven subsequent 16K attempts or the
+  five prior 17.7K runs, and the root cause was not captured
+  (`jev_backend_requests_total{status="error"} 1`).
 - Short benchmark, serialized build (16 unique requests/level, gated): c=1
   **16.444 req/s**, p50 **60.9 ms**; c=4 **16.826 req/s**, p50 **225.7 ms**. Throughput
   was flat because forwards were serialized; c=4 latency was queueing.
@@ -134,6 +138,20 @@ measurement files are kept only for drift context.
 - Batch metrics observed during the sweep (`jev_native_batch_size` mean per level):
   c=1 **1.0**, c=2 **2.0**, c=4 **4.0**, c=8 **5.33**, c=16 **5.33-8.0**;
   `jev_native_batch_queue_depth` peaked at **8** at c=16.
+
+## Chunked GDN prefill
+
+`JEV_NATIVE_GDN_CHUNKED=true` (default) selects the TF32 WMMA chunked delta-rule
+prefill (native commit `7c78a3f`) for sequences **>= 512 tokens**; shorter prompts keep
+the shared/split recurrence, and `false` restores the legacy path everywhere.
+
+- GDN stage **2.1x** faster; full forward **1K 488 -> 395 ms (-17.7%)** and
+  **16K 8.80 -> 6.94 s (-16.4%)** in the native benchmark.
+- Server single-request `/v1/decide`: 4K **1.63 s** (legacy 2.12-2.18), 8K **3.27 s**
+  (4.23-4.32), 16K **6.77 s** (8.62-8.97), 35.3K **16.67 s** (20.15).
+- suite28 is unchanged (28/28, KL 3.281e-5, MAE 7.365e-4, max delta 1.010e-2) because
+  every suite row is below 512 tokens and takes the fallback; the long-context suite is
+  10/10 and short c1/c4/c8 latency is unchanged.
 
 ## Request batching
 
