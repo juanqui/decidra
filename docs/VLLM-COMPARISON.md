@@ -1,120 +1,166 @@
-# Native engine vs vLLM 0.31.0
+# Native engine vs vLLM 0.31.0 (final)
 
 A controlled single-GPU comparison of the in-process native engine with a
 production-style vLLM deployment of the same AWQ artifact. This is a snapshot, not
-a recurring benchmark: each server was measured once on an otherwise idle GPU 1
-(RTX 4090, 24 GB), so small differences at c=4/c=8 (a few percent) are within
-run-to-run noise. Raw vLLM data came from `/tmp/jev-vllm-compare/comparison.json`;
-native numbers are the final 71-token sweep and long-context probes in
-[`RESULTS.md`](RESULTS.md).
+a recurring benchmark. Raw vLLM data: `/tmp/jev-final-compare/vllm/REPORT.md`
+(plus its JSON/log artifacts); native data: `/tmp/jev-final-compare/native/`.
+Both servers were measured on GPU 1 only.
 
 ## Methodology
 
-- **Hardware**: GPU 1, RTX 4090 24 GB. GPU 0 was not used. Both servers loaded the
+- **Hardware**: GPU 1, RTX 4090 24 GB. GPU 0 was not used. Both stacks loaded the
   **same** `/srv/models/jev-awq/awq-w4a16-v2` AWQ W4A16 artifact and decision head.
-- **Fresh server per stack**: native preloaded before each sweep; vLLM was started
-  from a clean container and measured after health.
-- **Short load**: 16 unique prompts per level (~70.5 prompt tokens), c = 1, 2, 4,
-  8, 16, three warmup requests, one completion token per decision. Native rows are
-  the median of three runs at ~70.8 prompt tokens. No prompt is repeated across
-  levels, so no prefix/KV reuse flatters either server.
-- **Long load**: single-stream document decisions at ~4K, ~8K, and ~15.5K prompt
-  tokens, one completion token.
-- **vLLM A_ref configuration**: `vllm/vllm-openai:v0.31.0` (Torch 2.13.0+cu130,
-  CUDA 13.0), `max_model_len=16384`, `max_num_seqs=8`,
-  `gpu_memory_utilization=0.95`, `kv_cache_dtype=fp8`, `quantization=compressed-tensors`,
-  CUDA graphs enabled (`enforce_eager=false`), chunked prefill on, V2 runner.
-- **Native configuration**: defaults in this repo (`JEV_NATIVE_MAX_BATCH=8`,
-  `JEV_NATIVE_BATCH_WINDOW_US=2000`, `JEV_NATIVE_MAX_BATCH_TOKENS=16384`), Marlin
-  resident weights.
-- `ms/token` is p50 latency divided by mean prompt tokens (per request); `tok/s` is
+- **vLLM 0.31.0 A_ref**: `vllm/vllm-openai:v0.31.0` (Torch 2.13.0+cu130, CUDA 13.0),
+  exact flags `--model /models/awq-w4a16-v2 --served-model-name jev-awq
+  --logprobs-mode processed_logprobs --max-model-len 16384
+  --enable-prefix-caching --mamba-cache-mode align --trust-request-chat-template
+  --max-num-seqs 8 --gpu-memory-utilization 0.95 --kv-cache-dtype fp8`.
+- **Native**: final build with chunked GDN and the exact-decision cache enabled
+  (`JEV_NATIVE_GDN_CHUNKED=true`, `JEV_DECISION_CACHE_SIZE=256`, batch defaults 8 /
+  2000 us / 16384 tokens).
+- **Prompts**: regenerated from the native suite/bench generator with the same seed
+  and tags. Locally verified means are **73.0 / 73.0 / 73.0 / 73.0625 / 73.9375**
+  tokens for c=1/2/4/8/16, matching native's server-counted means. Short runs: 16
+  unique prompts per level, 3 runs, 3 warmups. vLLM `max_num_seqs=8`, so c=16 runs
+  as two scheduler waves.
+- **Long prompts**: 4,090 / 8,178 / 16,383 tokens; the 16K prompt fits prompt+1 in
+  vLLM's 16,384 cap. Native additionally ran the verified 35,310-token request.
+- **Repeated exact**: 16 identical requests (58 native tokens / 73 vLLM tokens) at
+  c=1 and c=8, cold and warm.
+- **Prefix cache**: vLLM recorded **0 hits** on all short and repeated requests
+  (58–74-token prompts cannot fill its 1,568-token block); the nested 8K/16K long
+  probes received one 1,568-token hit, so vLLM's long numbers are slightly
+  cache-assisted. Native has no prefix cache; it does have the exact-decision cache.
+- `ms/token` is p50 divided by mean prompt tokens (per request); `tok/s` is
   aggregate prompt-token throughput.
 
-## Short requests (~70.5 tokens, 16 per level)
+## Short unique prompts (~73 tokens)
 
 | c | vLLM rps | native rps | vLLM p50 | native p50 | vLLM tok/s | native tok/s | vLLM ms/token | native ms/token | vLLM/native rps |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 19.02 | 15.84 | 52.1 ms | 61.9 ms | 1,338.6 | 1,122 | 0.744 | 0.874 | **1.20x** |
-| 2 | 20.34 | 23.38 | 96.9 ms | 83.2 ms | 1,436.5 | 1,656 | 1.384 | 1.175 | 0.87x (**native 1.15x**) |
-| 4 | 29.42 | 30.13 | 134.3 ms | 133.7 ms | 2,073.8 | 2,133 | 1.882 | 1.888 | 0.98x (tie) |
-| 8 | 35.85 | 29.25-30.26 | 217.6 ms | 233-256 ms | 2,529.7 | 2,051-2,141 | 3.054 | 3.45 (mid) | **1.20x** |
-| 16 | 34.93 | 29.28-30.47 | 318.5 ms | 388-442 ms | 2,464.7 | 2,107-2,192 | 4.962 | 5.86 (mid) | **1.17x** |
+| 1 | **18.91** | 15.63 | **52.67 ms** | 61.8 ms | **1,380** | 1,141 | 0.722 | 0.847 | **1.21x** |
+| 2 | 20.38 | **23.28** | 97.57 ms | **87.3 ms** | 1,487 | **1,699** | 1.337 | 1.196 | 0.88x (**native 1.14x**) |
+| 4 | 29.36 | **29.96** | **134.43 ms** | 134.8 ms | 2,142 | **2,187** | 1.842 | 1.847 | 0.98x (tie) |
+| 8 | **34.70** | 29.61 | **229.20 ms** | 269.7 ms | **2,546** | 2,164 | 3.140 | 3.691 | **1.17x** |
+| 16 | **35.09** | 28.86 | **305.53 ms** | 431.1 ms | **2,590** | 2,134 | 4.185 | 5.831 | **1.22x** |
 
-Native c8/c16 are ranges over three runs. Native tok/s plateaus at ~2,100-2,150
-because the single FIFO worker executes one batch at a time; vLLM's continuous
-batching keeps adding throughput through c=8/c=16. Native peaks at c=2/c=4, where
-the 2 ms FIFO window captures both requests without queueing.
+vLLM run ranges: c1 rps 18.12-19.08; c2 20.23-20.51; c4 29.34-29.58; c8
+34.58-34.85; c16 35.03-35.38. p50 ranges were tight (e.g. c1 52.45-52.85,
+c8 228.48-230.32).
 
-## Long prefill (single stream)
+## Long single request (cold, exact native prompts)
 
-| prompt | vLLM p50 | vLLM tok/s | native latency | native tok/s | vLLM/native latency |
+| prompt | vLLM latency | vLLM tok/s | native latency | native tok/s | vLLM/native |
 |---|---:|---:|---:|---:|---:|
-| ~4K (4,097 vLLM / 4,096 native) | 1,305.7 ms | 3,135.7 | 2.12-2.18 s | 1,879-1,932 | **1.60-1.67x** |
-| ~8K (8,085 / 8,192) | 2,637.0 ms | 3,064.8 | 4.23-4.32 s | 1,871-1,911 | **1.60-1.64x** |
-| ~15.5K (15,595 / 16,384) | 5,248.2 ms | 2,970.3 | 8.62-8.97 s (16K row) | 1,739-1,809 | **1.64-1.71x** |
+| 4K (4,090 tok) | **1.304 s** | **3,136** | 1.670 s | 2,449 | **1.28x** |
+| 8K (8,178 tok) | **2.661 s** | **3,073** | 3.327 s | 2,459 | **1.25x** |
+| 16K (16,383 tok) | **5.052 s** | **3,243** | 6.932 s | 2,363 | **1.37x** |
+| 35.3K (35,310 tok) | not runnable (`max_model_len=16,384`) | - | 16.662 s | 2,120 | - |
 
-Native also completed a **35,310-token** decision in 20.15-20.16 s (verified
-maximum; 10x 17.7K and 3x 35.3K runs, all 200). vLLM was capped at
-`max_model_len=16384`, so it was not exercised beyond ~15.6K in this pass.
+All choices were `true`. Native scales linearly; vLLM's 8K/16K rows include one
+nested-prefix cache hit. Even allowing for that, vLLM is **1.25-1.37x faster** on
+long single-request prefill.
 
-## Startup, memory, KV cache, context
+## Repeated exact prompt (16 identical requests)
 
-| metric | vLLM 0.31.0 | native engine |
-|---|---|---|
-| startup to health | **139 s** (91.8 s engine init + 22.6 s compile) | **10.1 s** (7.6 s observed on final build) |
-| peak GPU memory | **21,909 MiB** | **13.1 GiB** resident; **19.1 GiB** peak at 32K |
-| KV cache | 41,441 tokens / **2.08 GiB** (fp8) | none: every decision re-runs full prefill |
-| configured context | 16,384 tokens | no batch cap on a single request; **35,310 tokens verified** |
-| max concurrent sequences | `max_num_seqs=8` | FIFO batch (`MAX_BATCH=8`), one batch at a time |
+| case | vLLM cold | vLLM warm | native cold | native warm |
+|---|---:|---:|---:|---:|
+| c1 rps / p50 | 19.12 / 52.12 ms | 19.40 / 51.11 ms | 254.7 / 0.337 ms* | **2,989 / 0.330 ms** |
+| c8 rps / p50 | 41.32 / 191.46 ms | 41.02 / 193.56 ms | 69.3 / 60.9 ms | **2,298 / 1.258 ms** |
+
+`*` native c1 cold includes a 57 ms first request; the warm number is steady state.
+vLLM prefix-cache hits: **0** in both cold and warm runs (928 queries each); a
+58-token prompt cannot fill the 1,568-token block. vLLM cold and warm are identical
+within noise. Native's exact-decision cache sees a hit rate of 1.0 after the first
+request, so it wins repeated-prompt workloads by **~150x at c1 and ~56x at c8**.
+vLLM has no equivalent response cache.
+
+## Startup, memory, KV
+
+| metric | vLLM | native |
+|---|---:|---:|
+| startup to ready | 145 s | **7.65 s** |
+| GPU idle after startup | 21,781 MiB (21.8 GiB) | **13,383 MiB (13.4 GiB)** |
+| GPU peak during suite/long | 22,069 MiB (22.07 GiB) | 22,349 MiB (22.35 GiB) |
+| host RSS | **8.58 GiB** (container) | 12.89 GiB |
+| KV cache | 41,441 fp8 tokens / 2.08 GiB | none (recurrent state) |
+| configured context | 16,384 tokens | 35,310 tokens verified |
+
+vLLM starts ~19x slower and idles ~8.4 GiB higher on GPU because it preallocates
+weights plus KV; native peaks slightly higher on GPU and uses more host RSS.
 
 ## Kernel/execution stacks
 
 | layer | vLLM 0.31.0 | native engine |
 |---|---|---|
-| linear | Marlin (`MarlinLinearKernel`, compressed-tensors WNA16) | Marlin W4A16 (resident repacked layout) |
-| GDN | Triton/FLA prefill + CUDA decode | custom split-dk GDN recurrence |
-| attention | FlashInfer decode, FlashAttention ViT | tiled FA2 |
-| batching | continuous batching, chunked prefill | FIFO request batch, 2 ms window |
+| linear | Marlin (compressed-tensors WNA16) | Marlin W4A16 resident |
+| GDN | Triton/FLA chunked prefill + CUDA decode | chunked TF32 WMMA prefill (>=512), shared/split fallback |
+| attention | FlashInfer (FA2-class on SM89) | tiled FA2 |
+| batching | continuous batching, chunked prefill, `max_num_seqs=8` | FIFO batch, 8 / 2 ms / 16384 tokens |
 | graphs | CUDA graphs (PIECEWISE + FULL) | none |
-| KV cache | fp8 LBNHC, paged | none (full recompute per pass) |
-| output head | FlashInfer top-p/top-k sampler | decision head logits |
+| KV | fp8 LBNHC, paged, prefix caching | none; exact-response logits cache only |
+| output head | FlashInfer top-p/top-k | decision head logits |
 
 ## Why the curves differ
 
-- **c=1**: vLLM wins ~20% because CUDA graphs remove per-forward kernel-launch
-  overhead; the native path launches eager kernels and pays the 2 ms batch window.
-- **c=2**: native wins ~15% because both requests usually share one 2-wide batch,
-  halving forward cost; vLLM's scheduler does not gain as much from two sequences.
-- **c=4**: a tie. The native batch is already full at 4 and vLLM is still
-  launch-bound.
-- **c=8/c=16**: vLLM wins ~17-20% through continuous batching and graph replay;
-  the native worker is a single batch at a time and saturates at ~30 req/s.
-- **Long prefill**: vLLM is ~1.6-1.7x faster due to chunked prefill, FlashInfer
-  attention, FLA GDN, and fused graphs. Native uses full recompute (no KV cache)
-  with custom GDN and tiled FA2, which is competitive but not faster.
-- **Startup and memory**: native skips graph capture/compilation and keeps no KV
-  cache, so it starts 13.8x sooner and uses ~40% less peak memory, at the cost of
-  recomputing prefill every pass. That trade is what allows the 35.3K context on
-  the same 24 GB card while vLLM is configured for 16K.
+- **c=1**: vLLM wins ~21% via CUDA graphs and a tighter single-request path; native
+  still launches eager kernels and pays the 2 ms batch window.
+- **c=2**: native wins ~14% because both requests share one 2-wide batch.
+- **c=4**: a tie; the native batch is full and vLLM is still launch-bound.
+- **c=8/c=16**: vLLM wins 17-22% through continuous batching and graph replay; its
+  `max_num_seqs=8` forces a second wave at c=16, raising its p95 to 455 ms, but
+  throughput still leads. Native's single FIFO worker saturates near 30 req/s.
+- **Long prefill**: vLLM is 1.25-1.37x faster (chunked prefill, FlashInfer, FLA GDN,
+  graphs); native's chunked GDN closed the earlier 1.6-1.7x gap but did not erase it.
+- **Repeated prompts**: the native exact-decision cache bypasses the engine entirely;
+  vLLM's prefix cache cannot help because these prompts are shorter than one block.
 
 ## Quality caveat
 
-- Native vs the CPU AWQ golden suite28: top-1 **28/28**, max delta **1.010e-2**,
-  mean MAE **7.365e-4**, mean KL **3.281e-5** (passes the 0.011/0.001 gates).
-- vLLM vs the saved production artifacts in this pass: suite28 **28/28**, max
-  delta **2.61e-4**, mean delta **9.33e-6**. This is a comparison to the saved
-  production outputs, not to the CPU AWQ golden.
-- Historical vLLM-vs-CPU-AWQ numbers were max **0.01377** / mean MAE **0.00156**.
-  That comparison was **not rerun** in this controlled pass, so it remains context
-  only. Do not read the vLLM 2.61e-4 as vLLM being closer to CPU AWQ than native;
-  the reference files differ.
+| comparison | top-1 | max delta | mean MAE | note |
+|---|---:|---:|---:|---|
+| native vs CPU AWQ golden suite28 | **28/28** | **0.01010** | **0.000736** | native's shipping gate (<=0.011 / <=0.001) |
+| vLLM vs saved production reference | **28/28** | **0.00493** | **0.000651** | vLLM sits closer to the saved production outputs |
+| vLLM vs native live | 28/28 | 0.02264 | 0.001603 | max fails if native is treated as the reference |
+
+The vLLM-vs-native max delta is concentrated in **r22** (noul): vLLM
+`[0.68860, 0.31140]`, production `[0.69353, 0.30647]`, native live
+`[0.71124, 0.28876]`. vLLM is closer to production on that row; native's own shift
+from production is ~0.0177 versus vLLM's 0.0049. The three comparisons use different
+references and must not be read as a single ranking: native is gated against CPU AWQ,
+vLLM against saved production, and the vLLM-vs-native delta is mostly native's
+row-22 shift.
+
+Historical context, unchanged: the earlier vLLM-vs-CPU-AWQ measurement was max
+**0.01377** / mean MAE **0.00156**; it was not rerun in this controlled pass.
+
+## Quantization probes
+
+Both probes were offline kernel/layer experiments on GPU1; neither is enabled in the
+shipped server, and the default remains **W4A16**.
+
+- **W4A8-FP8 Marlin** (`kFE4M3fn x kU4` + zero points): kernel works on SM89 and
+  gives **1.59-1.61x** at M>=1024 (~280 vs ~176 TFLOPS), but per-token E4M3
+  activation quantization adds ~**2.6% normalized layer MAE** (vs ~0.21% for
+  W4A16). Quality is a **no-go** for the strict decision gate. Default OFF.
+- **W4A8-INT8 Marlin** (`kS8 x kU4` + zero points): kernel works and gives
+  **2.6-2.76x** at M=1024/16384 (~457-486 TFLOPS). Layer error is lower than FP8
+  (~0.90-0.96% normalized MAE), but the **full-model suite fails: 26/28, max delta
+  0.657, MAE 0.060**. Default OFF.
+- The shipped default stays **W4A16**: suite28 28/28, max delta 0.0101, MAE
+  0.000736. A future W4A8 attempt needs a full calibration/quality project before it
+  can be considered.
 
 ## Verdict
 
-Under this load shape vLLM is faster at **c=1 (1.20x)**, **c=8 (1.20x)**,
-**c=16 (1.17x)**, and on **long prefill (1.6-1.7x)**. The native engine is faster
-at **c=2 (1.15x)**, ties at **c=4**, and wins decisively on **startup (139 s vs
-10.1 s)**, **peak memory (21.9 GiB vs 13.1 GiB resident / 19.1 GiB peak)**, and
-**verified context (35.3K vs a 16K configured cap)**. Neither result is a defect:
-they reflect CUDA graphs, chunked prefill, FlashInfer/FLA, and continuous batching
-in vLLM versus a simpler FIFO batch with no KV cache in the native engine.
+Under this load shape **vLLM wins c=1 (1.21x), c=8 (1.17x), c=16 (1.22x), and long
+prefill (1.25-1.37x)**. The native engine **wins c=2 (1.14x), ties c=4**, and wins
+**repeated exact prompts (~150x c1 / ~56x c8)**, **startup (7.65 s vs 145 s)**,
+**GPU idle memory (13.4 vs 21.8 GiB)**, and **verified context (35,310 vs a 16,384
+cap)**. vLLM has slightly lower GPU peak (22.07 vs 22.35 GiB) and host RSS
+(8.58 vs 12.89 GiB), and its production-reference suite passes.
+
+**Do not claim the native engine is faster overall.** The gaps are explained by
+CUDA graphs, continuous batching, chunked prefill/FlashInfer/FLA, and prefix caching
+in vLLM versus a simpler FIFO batch with no KV cache but an exact-decision cache in
+the native engine.

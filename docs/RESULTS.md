@@ -206,9 +206,15 @@ Metrics: `jev_native_batch_size`, `jev_native_batch_queue_depth`,
 ## Performance
 
 For a controlled same-GPU comparison against vLLM 0.31.0 (short concurrency sweep,
-long prefill, startup, memory, KV cache, and kernel stacks), see
-[`VLLM-COMPARISON.md`](VLLM-COMPARISON.md). For the ranked, gated plan to close
-the remaining gaps, see [`OPTIMIZATION-PROPOSAL.md`](OPTIMIZATION-PROPOSAL.md).
+long prefill, repeated exact prompts, startup, memory, KV cache, kernel stacks, and
+quantization probes), see [`VLLM-COMPARISON.md`](VLLM-COMPARISON.md). Final summary:
+with 73-token prompts vLLM wins c1/c8/c16 (**1.21x/1.17x/1.22x rps**) and long
+prefill (**1.25-1.37x**); native wins c2 (**1.14x**), ties c4, and wins repeated
+exact prompts (exact cache), startup (**7.65 s vs 145 s**), GPU idle memory
+(**13.4 vs 21.8 GiB**), and verified 35,310-token context. W4A8-FP8/INT8 probes
+remain default OFF (FP8 ~2.6% layer MAE; INT8 suite 26/28, max 0.657). For the
+ranked, gated plan to close the remaining gaps, see
+[`OPTIMIZATION-PROPOSAL.md`](OPTIMIZATION-PROPOSAL.md).
 
 Resident native engine on GPU 1 (`--preload`, Marlin repacked layout 13.1 GiB), measured
 in `native/README.md`:
