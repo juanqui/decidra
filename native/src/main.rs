@@ -202,6 +202,9 @@ fn cmd_batch(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--gdn-shared") {
         eng.set_gdn_split(false);
     }
+    if args.iter().any(|a| a == "--gdn-chunked") {
+        eng.set_gdn_chunked(true);
+    }
     if args.iter().any(|a| a == "--legacy-attention") {
         eng.set_warp_attention(false);
     }
@@ -385,6 +388,9 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     }
     if args.iter().any(|a| a == "--gdn-shared") {
         eng.set_gdn_split(false);
+    }
+    if args.iter().any(|a| a == "--gdn-chunked") {
+        eng.set_gdn_chunked(true);
     }
     if let Some(c) = opt(args, "--gdn-chunks") {
         eng.set_gdn_chunks(c.parse().context("--gdn-chunks must be an integer")?);

@@ -29,6 +29,7 @@ pub struct Kernels {
     pub gdn_recurrent_split: CudaFunction,
     pub gdn_recurrent_shared_batched: CudaFunction,
     pub gdn_recurrent_split_batched: CudaFunction,
+    pub gdn_chunked: CudaFunction,
     pub conv1d_silu_batched: CudaFunction,
     pub conv1d_silu_tiled: CudaFunction,
     pub conv1d_silu_tiled_batched: CudaFunction,
@@ -103,6 +104,14 @@ impl Kernels {
                 f.set_attribute(
                     CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     32768,
+                )?;
+                f
+            },
+            gdn_chunked: {
+                let f = gpu.func("gdn_chunked_f32")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    90112,
                 )?;
                 f
             },
@@ -1050,6 +1059,81 @@ pub fn conv1d_silu_tiled_batched(
     l.arg(lens);
     l.arg(&b_i);
     l.arg(&ch_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+/// Chunk length of `gdn_chunked_f32`; must match `GDN_CHUNK_C` in kernels.cu.
+pub const GDN_CHUNK_C: usize = 32;
+/// Value columns owned by one chunked CTA.
+pub const GDN_CHUNK_VC: usize = 64;
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_chunked<Q, K, V, G, B, ST, O>(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    q: &Q,
+    k: &K,
+    v: &V,
+    g: &G,
+    beta: &B,
+    state: &mut ST,
+    out: &mut O,
+    seq: usize,
+    heads: usize,
+    dk: usize,
+    dv: usize,
+) -> Result<()>
+where
+    Q: DevicePtr<f32>,
+    K: DevicePtr<f32>,
+    V: DevicePtr<f32>,
+    G: DevicePtr<f32>,
+    B: DevicePtr<f32>,
+    ST: DevicePtrMut<f32>,
+    O: DevicePtrMut<bf16>,
+{
+    if dv % GDN_CHUNK_VC != 0 {
+        anyhow::bail!("dv={dv} not divisible by chunked VC={GDN_CHUNK_VC}");
+    }
+    let smem = (dk * GDN_CHUNK_VC
+        + 2 * GDN_CHUNK_C * dk
+        + 2 * GDN_CHUNK_C * GDN_CHUNK_VC
+        + GDN_CHUNK_C * GDN_CHUNK_C
+        + 4 * GDN_CHUNK_C)
+        * std::mem::size_of::<f32>();
+    let cfg = LaunchConfig {
+        grid_dim: ((dv / GDN_CHUNK_VC) as u32, heads as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: smem as u32,
+    };
+    let (seq_i, heads_i, dk_i, dv_i, vc_i) = (
+        seq as i32,
+        heads as i32,
+        dk as i32,
+        dv as i32,
+        GDN_CHUNK_VC as i32,
+    );
+    let (qp, _rq) = q.device_ptr(&gpu.stream);
+    let (kp, _rk) = k.device_ptr(&gpu.stream);
+    let (vp, _rv) = v.device_ptr(&gpu.stream);
+    let (gp, _rg) = g.device_ptr(&gpu.stream);
+    let (bp, _rb) = beta.device_ptr(&gpu.stream);
+    let (sp, _rs) = state.device_ptr_mut(&gpu.stream);
+    let (op, _ro) = out.device_ptr_mut(&gpu.stream);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(&qp);
+    l.arg(&kp);
+    l.arg(&vp);
+    l.arg(&gp);
+    l.arg(&bp);
+    l.arg(&sp);
+    l.arg(&op);
+    l.arg(&seq_i);
+    l.arg(&heads_i);
+    l.arg(&dk_i);
+    l.arg(&dv_i);
+    l.arg(&vc_i);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }

@@ -884,6 +884,191 @@ extern "C" __global__ void gdn_recurrent_split(
 }
 
 // ---------------------------------------------------------------------------
+// Chunked FLA WY/UT gated delta rule (f32 prototype).
+//
+// One CTA owns one (value-column block, value head, sequence). It keeps the
+// [dk, VC] state in shared memory and walks chunks of C=32 tokens:
+//   G   = inclusive cumsum(g) inside the chunk
+//   A   = strict_lower(beta_i * (k_i . k_j) * exp(G_i - G_j))
+//   M   = I + A;  U = M^-1 (beta V);  W = M^-1 (beta exp(G) K)
+//   Vn  = U - W S
+//   O   = exp(G) (Q S) + tril(Q K^T * exp(G_i-G_j)) Vn     (q already scaled)
+//   S   = exp(G_last) S + K^T (exp(G_last - G) Vn)
+// All state/accumulators are f32; only the final output is rounded to bf16.
+// The last chunk is zero-padded (k=q=v=0, beta=0, g=0).
+// ---------------------------------------------------------------------------
+#define GDN_CHUNK_C 32
+
+extern "C" __global__ void gdn_chunked_f32(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc) {
+  constexpr int C = GDN_CHUNK_C;
+  extern __shared__ float sm[];
+  float* S = sm;                       // [dk, vc]
+  float* Kb = S + dk * vc;             // [C, dk]
+  float* WQ = Kb + C * dk;             // [C, dk] (W, later Q)
+  float* Vb = WQ + C * dk;             // [C, vc]
+  float* Ub = Vb + C * vc;             // [C, vc] (U, later Vnew)
+  float* Ab = Ub + C * vc;             // [C, C]
+  float* Gb = Ab + C * C;              // [C]
+  float* Bb = Gb + C;                  // [C]
+  float* ExpG = Bb + C;                // [C] exp(G_i)
+  float* Dg = ExpG + C;                // [C] exp(G_last - G_i)
+
+  const int h = blockIdx.y;
+  const int j0 = blockIdx.x * vc;
+  const int tid = threadIdx.x;
+  const int nchunks = (seq + C - 1) / C;
+
+  for (int i = tid; i < dk * vc; i += blockDim.x) S[i] = 0.f;
+
+  for (int c = 0; c < nchunks; ++c) {
+    const int t0 = c * C;
+    const int L = min(C, seq - t0);
+
+    for (int idx = tid; idx < C * dk; idx += blockDim.x) {
+      int i = idx / dk, d = idx - i * dk;
+      float val = 0.f;
+      if (i < L)
+        val = k[((size_t)(t0 + i) * heads + h) * dk + d];
+      Kb[idx] = val;
+    }
+    for (int idx = tid; idx < C * vc; idx += blockDim.x) {
+      int i = idx / vc, j = idx - i * vc;
+      float val = 0.f;
+      if (i < L)
+        val = v[((size_t)(t0 + i) * heads + h) * dv + j0 + j];
+      Vb[idx] = val;
+    }
+    if (tid < C) {
+      if (tid < L) {
+        Gb[tid] = g[(t0 + tid) * heads + h];
+        Bb[tid] = beta[(t0 + tid) * heads + h];
+      } else {
+        Gb[tid] = 0.f;
+        Bb[tid] = 0.f;
+      }
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+      for (int i = 1; i < C; ++i) Gb[i] += Gb[i - 1];
+    }
+    __syncthreads();
+    if (tid < C) {
+      ExpG[tid] = expf(Gb[tid]);
+      Dg[tid] = expf(Gb[C - 1] - Gb[tid]);
+    }
+    __syncthreads();
+
+    for (int i = tid; i < C * C; i += blockDim.x) Ab[i] = 0.f;
+    __syncthreads();
+
+    // Strict-lower A. Linear triangular index -> (i,j), i>j.
+    const int npairs = C * (C - 1) / 2;
+    for (int p = tid; p < npairs; p += blockDim.x) {
+      int i = 1;
+      while (p >= i * (i + 1) / 2) ++i;
+      int j = p - i * (i - 1) / 2;
+      float dot = 0.f;
+      const float* ki = Kb + i * dk;
+      const float* kj = Kb + j * dk;
+#pragma unroll 4
+      for (int d = 0; d < dk; ++d) dot += ki[d] * kj[d];
+      Ab[i * C + j] = dot * Bb[i] * expf(Gb[i] - Gb[j]);
+    }
+    __syncthreads();
+
+    // Forward substitution for U (beta*V) and W (beta*expG*K).
+    const int cols = vc + dk;
+    for (int i = 0; i < C; ++i) {
+      for (int col = tid; col < cols; col += blockDim.x) {
+        float rhs = (col < vc)
+                        ? Bb[i] * Vb[i * vc + col]
+                        : Bb[i] * ExpG[i] * Kb[i * dk + (col - vc)];
+        float acc = 0.f;
+        for (int j = 0; j < i; ++j) {
+          float x = (col < vc) ? Ub[j * vc + col] : WQ[j * dk + (col - vc)];
+          acc += Ab[i * C + j] * x;
+        }
+        if (col < vc)
+          Ub[i * vc + col] = rhs - acc;
+        else
+          WQ[i * dk + (col - vc)] = rhs - acc;
+      }
+      __syncthreads();
+    }
+
+    // Vnew = U - W S (in place in Ub; W and S are read-only here).
+    for (int idx = tid; idx < C * vc; idx += blockDim.x) {
+      int i = idx / vc, j = idx - i * vc;
+      float acc = 0.f;
+#pragma unroll 4
+      for (int d = 0; d < dk; ++d) acc += WQ[i * dk + d] * S[d * vc + j];
+      Ub[idx] -= acc;
+    }
+    __syncthreads();
+
+    // Q is streamed into the now-free W buffer.
+    for (int idx = tid; idx < C * dk; idx += blockDim.x) {
+      int i = idx / dk, d = idx - i * dk;
+      float val = 0.f;
+      if (i < L)
+        val = q[((size_t)(t0 + i) * heads + h) * dk + d];
+      WQ[idx] = val;
+    }
+    __syncthreads();
+
+    // Inclusive-lower QK^T * decay, stored in the now-free A buffer.
+    const int qpairs = C * (C + 1) / 2;
+    for (int p = tid; p < qpairs; p += blockDim.x) {
+      int i = 0;
+      while (p >= (i + 1) * (i + 2) / 2) ++i;
+      int j = p - i * (i + 1) / 2;
+      float dot = 0.f;
+      const float* qi = WQ + i * dk;
+      const float* kj = Kb + j * dk;
+#pragma unroll 4
+      for (int d = 0; d < dk; ++d) dot += qi[d] * kj[d];
+      Ab[i * C + j] = dot * expf(Gb[i] - Gb[j]);
+    }
+    __syncthreads();
+
+    // Output: exp(G) (Q S) + (QK decay) Vnew.
+    for (int idx = tid; idx < C * vc; idx += blockDim.x) {
+      int i = idx / vc, j = idx - i * vc;
+      if (i >= L) continue;
+      float inter = 0.f;
+#pragma unroll 4
+      for (int d = 0; d < dk; ++d) inter += WQ[i * dk + d] * S[d * vc + j];
+      float o = ExpG[i] * inter;
+      for (int jj = 0; jj <= i; ++jj) o += Ab[i * C + jj] * Ub[jj * vc + j];
+      out[((size_t)(t0 + i) * heads + h) * dv + j0 + j] = f2bf(o);
+    }
+    __syncthreads();
+
+    // State: exp(G_last) S + K^T (exp(G_last - G) Vnew).
+    const float egl = ExpG[C - 1];
+    for (int idx = tid; idx < dk * vc; idx += blockDim.x) {
+      int d = idx / vc, j = idx - d * vc;
+      float acc = egl * S[idx];
+#pragma unroll 4
+      for (int i = 0; i < C; ++i)
+        acc += Kb[i * dk + d] * Dg[i] * Ub[i * vc + j];
+      S[idx] = acc;
+    }
+    __syncthreads();
+  }
+
+  for (int idx = tid; idx < dk * vc; idx += blockDim.x) {
+    int d = idx / vc, j = idx - d * vc;
+    state[((size_t)h * dk + d) * dv + j0 + j] = S[idx];
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Batched variants: every sequence is a contiguous row range
 // [offsets[s], offsets[s] + lens[s]) in the flattened [total, ...] buffers.
 // ---------------------------------------------------------------------------
