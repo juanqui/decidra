@@ -395,7 +395,8 @@ all returned 200 with zero backend errors and no timeout/OOM.
 
 A controlled same-GPU comparison against vLLM 0.31.0 (throughput, latency, long
 prefill, startup, memory, and kernel stacks) is in
-[`docs/VLLM-COMPARISON.md`](docs/VLLM-COMPARISON.md).
+[`docs/VLLM-COMPARISON.md`](docs/VLLM-COMPARISON.md). The follow-on ranked
+optimization plan is [`docs/OPTIMIZATION-PROPOSAL.md`](docs/OPTIMIZATION-PROPOSAL.md).
 
 ## One-GPU deployment example (GPU 1 only)
 
