@@ -441,7 +441,7 @@ impl Engine {
         }
         if capture && stage == Stage::Attn {
             *captured = Some(mix);
-            return Ok(self.alloc_bf16(0)?);
+            return self.alloc_bf16(0);
         }
 
         let mut x1 = self.alloc_bf16(seq * hidden)?;

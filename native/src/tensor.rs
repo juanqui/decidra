@@ -22,7 +22,7 @@ pub enum DType {
 }
 
 impl DType {
-    pub fn from_str(s: &str) -> Result<Self> {
+    pub fn parse(s: &str) -> Result<Self> {
         Ok(match s {
             "F32" => DType::F32,
             "F16" => DType::F16,
@@ -105,7 +105,7 @@ impl Store {
                 if name == "__metadata__" {
                     continue;
                 }
-                let dtype = DType::from_str(info["dtype"].as_str().context("dtype")?)?;
+                let dtype = DType::parse(info["dtype"].as_str().context("dtype")?)?;
                 let shape: Vec<usize> = info["shape"]
                     .as_array()
                     .context("shape")?

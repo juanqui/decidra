@@ -171,6 +171,7 @@ pub fn sigmoid_gate(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn split_q_gate(
     gpu: &Gpu,
     k: &CudaFunction,

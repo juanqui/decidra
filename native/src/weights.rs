@@ -62,8 +62,8 @@ pub struct LayerWeights {
 }
 
 pub enum MixerWeights {
-    Full(FullAttentionWeights),
-    Gdn(GdnWeights),
+    Full(Box<FullAttentionWeights>),
+    Gdn(Box<GdnWeights>),
 }
 
 pub struct FullAttentionWeights {
@@ -155,8 +155,8 @@ impl<'a> WeightProvider<'a> {
             if group_size != 64 {
                 bail!("{module}: unsupported group size {group_size}");
             }
-            let packed_words = (in_ + 7) / 8;
-            let zp_rows = (out + 7) / 8;
+            let packed_words = in_.div_ceil(8);
+            let zp_rows = out.div_ceil(8);
             let packed = self.store.i32(&packed_name)?;
             let scale = self.store.bf16(&format!("{module}.weight_scale"))?;
             let zp = self.store.i32(&format!("{module}.weight_zero_point"))?;
@@ -206,15 +206,17 @@ impl<'a> WeightProvider<'a> {
         let up_proj = self.linear(&self.name(&format!("{l}mlp.up_proj")))?;
         let down_proj = self.linear(&self.name(&format!("{l}mlp.down_proj")))?;
         let mixer = match kind {
-            crate::config::LayerType::FullAttention => MixerWeights::Full(FullAttentionWeights {
-                q_proj: self.linear(&self.name(&format!("{l}self_attn.q_proj")))?,
-                k_proj: self.linear(&self.name(&format!("{l}self_attn.k_proj")))?,
-                v_proj: self.linear(&self.name(&format!("{l}self_attn.v_proj")))?,
-                o_proj: self.linear(&self.name(&format!("{l}self_attn.o_proj")))?,
-                q_norm: self.upload(&self.name(&format!("{l}self_attn.q_norm.weight")))?,
-                k_norm: self.upload(&self.name(&format!("{l}self_attn.k_norm.weight")))?,
-            }),
-            crate::config::LayerType::LinearAttention => MixerWeights::Gdn(GdnWeights {
+            crate::config::LayerType::FullAttention => {
+                MixerWeights::Full(Box::new(FullAttentionWeights {
+                    q_proj: self.linear(&self.name(&format!("{l}self_attn.q_proj")))?,
+                    k_proj: self.linear(&self.name(&format!("{l}self_attn.k_proj")))?,
+                    v_proj: self.linear(&self.name(&format!("{l}self_attn.v_proj")))?,
+                    o_proj: self.linear(&self.name(&format!("{l}self_attn.o_proj")))?,
+                    q_norm: self.upload(&self.name(&format!("{l}self_attn.q_norm.weight")))?,
+                    k_norm: self.upload(&self.name(&format!("{l}self_attn.k_norm.weight")))?,
+                }))
+            }
+            crate::config::LayerType::LinearAttention => MixerWeights::Gdn(Box::new(GdnWeights {
                 in_proj_qkv: self.linear(&self.name(&format!("{l}linear_attn.in_proj_qkv")))?,
                 in_proj_z: self.linear(&self.name(&format!("{l}linear_attn.in_proj_z")))?,
                 in_proj_b: self.linear(&self.name(&format!("{l}linear_attn.in_proj_b")))?,
@@ -224,7 +226,7 @@ impl<'a> WeightProvider<'a> {
                 a_log: self.tensor_f32(&self.name(&format!("{l}linear_attn.A_log")))?,
                 dt_bias: self.tensor_f32(&self.name(&format!("{l}linear_attn.dt_bias")))?,
                 norm: self.upload(&self.name(&format!("{l}linear_attn.norm.weight")))?,
-            }),
+            })),
         };
         Ok(LayerWeights {
             input_norm,
