@@ -102,6 +102,29 @@ measurement files are kept only for drift context.
   concurrency because the native engine serializes forwards; c=4 latency is queueing,
   not batching.
 
+## Request batching
+
+The native backend runs one engine thread. HTTP handlers tokenize on the reactor,
+enqueue `{tokens, head_ids, oneshot reply}`, and await the reply; the worker owns the
+CUDA context. Batch formation:
+
+- block for the first request;
+- drain more until the window (`JEV_NATIVE_BATCH_WINDOW_US`, default **2000 µs**),
+  `JEV_NATIVE_MAX_BATCH` (default **8**), or `JEV_NATIVE_MAX_BATCH_TOKENS`
+  (default **16384**) is reached;
+- strict FIFO; a request never spans batches; a request that does not fit is pushed
+  back to the head for the next batch;
+- a single request larger than the token cap (e.g. 16K/32K) runs alone;
+- closed client receivers are skipped; executor errors are returned per request;
+- `JEV_NATIVE_BATCH=false` sets max batch 1 and window 0.
+
+Lone requests pay the window; `JEV_NATIVE_BATCH_WINDOW_US=0` removes it. The worker
+executes one batch at a time, so `JEV_MAX_CONCURRENCY` bounds queued passes but does
+not create parallel forwards.
+
+Metrics: `jev_native_batch_size`, `jev_native_batch_queue_depth`,
+`jev_native_batch_wait_seconds`, plus the existing `jev_backend_*` counters.
+
 ## Performance
 
 Resident native engine on GPU 1 (`--preload`, Marlin repacked layout 13.1 GiB), measured

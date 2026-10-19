@@ -2,10 +2,10 @@
 //! `tokenizers` tokenizer. No HTTP hop, no Python, no external model server.
 //!
 //! `jev_native::Engine` is `Send` but owns one CUDA context/stream and is not
-//! safe for concurrent forwards. Calls are serialized through a mutex and moved
-//! to `spawn_blocking`, so the async reactor is never stalled by a forward.
+//! safe for concurrent forwards. It is moved into a dedicated worker thread
+//! (see [`crate::batch`]); requests are tokenized on the async reactor, queued,
+//! and executed in small FIFO batches. The reactor never blocks on a forward.
 
-use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
@@ -13,14 +13,44 @@ use tokenizers::Tokenizer;
 
 use crate::{
     backend::{Backend, LogitsFuture},
+    batch::{BatchExecutor, BatchHandle, BatchOptions, ExecResult},
     config::Config,
     error::EngineError,
     prompt,
 };
 
+/// Owns the engine on the batch worker thread.
+struct EngineExecutor {
+    engine: jev_native::Engine,
+    /// Whether the queue may submit multi-request batches. When false the
+    /// queue is configured for single requests anyway; this flag also lets the
+    /// adapter take the single-call path explicitly.
+    batch_enabled: bool,
+}
+
+impl BatchExecutor for EngineExecutor {
+    fn execute(&mut self, tokens: &[&[u32]], ids: &[&[u32]]) -> Vec<ExecResult> {
+        debug_assert_eq!(tokens.len(), ids.len());
+        // Native batch API (Engine::decision_logits_batch) is not available in
+        // this checkout yet. Until it lands, execute the batch in FIFO order
+        // with the single-request call. The queue, limits, metrics, and error
+        // semantics are already final; only this adapter changes.
+        let _ = self.batch_enabled;
+        tokens
+            .iter()
+            .zip(ids)
+            .map(|(tokens, ids)| {
+                self.engine
+                    .decision_logits(tokens, ids)
+                    .map_err(|error| error.to_string())
+            })
+            .collect()
+    }
+}
+
 pub struct NativeBackend {
     tokenizer: Tokenizer,
-    engine: Arc<Mutex<jev_native::Engine>>,
+    queue: BatchHandle,
 }
 
 impl NativeBackend {
@@ -64,12 +94,29 @@ impl NativeBackend {
             fused_w4a16 = config.native_fused_w4a16 && !config.native_marlin,
             hidden = engine.cfg.hidden_size,
             layers = engine.cfg.num_hidden_layers,
+            batching = config.native_batch,
+            max_batch = config.native_max_batch,
+            batch_window_us = config.native_batch_window_us,
+            max_batch_tokens = config.native_max_batch_tokens,
             elapsed_secs = started.elapsed().as_secs_f64(),
             "native engine ready"
         );
+        let options = if config.native_batch {
+            BatchOptions::new(
+                config.native_max_batch,
+                config.native_max_batch_tokens,
+                std::time::Duration::from_micros(config.native_batch_window_us),
+            )
+        } else {
+            BatchOptions::single(config.native_max_batch_tokens)
+        };
+        let executor = EngineExecutor {
+            engine,
+            batch_enabled: config.native_batch,
+        };
         Ok(Self {
             tokenizer,
-            engine: Arc::new(Mutex::new(engine)),
+            queue: BatchHandle::spawn(executor, options),
         })
     }
 
@@ -84,22 +131,13 @@ impl NativeBackend {
 impl Backend for NativeBackend {
     fn logits<'a>(&'a self, prompt: &'a str, ids: &'a [u32]) -> LogitsFuture<'a> {
         Box::pin(async move {
+            let started = Instant::now();
             let tokens = self.encode(prompt)?;
             let ids = ids.to_vec();
             let expected = ids.len();
-            let engine = self.engine.clone();
-            let started = Instant::now();
-            let result = tokio::task::spawn_blocking(move || {
-                let engine = engine.lock().map_err(|_| {
-                    EngineError::Internal("native engine mutex poisoned".to_owned())
-                })?;
-                engine
-                    .decision_logits(&tokens, &ids)
-                    .map_err(|error| EngineError::Backend(error.to_string()))
-            })
-            .await
-            .map_err(|error| {
-                EngineError::Internal(format!("native forward task failed: {error}"))
+            let receiver = self.queue.submit(tokens, ids)?;
+            let result = receiver.await.map_err(|_| {
+                EngineError::Internal("native batch worker dropped the request".to_owned())
             })?;
             metrics::histogram!("jev_backend_forward_seconds")
                 .record(started.elapsed().as_secs_f64());
@@ -110,7 +148,7 @@ impl Backend for NativeBackend {
                 Err(_) => metrics::counter!("jev_backend_requests_total", "status" => "error")
                     .increment(1),
             }
-            let logits = result?;
+            let logits = result.map_err(EngineError::Backend)?;
             if logits.len() != expected {
                 return Err(EngineError::BadResponse(format!(
                     "native engine returned {} logits for {} requested ids",

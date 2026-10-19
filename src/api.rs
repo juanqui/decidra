@@ -51,6 +51,10 @@ pub struct LoadReport {
     pub native_choice_options: usize,
     pub temperatures: Value,
     pub backend: String,
+    pub batching: bool,
+    pub max_batch: usize,
+    pub batch_window_us: u64,
+    pub max_batch_tokens: usize,
     pub signing_enabled: bool,
 }
 
@@ -108,6 +112,10 @@ pub fn load_metadata(config: &Config) -> Result<Metadata> {
         native_choice_options,
         temperatures: loaded.temperatures.raw.clone(),
         backend: "not loaded (check-config)".to_owned(),
+        batching: config.native_batch,
+        max_batch: config.native_max_batch,
+        batch_window_us: config.native_batch_window_us,
+        max_batch_tokens: config.native_max_batch_tokens,
         signing_enabled: config.signing_enabled(),
     };
     Ok(Metadata {

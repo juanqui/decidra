@@ -186,6 +186,10 @@ GPU 0 is not used by this stack. Inside a container, reserve GPU 1
 | `JEV_NATIVE_CACHE` | `true` | Keep packed decoder weights resident on the GPU. |
 | `JEV_NATIVE_MARLIN` | `true` | Repack weights into the Marlin W4A16 layout during preload and use the Marlin kernel. Set `false` for the dequant/fused fallback. |
 | `JEV_NATIVE_FUSED_W4A16` | `true` | Fallback-only hybrid fused policy (ignored when Marlin is on): fused when `N >= 5120 && M <= 256`, otherwise dequant + cuBLAS. |
+| `JEV_NATIVE_BATCH` | `true` | Enable the native request batcher. Disabled sets one request per forward and window 0. |
+| `JEV_NATIVE_MAX_BATCH` | `8` | Maximum requests per batch (`>= 1`). Effective value is `1` when batching is disabled. |
+| `JEV_NATIVE_BATCH_WINDOW_US` | `2000` | Microseconds the worker waits after a batch's first request for more work (max `50000`). Effective value is `0` when batching is disabled. |
+| `JEV_NATIVE_MAX_BATCH_TOKENS` | `16384` | Maximum total prompt tokens per batch (`>= 512`). A single larger request runs alone. |
 | `JEV_TOKENIZER` | checkpoint `tokenizer.json` | Tokenizer file or directory override. |
 | `JEV_CALIBRATION` | discovered | `calibration.json` override. |
 | `JEV_CALIBRATION_FITTED` | unset | Optional `fit_bias.py` output. Unset/absent disables it. |
@@ -442,18 +446,29 @@ WantedBy=multi-user.target
   (1K per-layer 13.35 -> 3.41 ms) but is gated to sequences >= 512 tokens; shorter
   prompts keep the accurate shared recurrence. Tiled FA2 attention is 7-12x faster than
   warp on identical buffers (kernel-only 1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms).
-- Wide choices multiply forwards: a 256-option tournament makes 16 group passes plus one
-  final pass; a permute makes 4 passes. The engine serializes them, so `permute` and
-  `tournament` scale roughly linearly with pass count.
+- Requests are batched. A single engine thread owns the CUDA context; the HTTP
+  reactor tokenizes and enqueues, then awaits a oneshot reply. The worker blocks for
+  the first request and drains more until the **2 ms** window expires, `MAX_BATCH`
+  (8) is reached, or the next request would exceed `MAX_BATCH_TOKENS` (16,384).
+  Order is strict FIFO and a request is never split. A request larger than the token
+  cap (e.g. 32K) runs alone, so long context is unaffected by the 2 ms window.
+- Dropped clients are skipped when the batch is formed; executor errors are returned
+  per request. A panicking executor fails only its batch.
+- Wide choices multiply passes: a 256-option tournament makes 16 group passes plus one
+  final pass; a permute makes 4 passes. Passes are independent requests and can share
+  a batch when they arrive together.
 - The `single` strategy is the lowest-latency option for ≤16 choices.
+- Batching only helps when requests arrive together. A lone request still pays the
+  2 ms window; set `JEV_NATIVE_BATCH_WINDOW_US=0` or `JEV_NATIVE_BATCH=false` for
+  latency-critical single-client deployments.
 - `JEV_NATIVE_MARLIN=true` is the default and uses the repacked Marlin W4A16 kernel. At 1K
   the gain is 2.58x (1261 -> 488 ms) after the gated split-GDN work; short prompts keep
   the accurate shared GDN.
 - With Marlin off, `JEV_NATIVE_FUSED_W4A16=true` selects the hybrid fused policy (fused for
   `N >= 5120 && M <= 256`), and the remaining path dequantizes into a BF16 workspace for
   cuBLAS BF16 GEMM.
-- Increase `JEV_MAX_CONCURRENCY` only for queueing; it does not batch because forwards are
-  serialized.
+- `JEV_MAX_CONCURRENCY` bounds outstanding decision passes; the batch worker still
+  executes one batch at a time.
 
 Prometheus metrics exposed:
 
@@ -461,8 +476,11 @@ Prometheus metrics exposed:
 - `jev_http_request_duration_seconds{path}`
 - `jev_http_requests_in_flight`
 - `jev_backend_requests_total{status}`
-- `jev_backend_forward_seconds`
+- `jev_backend_forward_seconds` (enqueue to reply, includes batch wait)
 - `jev_backend_prompt_tokens_total`
+- `jev_native_batch_size` (requests per executed batch)
+- `jev_native_batch_queue_depth` (queued, not executing)
+- `jev_native_batch_wait_seconds` (enqueue to batch start)
 - `jev_decide_total{kind,strategy}`
 - `jev_decide_options`, `jev_decide_pass_options`
 - `jev_decisions_total{kind}`

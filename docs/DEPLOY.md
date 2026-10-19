@@ -100,7 +100,11 @@ those steps to succeed; there is no partial serving.
 | `JEV_NATIVE_CACHE` | `true` | Keep packed decoder weights resident. |
 | `JEV_NATIVE_MARLIN` | `true` | Repack to the Marlin W4A16 layout during preload and use Marlin. |
 | `JEV_NATIVE_FUSED_W4A16` | `true` | Fallback-only hybrid fused policy; ignored when Marlin is on. |
-| `JEV_MAX_CONCURRENCY` | `8` | Outstanding decision passes. Forwards are serialized. |
+| `JEV_NATIVE_BATCH` | `true` | Native request batcher. `false` means one request per forward and window 0. |
+| `JEV_NATIVE_MAX_BATCH` | `8` | Max requests per batch. |
+| `JEV_NATIVE_BATCH_WINDOW_US` | `2000` | Batch window in microseconds (max `50000`). |
+| `JEV_NATIVE_MAX_BATCH_TOKENS` | `16384` | Max total prompt tokens per batch (min `512`); a larger single request runs alone. |
+| `JEV_MAX_CONCURRENCY` | `8` | Outstanding decision passes. Batches execute one at a time. |
 | `JEV_SIGNING_KEY` | unset | HMAC-SHA256 response signing. |
 | `JEV_METRICS_ENABLED` | `true` | Prometheus recorder. |
 | `JEV_CUDA_LIBS` | unset | Directory with `libcublas.so.13`/`libcublasLt.so.13`. |
