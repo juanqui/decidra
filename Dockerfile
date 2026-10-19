@@ -47,6 +47,7 @@ ENV JEV_BIND_ADDR=0.0.0.0:8080 \
     JEV_NATIVE_MODEL=/models/awq-w4a16-v2 \
     JEV_CHECKPOINT=/models/awq-w4a16-v2 \
     JEV_NATIVE_CACHE=true \
+    JEV_NATIVE_MARLIN=true \
     JEV_NATIVE_FUSED_W4A16=true \
     JEV_MAX_CONCURRENCY=8 \
     JEV_METRICS_ENABLED=true

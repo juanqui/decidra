@@ -26,6 +26,9 @@ pub struct Config {
     pub native_model: PathBuf,
     /// Keep packed decoder weights resident on the GPU (`JEV_NATIVE_CACHE`).
     pub native_cache: bool,
+    /// Use the repacked Marlin W4A16 kernel (`JEV_NATIVE_MARLIN`). On by
+    /// default; the engine repacks once during `preload_all`.
+    pub native_marlin: bool,
     /// Use the fused W4A16 kernel/hybrid policy (`JEV_NATIVE_FUSED_W4A16`).
     /// On by default: the native policy uses fused for `N >= 5120 && M <= 256`
     /// and falls back to dequant + cuBLAS otherwise.
@@ -61,6 +64,7 @@ impl Config {
             env_string("JEV_NATIVE_MODEL").unwrap_or_else(|| checkpoint.display().to_string()),
         );
         let native_cache = env_bool("JEV_NATIVE_CACHE")?.unwrap_or(true);
+        let native_marlin = env_bool("JEV_NATIVE_MARLIN")?.unwrap_or(true);
         let native_fused_w4a16 = env_bool("JEV_NATIVE_FUSED_W4A16")?.unwrap_or(true);
 
         let max_concurrency = env_usize("JEV_MAX_CONCURRENCY")?.unwrap_or(DEFAULT_MAX_CONCURRENCY);
@@ -91,6 +95,7 @@ impl Config {
             hf_snapshot,
             native_model,
             native_cache,
+            native_marlin,
             native_fused_w4a16,
             max_concurrency,
             signing_key,

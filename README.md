@@ -43,8 +43,9 @@ visible set.
 ### Backends
 
 - `native` (feature `native`, shipped): in-process `jev_native::Engine`. Loads
-  `/srv/models/jev-awq/awq-w4a16-v2`, uploads the packed W4A16 decoder weights once
-  (`preload_all`), and keeps them resident.
+  `/srv/models/jev-awq/awq-w4a16-v2`, repacks/upload the W4A16 decoder weights once
+  (`preload_all`), and keeps them resident. Default weight kernel is the repacked Marlin
+  path; set `JEV_NATIVE_MARLIN=false` for the dequant/hybrid fallback.
 - `MockBackend` (always compiled): deterministic test backend used by unit and
   integration tests. No GPU or native crate needed.
 
@@ -182,7 +183,8 @@ GPU 0 is not used by this stack. Inside a container, reserve GPU 1
 | `JEV_CHECKPOINT` | `/srv/models/jev-awq/awq-w4a16-v2` | Artifact with tokenizer/head/calibration. |
 | `JEV_NATIVE_MODEL` | `$JEV_CHECKPOINT` | Checkpoint opened by the native engine. |
 | `JEV_NATIVE_CACHE` | `true` | Keep packed decoder weights resident on the GPU. |
-| `JEV_NATIVE_FUSED_W4A16` | `true` | Hybrid fused W4A16 policy: fused when `N >= 5120 && M <= 256`, otherwise dequant + cuBLAS BF16 GEMM. |
+| `JEV_NATIVE_MARLIN` | `true` | Repack weights into the Marlin W4A16 layout during preload and use the Marlin kernel. Set `false` for the dequant/fused fallback. |
+| `JEV_NATIVE_FUSED_W4A16` | `true` | Fallback-only hybrid fused policy (ignored when Marlin is on): fused when `N >= 5120 && M <= 256`, otherwise dequant + cuBLAS. |
 | `JEV_TOKENIZER` | checkpoint `tokenizer.json` | Tokenizer file or directory override. |
 | `JEV_CALIBRATION` | discovered | `calibration.json` override. |
 | `JEV_CALIBRATION_FITTED` | unset | Optional `fit_bias.py` output. Unset/absent disables it. |
@@ -328,30 +330,33 @@ Correctness (native engine, from `native/README.md`, validated against CPU golde
 Single-forward native measurements on GPU 1 with resident packed weights
 (`native/README.md`):
 
-| prompt | reference path (dequant + cuBLAS) | hybrid fused (`JEV_NATIVE_FUSED_W4A16=true`, default) |
-|---|---|---|
-| 36 tokens | 174.7 ms (first request 259 ms) | **84.8 ms** (2.06x) |
-| 76 tokens | 202.2 ms | **126.4 ms** (1.60x) |
-| 1024 tokens | 1261.2 ms | **1261.2 ms** (falls back, 1.00x) |
+| prompt | reference (dequant + cuBLAS) | hybrid fused fallback | Marlin (default) |
+|---|---|---|---|
+| 36 tokens | 174.7 ms | 84.8 ms | **45.1 ms** (3.87x) |
+| 76 tokens | 202.2 ms | 126.4 ms | **73.0 ms** (2.77x) |
+| 1024 tokens | 1261.2 ms | 1261.2 ms | **1144.9 ms** (1.10x) |
 
-Preload is **5.8 s** (12.4 GiB packed weights resident); init is 0.2 s. During the
-36-token hybrid run the GPU was at 100% utilization, ~184 W mean / 213 W peak. Outputs are
-bit-identical to the streaming path, and the golden checks are unchanged.
+Marlin preload is **10.1 s** (repack) and uses **13.1 GiB** resident; the fallback paths
+use 5.8 s / 12.7 GiB. Init is 0.2 s. At 36 tokens Marlin runs at 100% GPU utilization.
+Long-context latency with Marlin + warp attention: **4K 4.65 s**, **8K 9.88 s**,
+**16K 22.88 s** (peak 18.9 GiB at 16K). Those cases are attention/prefill-bound; 1K is
+still ~1.14 s because the fixed 64-row M tile limits Marlin's large-M benefit.
 
-The hybrid policy uses fused only for `N >= 5120 && M <= 256` and falls back to
-dequant + cuBLAS otherwise; that is why 1K prefill sees no fused benefit. The server adds
-tokenization, head math, and JSON on top of these forward times. Short live benchmark
-(16 unique requests/level, hybrid default): c=1 **8.44 req/s**, p50 **123.7 ms**; c=4
-**8.48 req/s**, p50 **459.3 ms**, ~**587 tok/s**. Throughput is flat because forwards are
-serialized; c=4 is queueing, not batching.
+With `JEV_NATIVE_MARLIN=false`, the fallback hybrid policy uses fused only for
+`N >= 5120 && M <= 256` and falls back to dequant + cuBLAS otherwise. Marlin is the
+default and ignores both fallback flags.
 
 Live API comparison against the **CPU AWQ golden** (`eval/data/awq-cpu-suite28.json`,
-28 rows): top-1 **28/28**, mean KL **3.06e-5**, mean MAE **8.45e-4**, max delta
-**1.0345e-2** (`r20`). Acceptance uses `top1 1.0`, `max_kl 0.001`, `mean_mae 0.001`,
-`max_delta 0.011` and passes. The historical production-v2 baseline gives top-1 28/28,
-mean KL 8.07e-5, mean MAE 1.64e-3, max delta 1.45e-2; that baseline itself differs from
-CPU golden by max 0.01377 / mean MAE 0.00156, so it is context only. See `docs/RESULTS.md`
-for per-kind tables. Run `scripts/run-eval.sh` to reproduce.
+28 rows, Marlin default): top-1 **28/28**, mean KL **2.62e-5**, mean MAE **9.30e-4**,
+max delta **6.03e-3** (`r03`). Acceptance uses `top1 1.0`, `max_kl 0.001`,
+`mean_mae 0.001`, `max_delta 0.011` and passes. The historical production-v2 baseline is
+context only: it itself differs from CPU golden by max 0.01377 / mean MAE 0.00156. See
+`docs/RESULTS.md` for per-kind tables. Run `scripts/run-eval.sh` to reproduce.
+
+Short live benchmark (16 unique requests/level, Marlin default, forwards serialized):
+c=1 **14.589 req/s**, p50 **68.0 ms**, p95 **84.0 ms**; c=4 **14.992 req/s**, p50
+**254.3 ms**, p95 **298.1 ms**, ~**1,014-1,042 tok/s**. c=4 latency is queueing, not
+batching.
 
 ## One-GPU deployment example (GPU 1 only)
 
@@ -405,22 +410,24 @@ WantedBy=multi-user.target
 
 ## Performance notes
 
-- The native engine loads all packed decoder weights once at startup (~12.4 GiB, ~5.8 s
-  preload) and keeps them resident. First request latency does not include a checkpoint
-  upload.
+- The native engine repacks and loads all decoder weights once at startup (~13.1 GiB,
+  ~10.1 s preload with Marlin) and keeps them resident. First request latency does not
+  include a checkpoint upload.
 - One forward produces one decision read-out position. Latency is dominated by prefill;
-  nothing is decoded. Single-forward measurements: 176.6 ms (36 tokens), 202.9 ms
-  (76 tokens), 1277.6 ms (1024 tokens).
+  nothing is decoded. Marlin single-forward timings: **45.1 ms** (36 tokens),
+  **73.0 ms** (76 tokens), **1144.9 ms** (1024 tokens). Long context is
+  attention/prefill-bound: 4K **4.65 s**, 8K **9.88 s**, 16K **22.88 s**.
 - Wide choices multiply forwards: a 256-option tournament makes 16 group passes plus one
   final pass; a permute makes 4 passes. The engine serializes them, so `permute` and
   `tournament` scale roughly linearly with pass count.
 - The `single` strategy is the lowest-latency option for ≤16 choices.
-- `JEV_NATIVE_FUSED_W4A16=true` is the default hybrid policy: fused for
-  `N >= 5120 && M <= 256`, dequant + cuBLAS otherwise. It gives 84.8 ms vs 174.7 ms at
-  36 tokens (2.06x) and 126.4 ms at 76 tokens, but **no benefit at 1K tokens** (falls
-  back). Small-N projections and large prefills remain on the reference path.
-- The fallback path dequantizes each module into a BF16 workspace and uses cuBLAS BF16
-  GEMM.
+- `JEV_NATIVE_MARLIN=true` is the default and uses the repacked Marlin W4A16 kernel. At 1K
+  tokens the gain is only 1.10x because the fixed 64-row M tile is the bottleneck.
+- With Marlin off, `JEV_NATIVE_FUSED_W4A16=true` selects the hybrid fused policy (fused for
+  `N >= 5120 && M <= 256`), and the remaining path dequantizes into a BF16 workspace for
+  cuBLAS BF16 GEMM.
+- Increase `JEV_MAX_CONCURRENCY` only for queueing; it does not batch because forwards are
+  serialized.
 
 Prometheus metrics exposed:
 

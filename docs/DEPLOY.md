@@ -43,7 +43,8 @@ Runtime:
 - `libcublas.so.13` and `libcublasLt.so.13`. Set `JEV_CUDA_LIBS` if they are not on the
   loader path.
 - RTX 4090 / sm_89.
-- ~14 GiB free VRAM for resident packed weights plus workspace.
+- ~13.1 GiB free VRAM for Marlin's resident repacked weights plus workspace; 16K context
+  peaks at ~18.9 GiB.
 
 `curl` is used by the health check and smoke script. `python3` is optional and only used
 by the development evaluation tooling.
@@ -77,8 +78,8 @@ JEV_SIGNING_KEY="$(cat /run/secrets/jev-signing-key)" \
 `JEV_CUDA_LIBS` is non-empty.
 
 Startup loads the tokenizer/head/calibration, validates the A-P verbalizer parity, opens
-the native checkpoint, and preloads the decoder layers. Readiness requires all of those
-steps to succeed; there is no partial serving.
+the native checkpoint, and preloads/re-packs the decoder layers. Readiness requires all of
+those steps to succeed; there is no partial serving.
 
 ## Environment
 
@@ -89,7 +90,8 @@ steps to succeed; there is no partial serving.
 | `JEV_CHECKPOINT` | `/srv/models/jev-awq/awq-w4a16-v2` | Tokenizer/head/calibration artifact. |
 | `JEV_NATIVE_MODEL` | `$JEV_CHECKPOINT` | Checkpoint opened by the native engine. |
 | `JEV_NATIVE_CACHE` | `true` | Keep packed decoder weights resident. |
-| `JEV_NATIVE_FUSED_W4A16` | `true` | Hybrid fused policy; falls back to dequant + cuBLAS for small N or M > 256. |
+| `JEV_NATIVE_MARLIN` | `true` | Repack to the Marlin W4A16 layout during preload and use Marlin. |
+| `JEV_NATIVE_FUSED_W4A16` | `true` | Fallback-only hybrid fused policy; ignored when Marlin is on. |
 | `JEV_MAX_CONCURRENCY` | `8` | Outstanding decision passes. Forwards are serialized. |
 | `JEV_SIGNING_KEY` | unset | HMAC-SHA256 response signing. |
 | `JEV_METRICS_ENABLED` | `true` | Prometheus recorder. |
@@ -157,7 +159,7 @@ in production.
 |---|---|
 | `libcublas.so.13: cannot open shared object file` | Set `JEV_CUDA_LIBS` to the cuBLAS directory or add it to `ldconfig`. |
 | `CUDA driver version is insufficient` | Driver too old for the CUDA 13 engine build. |
-| Startup blocks with high disk I/O | `JEV_NATIVE_CACHE=true` uploads ~12.3 GiB once; wait for the preload log line. |
+| Startup blocks for ~10 s with disk/GPU work | `JEV_NATIVE_CACHE=true` repacks/uploads ~13.1 GiB once; wait for the preload log line. |
 | `/v1/decide` returns 502 | Native forward failed (check logs); no fallback backend exists. |
 | `/v1/decide` returns 400 for image states | Expected: native vision is not implemented. |
 | `/v1/chat/completions` returns 501 | Expected: native generation is not implemented. |

@@ -42,8 +42,12 @@ impl NativeBackend {
                 config.native_model.display()
             )
         })?;
+        // Must be set before preload_all: Marlin repacks into its resident layout.
+        engine.set_marlin(config.native_marlin);
         engine.set_cache_weights(config.native_cache);
-        engine.set_fused_w4a16(config.native_fused_w4a16);
+        if !config.native_marlin {
+            engine.set_fused_w4a16(config.native_fused_w4a16);
+        }
         if config.native_cache {
             engine.preload_all().with_context(|| {
                 format!(
@@ -56,7 +60,8 @@ impl NativeBackend {
             model = %config.native_model.display(),
             tokenizer = %tokenizer_path.display(),
             cache = config.native_cache,
-            fused_w4a16 = config.native_fused_w4a16,
+            marlin = config.native_marlin,
+            fused_w4a16 = config.native_fused_w4a16 && !config.native_marlin,
             hidden = engine.cfg.hidden_size,
             layers = engine.cfg.num_hidden_layers,
             elapsed_secs = started.elapsed().as_secs_f64(),
