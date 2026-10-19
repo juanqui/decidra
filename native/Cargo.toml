@@ -1,0 +1,33 @@
+[package]
+name = "jev-native"
+version = "0.1.0"
+edition = "2024"
+description = "Native CUDA inference engine for JEV-27B (AWQ W4A16), no Python runtime"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+publish = false
+
+[[bin]]
+name = "jev-native"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+half = "2"
+memmap2 = "0.9"
+safetensors = "0.6"
+# Dynamic loading: no CUDA toolkit needed to build or link; the driver and
+# cuBLAS/cuBLASLt shared libraries are loaded at runtime.
+cudarc = { version = "0.19.10", default-features = false, features = [
+    "std",
+    "driver",
+    "cublas",
+    "cublaslt",
+    "nvrtc",
+    "f16",
+    "dynamic-loading",
+    "cuda-13000",
+] }

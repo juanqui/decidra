@@ -7,6 +7,10 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 rust-version = "1.85"
 
+[workspace]
+members = ["native"]
+resolver = "3"
+
 [dependencies]
 anyhow = "1"
 axum = "0.8"
