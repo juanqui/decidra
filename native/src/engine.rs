@@ -222,6 +222,8 @@ pub struct Engine {
     fused_tile128: AtomicBool,
     /// Use the vendored Marlin W4A16 kernel/layout instead of dequant+cuBLAS.
     marlin: AtomicBool,
+    /// Experimental W4A8-FP8 repack/dispatch (default off).
+    marlin_fp8: AtomicBool,
     /// Marlin split-K barrier workspace (one int per SM), zeroed once.
     marlin_locks: Mutex<Option<CudaSlice<i32>>>,
     /// Warp-per-query attention (fast for long contexts); the original block
@@ -333,6 +335,7 @@ impl Engine {
             fused_max_m: std::sync::atomic::AtomicUsize::new(128),
             fused_tile128: AtomicBool::new(false),
             marlin: AtomicBool::new(false),
+            marlin_fp8: AtomicBool::new(false),
             marlin_locks: Mutex::new(None),
             warp_attention: AtomicBool::new(true),
             prof: Prof::new(),
@@ -406,6 +409,10 @@ impl Engine {
         self.marlin.store(enabled, Ordering::Relaxed);
     }
 
+    pub fn set_marlin_fp8(&self, enabled: bool) {
+        self.marlin_fp8.store(enabled, Ordering::Relaxed);
+    }
+
     fn prof_begin(&self, _name: &'static str) -> Option<CudaEvent> {
         if !self.prof.enabled {
             return None;
@@ -467,6 +474,7 @@ impl Engine {
     fn provider(&self) -> Result<WeightProvider<'_>> {
         let mut p = WeightProvider::new(&self.store, &self.gpu, &self.kernels)?;
         p.marlin = self.marlin.load(Ordering::Relaxed);
+        p.marlin_fp8 = self.marlin_fp8.load(Ordering::Relaxed);
         Ok(p)
     }
 
@@ -2231,6 +2239,74 @@ impl Engine {
         self.set_logits_opts(Some(head_ids.to_vec()), false);
         let last = self.cfg.num_hidden_layers.saturating_sub(1) as isize;
         self.forward(tokens, last, Stage::Logits, true)
+    }
+
+    /// Experimental W4A8-FP8 path for one module: per-token FP8 activation
+    /// quantization + a8-repacked Marlin, compared against W4A16. The caller
+    /// must enable `set_marlin(true)` and `set_marlin_fp8(true)`.
+    pub fn matmul_module_fp8(
+        &self,
+        module: &str,
+        input: &[f32],
+        rows: usize,
+    ) -> Result<(Vec<f32>, Vec<f32>)> {
+        let prov = self.provider()?;
+        let w = prov.linear(module)?;
+        let (n, k) = (w.out(), w.in_());
+        if input.len() != rows * k {
+            bail!("input has {} values, expected {}", input.len(), rows * k);
+        }
+        let xf = self.gpu.stream.clone_htod(input)?;
+        let mut xq = self.gpu.stream.alloc_zeros::<u8>(rows * k)?;
+        let mut as_ = self.gpu.stream.alloc_zeros::<f32>(rows)?;
+        kernels::quant_fp8(
+            &self.gpu,
+            &self.kernels.quant_fp8,
+            &xf,
+            &mut xq,
+            &mut as_,
+            rows,
+            k,
+        )?;
+        let mut c = self.alloc_bf16(rows * n)?;
+        {
+            let mut g = self.marlin_locks.lock().unwrap();
+            if g.is_none() {
+                *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
+            }
+        }
+        let got = {
+            let locks_guard = self.marlin_locks.lock().unwrap();
+            let locks = locks_guard.as_ref().expect("locks initialized");
+            let (qweight, scales, zeros) = match &w {
+                LinearWeight::Marlin {
+                    qweight,
+                    scales,
+                    zeros,
+                    ..
+                } => (qweight, scales, zeros),
+                _ => bail!("FP8 path requires a Marlin-repacked module"),
+            };
+            let mut off = 0usize;
+            let mut rest = rows;
+            while rest > 0 {
+                let par = (rest / 64).min(16);
+                let pm = if par > 0 { par * 64 } else { rest };
+                let tmb = pm.div_ceil(16).min(4);
+                let idx = if pm <= 8 { 0 } else { tmb - 1 };
+                let f = &self.kernels.marlin_fp8_cfgs[idx];
+                kernels::marlin_gemm_fp8(
+                    &self.gpu, f, &xq, qweight, &mut c, scales, zeros, &as_, locks, off, pm, n, k,
+                )?;
+                off += pm;
+                rest -= pm;
+            }
+            self.to_f32(&c, rows * n)?
+        };
+        let was = self.marlin_fp8.swap(false, Ordering::Relaxed);
+        let reference = self.matmul_module(module, input, rows, false);
+        self.marlin_fp8.store(was, Ordering::Relaxed);
+        Ok((got, reference?))
     }
 
     /// Diagnostic: run one packed linear on host f32 input, via the reference

@@ -104,6 +104,8 @@ pub struct WeightProvider<'a> {
     pub store: &'a Store,
     pub prefix: String,
     pub marlin: bool,
+    /// FP8-activation Marlin repack (8-bit A layout; default off).
+    pub marlin_fp8: bool,
     stream: Arc<CudaStream>,
     gpu: &'a crate::cuda::Gpu,
     kernels: &'a crate::kernels::Kernels,
@@ -128,6 +130,7 @@ impl<'a> WeightProvider<'a> {
             store,
             prefix,
             marlin: false,
+            marlin_fp8: false,
             stream: gpu.stream.clone(),
             gpu,
             kernels,
@@ -214,16 +217,25 @@ impl<'a> WeightProvider<'a> {
                     eprintln!("  transpose ok");
                 }
                 let mut qweight = self.stream.alloc_zeros::<i32>((in_ / 16) * (out * 2))?;
+                let repack_kernel = if self.marlin_fp8 {
+                    &self.kernels.marlin_repack_a8
+                } else {
+                    &self.kernels.marlin_repack
+                };
                 crate::kernels::marlin_repack(
                     self.gpu,
-                    &self.kernels.marlin_repack,
+                    repack_kernel,
                     &gptq,
                     &mut qweight,
                     in_,
                     out,
                     sms,
                 )?;
-                let scales = marlin_permute_scales(&scale, out, groups, in_ / group_size);
+                let scales = if self.marlin_fp8 {
+                    marlin_permute_scales_a8(&scale, out, groups)
+                } else {
+                    marlin_permute_scales(&scale, out, groups, in_ / group_size)
+                };
                 // The transpose/repack temporaries are freed when this branch
                 // returns; synchronize so the async kernels cannot race with
                 // memory reuse by the next module.
@@ -231,7 +243,11 @@ impl<'a> WeightProvider<'a> {
                 if dbg {
                     eprintln!("  repack ok");
                 }
-                let zeros = marlin_permute_zeros(&zp, out, groups);
+                let zeros = if self.marlin_fp8 {
+                    marlin_permute_zeros_a8(&zp, out, groups)
+                } else {
+                    marlin_permute_zeros(&zp, out, groups)
+                };
                 return Ok(LinearWeight::Marlin {
                     out,
                     in_,
@@ -349,6 +365,39 @@ fn marlin_permute_scales(ct: &[bf16], out: usize, groups: usize, _group_size: us
     outv
 }
 
+/// vLLM `get_scale_perms()` single permutation (32 entries), used when A is 8-bit.
+fn scale_perm_single() -> [usize; 32] {
+    let mut p = [0usize; 32];
+    let mut k = 0;
+    for i in 0..4 {
+        for j in [0usize, 1, 8, 9, 16, 17, 24, 25] {
+            p[k] = 2 * i + j;
+            k += 1;
+        }
+    }
+    p
+}
+
+/// [out, groups] CT scales -> Marlin a8 scale layout; vLLM uses the single
+/// permutation (32-element blocks) whenever is_a_8bit is true.
+fn marlin_permute_scales_a8(ct: &[bf16], out: usize, groups: usize) -> Vec<bf16> {
+    let n = out * groups;
+    let mut transposed = vec![bf16::ZERO; n];
+    for o in 0..out {
+        for g in 0..groups {
+            transposed[g * out + o] = ct[o * groups + g];
+        }
+    }
+    let perm = scale_perm_single();
+    let mut outv = vec![bf16::ZERO; n];
+    for b in 0..n / 32 {
+        for i in 0..32 {
+            outv[b * 32 + i] = transposed[b * 32 + perm[i]];
+        }
+    }
+    outv
+}
+
 /// CT zero points [ceil(out/8), groups] -> Marlin packed zeros [groups, out/8].
 fn marlin_permute_zeros(ct: &[i32], out: usize, groups: usize) -> Vec<i32> {
     // Unpack to unsigned nibbles [groups, out].
@@ -387,4 +436,86 @@ fn marlin_permute_zeros(ct: &[i32], out: usize, groups: usize) -> Vec<i32> {
         }
     }
     zp
+}
+
+/// a8 variant: vLLM `marlin_zero_points(..., is_a_8bit=True)` keeps the 64-way
+/// scale permutation but skips the 8-way column interleave.
+fn marlin_permute_zeros_a8(ct: &[i32], out: usize, groups: usize) -> Vec<i32> {
+    let mut q = vec![0u8; groups * out];
+    for g in 0..groups {
+        for o in 0..out {
+            let w = ct[(o / 8) * groups + g];
+            q[g * out + o] = ((w >> (4 * (o % 8))) & 0xF) as u8;
+        }
+    }
+    let perm = scale_perm();
+    let mut p = vec![0u8; q.len()];
+    for b in 0..q.len() / 64 {
+        for i in 0..64 {
+            p[b * 64 + i] = q[b * 64 + perm[i]];
+        }
+    }
+    let words = out / 8;
+    let mut zp = vec![0i32; groups * words];
+    for g in 0..groups {
+        for w in 0..words {
+            let mut v = 0u32;
+            for k in 0..8 {
+                v |= (p[g * out + w * 8 + k] as u32) << (4 * k);
+            }
+            zp[g * words + w] = v as i32;
+        }
+    }
+    zp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a8_scale_permutation_matches_vllm() {
+        // out=64, groups=1, scale[o]=o. vLLM with is_a_8bit uses the 32-entry
+        // "single" permutation on flattened [groups, out].
+        let ct: Vec<bf16> = (0..64).map(|i| bf16::from_f32(i as f32)).collect();
+        let got = marlin_permute_scales_a8(&ct, 64, 1);
+        let perm = [
+            0usize, 1, 8, 9, 16, 17, 24, 25, 2, 3, 10, 11, 18, 19, 26, 27, 4, 5, 12, 13, 20, 21,
+            28, 29, 6, 7, 14, 15, 22, 23, 30, 31,
+        ];
+        for b in 0..2 {
+            for i in 0..32 {
+                assert_eq!(
+                    got[b * 32 + i].to_f32(),
+                    (b * 32 + perm[i]) as f32,
+                    "block {b} index {i}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a8_zero_packing_matches_vllm() {
+        // out=64, groups=1, unpacked zero point u[o] = o % 16.
+        let mut ct = vec![0i32; 8];
+        for b in 0..8 {
+            let mut v = 0u32;
+            for k in 0..8 {
+                v |= (((b * 8 + k) % 16) as u32) << (4 * k);
+            }
+            ct[b] = v as i32;
+        }
+        let got = marlin_permute_zeros_a8(&ct, 64, 1);
+        let want = [
+            -2139062144i32,
+            -1852730991,
+            -1566399838,
+            -1280068685,
+            -993737532,
+            -707406379,
+            -421075226,
+            -134744073,
+        ];
+        assert_eq!(got, want.to_vec());
+    }
 }

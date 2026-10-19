@@ -374,6 +374,11 @@ template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFl
 template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 4, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 1, 8, 8, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 4, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
+
 }
 
 extern "C" int jev_marlin_gemm_bf16(
@@ -547,6 +552,18 @@ __global__ void jev_gptq_marlin_repack_kernel(
       n_tile_id += repack_stages;
     }
   }
+}
+
+extern "C" int jev_marlin_repack_q4_a8(const void* gptq, void* out, int size_k,
+                                       int size_n, int sms, cudaStream_t stream) {
+  constexpr int shmem = repack_stages * (tile_k_size / 8) * (tile_n_size / 4) * 16;
+  cudaFuncSetAttribute(jev_gptq_marlin_repack_kernel<repack_threads, 4, true>,
+                       cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+  jev_gptq_marlin_repack_kernel<repack_threads, 4, true>
+      <<<sms, repack_threads, shmem, stream>>>(
+          reinterpret_cast<const uint32_t*>(gptq),
+          reinterpret_cast<uint32_t*>(out), size_k, size_n);
+  return 0;
 }
 
 extern "C" int jev_marlin_repack_q4(const void* gptq, void* out, int size_k,

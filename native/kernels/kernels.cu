@@ -1,6 +1,7 @@
 // Native CUDA kernels for the JEV engine (W4A16 Qwen3.5-family forward).
 // Compiled as a single cubin for sm_89 by native/build.rs.
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 #include <mma.h>
 
@@ -20,6 +21,31 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
     __syncthreads();
   }
   return scratch[0];
+}
+
+// Per-token FP8 E4M3 quantization of an f32 activation matrix [rows, k].
+// One CTA per row; scale = max_abs / 448 (E4M3 max finite).
+extern "C" __global__ void quant_fp8_per_token_f32(
+    const float* __restrict__ x, __nv_fp8_e4m3* __restrict__ out,
+    float* __restrict__ scales, int rows, int k) {
+  extern __shared__ float red[];
+  int row = blockIdx.x;
+  if (row >= rows) return;
+  const float* xr = x + (size_t)row * k;
+  float m = 0.f;
+  for (int i = threadIdx.x; i < k; i += blockDim.x) m = fmaxf(m, fabsf(xr[i]));
+  red[threadIdx.x] = m;
+  __syncthreads();
+  for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+    if (threadIdx.x < off) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + off]);
+    __syncthreads();
+  }
+  float scale = fmaxf(red[0], 1e-12f) / 448.f;
+  if (threadIdx.x == 0) scales[row] = scale;
+  __syncthreads();
+  __nv_fp8_e4m3* orow = out + (size_t)row * k;
+  for (int i = threadIdx.x; i < k; i += blockDim.x)
+    orow[i] = __nv_fp8_e4m3(xr[i] / scale);
 }
 
 // ---------------------------------------------------------------------------

@@ -296,6 +296,11 @@ fn cmd_matmul(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--marlin") {
         eng.set_marlin(true);
     }
+    let marlin_fp8 = args.iter().any(|a| a == "--marlin-fp8");
+    if marlin_fp8 {
+        eng.set_marlin(true);
+        eng.set_marlin_fp8(true);
+    }
     if args.iter().any(|a| a == "--legacy-gdn") {
         eng.set_gdn_shared(false);
         eng.set_gdn_split(false);
@@ -324,7 +329,23 @@ fn cmd_matmul(args: &[String]) -> Result<()> {
     }
     for _ in 0..repeat.max(1) {
         let t = std::time::Instant::now();
-        vals = eng.matmul_module(tensor, &input, rows, fused)?;
+        if marlin_fp8 {
+            let (got, reference) = eng.matmul_module_fp8(tensor, &input, rows)?;
+            let mut max = 0f32;
+            let mut sum = 0f64;
+            for (a, b) in got.iter().zip(reference.iter()) {
+                let d = (a - b).abs();
+                max = max.max(d);
+                sum += d as f64;
+            }
+            eprintln!(
+                "w4a8-fp8 vs w4a16: max_abs {max:.6} mean_abs {:.6}",
+                sum / got.len() as f64
+            );
+            vals = got;
+        } else {
+            vals = eng.matmul_module(tensor, &input, rows, fused)?;
+        }
         eng.gpu.synchronize()?;
         eprintln!("matmul: {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
     }

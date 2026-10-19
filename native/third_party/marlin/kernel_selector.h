@@ -8,3 +8,11 @@ else if (a_type == vllm::kBFloat16 && b_type == vllm::kU4 && c_type == vllm::kBF
   kernel = Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 4, false, 4, 4, false>;
 else if (a_type == vllm::kBFloat16 && b_type == vllm::kU4 && c_type == vllm::kBFloat16 && s_type == vllm::kBFloat16 && threads == 256 && thread_m_blocks == 4 && thread_n_blocks == 16 && thread_k_blocks == 4 && m_block_size_8 == false && stages == 4 && group_blocks == 4 && is_zp_float == false)
   kernel = Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 4, 16, 4, false, 4, 4, false>;
+else if (a_type == vllm::kFE4M3fn && b_type == vllm::kU4 && c_type == vllm::kBFloat16 && s_type == vllm::kBFloat16 && threads == 256 && thread_m_blocks == 1 && thread_n_blocks == 8 && thread_k_blocks == 8 && m_block_size_8 == false && stages == 4 && group_blocks == 4 && is_zp_float == false)
+  kernel = Marlin<vllm::kFE4M3fn.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 1, 8, 8, false, 4, 4, false>;
+else if (a_type == vllm::kFE4M3fn && b_type == vllm::kU4 && c_type == vllm::kBFloat16 && s_type == vllm::kBFloat16 && threads == 256 && thread_m_blocks == 2 && thread_n_blocks == 16 && thread_k_blocks == 4 && m_block_size_8 == false && stages == 4 && group_blocks == 4 && is_zp_float == false)
+  kernel = Marlin<vllm::kFE4M3fn.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 4, false, 4, 4, false>;
+else if (a_type == vllm::kFE4M3fn && b_type == vllm::kU4 && c_type == vllm::kBFloat16 && s_type == vllm::kBFloat16 && threads == 256 && thread_m_blocks == 3 && thread_n_blocks == 16 && thread_k_blocks == 4 && m_block_size_8 == false && stages == 4 && group_blocks == 4 && is_zp_float == false)
+  kernel = Marlin<vllm::kFE4M3fn.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 4, false, 4, 4, false>;
+else if (a_type == vllm::kFE4M3fn && b_type == vllm::kU4 && c_type == vllm::kBFloat16 && s_type == vllm::kBFloat16 && threads == 256 && thread_m_blocks == 4 && thread_n_blocks == 16 && thread_k_blocks == 4 && m_block_size_8 == false && stages == 4 && group_blocks == 4 && is_zp_float == false)
+  kernel = Marlin<vllm::kFE4M3fn.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 4, 16, 4, false, 4, 4, false>;
