@@ -776,6 +776,114 @@ extern "C" __global__ void gemm_w4a16_m128_bf16(
 }
 
 // ---------------------------------------------------------------------------
+// GDN recurrent rule with the f32 state cached in dynamic shared memory.
+// Each CTA owns one head and a slice of `vc` value dimensions; threads own one
+// value column and never share state, so no barriers are needed inside the
+// token loop. Splitting value columns across CTAs (vchunks) raises SM
+// occupancy for dv=128.
+// grid: heads*vchunks, block: vc, dynamic smem: dk*vc*4
+// ---------------------------------------------------------------------------
+extern "C" __global__ void gdn_recurrent_shared(
+    const float* __restrict__ qf, const float* __restrict__ kf,
+    const float* __restrict__ vf, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc,
+    int vchunks) {
+  extern __shared__ float S[];
+  int h = blockIdx.x / vchunks;
+  int chunk = blockIdx.x % vchunks;
+  int j = threadIdx.x;
+  if (j >= vc) return;
+  int v0 = chunk * vc;
+  int gj = v0 + j;
+  float* col = state + (size_t)h * dk * dv + v0;
+
+  for (int i = 0; i < dk; ++i) S[i * vc + j] = col[(size_t)i * dv + j];
+
+  for (int t = 0; t < seq; ++t) {
+    float dec = expf(g[t * heads + h]);
+    float bt = beta[t * heads + h];
+    const float* kt = kf + ((size_t)t * heads + h) * dk;
+    float kv = 0.f;
+    for (int i = 0; i < dk; ++i) {
+      float sv = S[i * vc + j] * dec;
+      S[i * vc + j] = sv;
+      kv += sv * kt[i];
+    }
+    float del = (vf[((size_t)t * heads + h) * dv + gj] - kv) * bt;
+    float o = 0.f;
+    const float* qt = qf + ((size_t)t * heads + h) * dk;
+    for (int i = 0; i < dk; ++i) {
+      float s = S[i * vc + j] + kt[i] * del;
+      S[i * vc + j] = s;
+      o += s * qt[i];
+    }
+    out[((size_t)t * heads + h) * dv + gj] = f2bf(o);
+  }
+
+  for (int i = 0; i < dk; ++i) col[(size_t)i * dv + j] = S[i * vc + j];
+}
+
+// ---------------------------------------------------------------------------
+// GDN recurrent rule, state in shared, four lanes per value column. Each lane
+// owns dk/4 consecutive state rows; the two dot products are reduced with two
+// shuffles inside the 4-lane group. grid: heads*chunks, block: vc*4,
+// dynamic smem: dk*(vc+1)*4.
+// ---------------------------------------------------------------------------
+#define GDN_L 4
+
+extern "C" __global__ void gdn_recurrent_split(
+    const float* __restrict__ qf, const float* __restrict__ kf,
+    const float* __restrict__ vf, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc,
+    int chunks) {
+  extern __shared__ float S[];
+  int h = blockIdx.x / chunks;
+  int chunk = blockIdx.x % chunks;
+  int tid = threadIdx.x;
+  int j = tid / GDN_L;
+  int l = tid % GDN_L;
+  if (j >= vc) return;
+  int v0 = chunk * vc;
+  int gj = v0 + j;
+  int pad = vc + 1;
+  float* col = state + (size_t)h * dk * dv + v0;
+  int per = dk / GDN_L;
+  int i0 = l * per;
+  int i1 = (l == GDN_L - 1) ? dk : (l + 1) * per;
+
+  for (int i = i0; i < i1; ++i) S[i * pad + j] = col[(size_t)i * dv + j];
+
+  for (int t = 0; t < seq; ++t) {
+    float dec = expf(g[t * heads + h]);
+    float bt = beta[t * heads + h];
+    const float* kt = kf + ((size_t)t * heads + h) * dk;
+    float kv = 0.f;
+    for (int i = i0; i < i1; ++i) {
+      float sv = S[i * pad + j] * dec;
+      S[i * pad + j] = sv;
+      kv += sv * kt[i];
+    }
+    kv += __shfl_xor_sync(0xffffffffu, kv, 1);
+    kv += __shfl_xor_sync(0xffffffffu, kv, 2);
+    float del = (vf[((size_t)t * heads + h) * dv + gj] - kv) * bt;
+    float o = 0.f;
+    const float* qt = qf + ((size_t)t * heads + h) * dk;
+    for (int i = i0; i < i1; ++i) {
+      float sv = S[i * pad + j] + kt[i] * del;
+      S[i * pad + j] = sv;
+      o += sv * qt[i];
+    }
+    o += __shfl_xor_sync(0xffffffffu, o, 1);
+    o += __shfl_xor_sync(0xffffffffu, o, 2);
+    if (l == 0) out[((size_t)t * heads + h) * dv + gj] = f2bf(o);
+  }
+
+  for (int i = i0; i < i1; ++i) col[(size_t)i * dv + j] = S[i * pad + j];
+}
+
+// ---------------------------------------------------------------------------
 // Embedding gather (device-side variant, not used by the CPU-gather path).
 // ---------------------------------------------------------------------------
 extern "C" __global__ void embed_gather_bf16(const bf16* __restrict__ table,

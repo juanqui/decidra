@@ -25,6 +25,8 @@ pub struct Kernels {
     pub conv1d_silu: CudaFunction,
     pub gdn_prepare: CudaFunction,
     pub gdn_recurrent: CudaFunction,
+    pub gdn_recurrent_shared: CudaFunction,
+    pub gdn_recurrent_split: CudaFunction,
     pub dequant_w4a16: CudaFunction,
     pub gemm_w4a16: CudaFunction,
     pub gemm_w4a16_m128: CudaFunction,
@@ -66,6 +68,22 @@ impl Kernels {
             conv1d_silu: gpu.func("conv1d_silu_bf16")?,
             gdn_prepare: gpu.func("gdn_prepare")?,
             gdn_recurrent: gpu.func("gdn_recurrent")?,
+            gdn_recurrent_shared: {
+                let f = gpu.func("gdn_recurrent_shared")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    65536,
+                )?;
+                f
+            },
+            gdn_recurrent_split: {
+                let f = gpu.func("gdn_recurrent_split")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    32768,
+                )?;
+                f
+            },
             dequant_w4a16: gpu.func("dequant_w4a16_bf16")?,
             marlin_cfgs: {
                 const NAMES: [&str; 5] = [
@@ -625,6 +643,113 @@ pub fn attention_tc(
     l.arg(&nh);
     l.arg(&nkv);
     l.arg(&scale);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_shared(
+    gpu: &Gpu,
+    k: &CudaFunction,
+    qf: &CudaSlice<f32>,
+    kf: &CudaSlice<f32>,
+    vf: &CudaSlice<f32>,
+    g: &CudaSlice<f32>,
+    beta: &CudaSlice<f32>,
+    state: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+    seq: usize,
+    heads: usize,
+    dk: usize,
+    dv: usize,
+    vchunks: usize,
+) -> Result<()> {
+    if dv % vchunks != 0 {
+        anyhow::bail!("dv={dv} not divisible by gdn chunks={vchunks}");
+    }
+    let vc = dv / vchunks;
+    let smem = dk * vc * 4;
+    let cfg = LaunchConfig {
+        grid_dim: ((heads * vchunks) as u32, 1, 1),
+        block_dim: (vc as u32, 1, 1),
+        shared_mem_bytes: smem as u32,
+    };
+    let (seq_i, heads_i, dk_i, dv_i, vc_i, vch_i) = (
+        seq as i32,
+        heads as i32,
+        dk as i32,
+        dv as i32,
+        vc as i32,
+        vchunks as i32,
+    );
+    let mut l = gpu.stream.launch_builder(k);
+    l.arg(qf);
+    l.arg(kf);
+    l.arg(vf);
+    l.arg(g);
+    l.arg(beta);
+    l.arg(state);
+    l.arg(out);
+    l.arg(&seq_i);
+    l.arg(&heads_i);
+    l.arg(&dk_i);
+    l.arg(&dv_i);
+    l.arg(&vc_i);
+    l.arg(&vch_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_split(
+    gpu: &Gpu,
+    k: &CudaFunction,
+    qf: &CudaSlice<f32>,
+    kf: &CudaSlice<f32>,
+    vf: &CudaSlice<f32>,
+    g: &CudaSlice<f32>,
+    beta: &CudaSlice<f32>,
+    state: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+    seq: usize,
+    heads: usize,
+    dk: usize,
+    dv: usize,
+) -> Result<()> {
+    let vc = dv.min(32);
+    if dv % vc != 0 {
+        anyhow::bail!("dv={dv} not divisible by vc={vc}");
+    }
+    let chunks = dv / vc;
+    let threads = vc * 4;
+    let smem = dk * (vc + 1) * 4;
+    let cfg = LaunchConfig {
+        grid_dim: ((heads * chunks) as u32, 1, 1),
+        block_dim: (threads as u32, 1, 1),
+        shared_mem_bytes: smem as u32,
+    };
+    let (seq_i, heads_i, dk_i, dv_i, vc_i, ch_i) = (
+        seq as i32,
+        heads as i32,
+        dk as i32,
+        dv as i32,
+        vc as i32,
+        chunks as i32,
+    );
+    let mut l = gpu.stream.launch_builder(k);
+    l.arg(qf);
+    l.arg(kf);
+    l.arg(vf);
+    l.arg(g);
+    l.arg(beta);
+    l.arg(state);
+    l.arg(out);
+    l.arg(&seq_i);
+    l.arg(&heads_i);
+    l.arg(&dk_i);
+    l.arg(&dv_i);
+    l.arg(&vc_i);
+    l.arg(&ch_i);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }

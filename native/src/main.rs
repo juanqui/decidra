@@ -149,6 +149,16 @@ fn cmd_matmul(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--marlin") {
         eng.set_marlin(true);
     }
+    if args.iter().any(|a| a == "--legacy-gdn") {
+        eng.set_gdn_shared(false);
+        eng.set_gdn_split(false);
+    }
+    if args.iter().any(|a| a == "--gdn-shared") {
+        eng.set_gdn_split(false);
+    }
+    if let Some(c) = opt(args, "--gdn-chunks") {
+        eng.set_gdn_chunks(c.parse().context("--gdn-chunks must be an integer")?);
+    }
     if args.iter().any(|a| a == "--legacy-attention") {
         eng.set_warp_attention(false);
     }
@@ -221,6 +231,19 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     }
     if args.iter().any(|a| a == "--marlin") {
         eng.set_marlin(true);
+    }
+    if args.iter().any(|a| a == "--legacy-gdn") {
+        eng.set_gdn_shared(false);
+        eng.set_gdn_split(false);
+    }
+    if args.iter().any(|a| a == "--gdn-shared") {
+        eng.set_gdn_split(false);
+    }
+    if let Some(c) = opt(args, "--gdn-chunks") {
+        eng.set_gdn_chunks(c.parse().context("--gdn-chunks must be an integer")?);
+    }
+    if args.iter().any(|a| a == "--legacy-attention") {
+        eng.set_warp_attention(false);
     }
     if args.iter().any(|a| a == "--no-cache") {
         eng.set_cache_weights(false);

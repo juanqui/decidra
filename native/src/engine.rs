@@ -6,7 +6,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result, bail};
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{Gemm, GemmConfig};
-use cudarc::driver::CudaSlice;
+use cudarc::driver::sys::CUevent_flags;
+use cudarc::driver::{CudaEvent, CudaSlice};
 use half::bf16;
 
 use crate::config::Config;
@@ -64,10 +65,39 @@ impl Drop for Buf {
     }
 }
 
+struct ProfEntry {
+    name: &'static str,
+    start: CudaEvent,
+    end: CudaEvent,
+}
+
+struct Prof {
+    enabled: bool,
+    entries: Mutex<Vec<ProfEntry>>,
+}
+
+impl Prof {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var("JEV_PROFILE").is_ok(),
+            entries: Mutex::new(Vec::new()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LogitsOpts {
     pub head_ids: Option<Vec<u32>>,
     pub full: bool,
+}
+
+macro_rules! timed {
+    ($self:expr, $name:expr, $e:expr) => {{
+        let __t = $self.prof_begin($name);
+        let __r = $e;
+        $self.prof_end($name, __t);
+        __r
+    }};
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -134,6 +164,11 @@ pub struct Engine {
     /// Warp-per-query attention (fast for long contexts); the original block
     /// kernel remains selectable.
     warp_attention: AtomicBool,
+    prof: Prof,
+    /// Use the shared-state GDN recurrence (default) and its value-column split.
+    gdn_shared: AtomicBool,
+    gdn_chunks: std::sync::atomic::AtomicUsize,
+    gdn_split: AtomicBool,
 }
 
 const _: fn() = || {
@@ -166,6 +201,10 @@ impl Engine {
             marlin: AtomicBool::new(false),
             marlin_locks: Mutex::new(None),
             warp_attention: AtomicBool::new(true),
+            prof: Prof::new(),
+            gdn_shared: AtomicBool::new(true),
+            gdn_chunks: std::sync::atomic::AtomicUsize::new(2),
+            gdn_split: AtomicBool::new(true),
         })
     }
 
@@ -197,8 +236,78 @@ impl Engine {
         self.warp_attention.store(enabled, Ordering::Relaxed);
     }
 
+    pub fn set_gdn_shared(&self, enabled: bool) {
+        self.gdn_shared.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_gdn_split(&self, enabled: bool) {
+        self.gdn_split.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_gdn_chunks(&self, chunks: usize) {
+        self.gdn_chunks.store(chunks, Ordering::Relaxed);
+    }
+
     pub fn set_marlin(&self, enabled: bool) {
         self.marlin.store(enabled, Ordering::Relaxed);
+    }
+
+    fn prof_begin(&self, _name: &'static str) -> Option<CudaEvent> {
+        if !self.prof.enabled {
+            return None;
+        }
+        let ev = self
+            .gpu
+            .ctx
+            .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            .ok()?;
+        ev.record(&self.gpu.stream).ok()?;
+        Some(ev)
+    }
+
+    fn prof_end(&self, name: &'static str, start: Option<CudaEvent>) {
+        if let Some(start) = start {
+            if let Ok(end) = self
+                .gpu
+                .ctx
+                .new_event(Some(CUevent_flags::CU_EVENT_DEFAULT))
+            {
+                if end.record(&self.gpu.stream).is_ok() {
+                    self.prof
+                        .entries
+                        .lock()
+                        .unwrap()
+                        .push(ProfEntry { name, start, end });
+                }
+            }
+        }
+    }
+
+    fn prof_report(&self) {
+        if !self.prof.enabled {
+            return;
+        }
+        let entries = std::mem::take(&mut *self.prof.entries.lock().unwrap());
+        let mut sums: std::collections::HashMap<&'static str, (f64, usize)> =
+            std::collections::HashMap::new();
+        for e in &entries {
+            if let Ok(ms) = e.start.elapsed_ms(&e.end) {
+                let v = sums.entry(e.name).or_insert((0.0, 0));
+                v.0 += ms as f64;
+                v.1 += 1;
+            }
+        }
+        let total: f64 = sums.values().map(|v| v.0).sum();
+        let mut rows: Vec<_> = sums.into_iter().collect();
+        rows.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+        eprintln!("--- profile (sum of regions {total:.2} ms) ---");
+        for (name, (ms, n)) in rows {
+            eprintln!(
+                "{name:16} {ms:9.3} ms  {:6.2}%  n={n}  {:.3} ms/op",
+                ms / total * 100.0,
+                ms / n as f64
+            );
+        }
     }
 
     fn provider(&self) -> Result<WeightProvider<'_>> {
@@ -325,7 +434,7 @@ impl Engine {
         stage: Stage,
         last_only: bool,
     ) -> Result<Vec<f32>> {
-        let x = self.embed(tokens)?;
+        let x = timed!(self, "embed", self.embed(tokens)?);
         self.forward_dev(x, tokens.len(), 0, layer, stage, last_only)
     }
 
@@ -375,9 +484,10 @@ impl Engine {
                 self.cfg.num_hidden_layers
             );
         }
+        self.prof.entries.lock().unwrap().clear();
         let mut x = x;
         for i in start..=last {
-            let w = self.layer_weights(i)?;
+            let w = timed!(self, "weights", self.layer_weights(i)?);
             let mut captured = None;
             self.dump_dev("00_layer_input", &x, seq, self.cfg.hidden_size)?;
             let next = self.run_layer(&x, seq, &w, i == last, stage, &mut captured)?;
@@ -385,39 +495,47 @@ impl Engine {
                 self.dump_dev("06_layer_output", &next, seq, self.cfg.hidden_size)?;
             }
             if let Some(v) = captured {
+                self.prof_report();
                 return self.to_f32(&v, seq * self.cfg.hidden_size);
             }
             x = next;
         }
-        match stage {
+        let result = match stage {
             Stage::FinalNorm | Stage::Logits => {
                 let norm = self.provider()?.final_norm()?;
                 let mut h = self.alloc_bf16(seq * self.cfg.hidden_size)?;
-                kernels::rmsnorm(
-                    &self.gpu,
-                    &self.kernels.rmsnorm,
-                    &x,
-                    &norm,
-                    &mut h,
-                    seq,
-                    self.cfg.hidden_size,
-                    self.cfg.rms_norm_eps,
-                    true,
-                )?;
+                timed!(
+                    self,
+                    "norm.final",
+                    kernels::rmsnorm(
+                        &self.gpu,
+                        &self.kernels.rmsnorm,
+                        &x,
+                        &norm,
+                        &mut h,
+                        seq,
+                        self.cfg.hidden_size,
+                        self.cfg.rms_norm_eps,
+                        true,
+                    )?
+                );
                 if stage == Stage::FinalNorm {
-                    return self.slice_out(&h, seq, self.cfg.hidden_size, last_only);
-                }
-                let opts = self.logits_opts.lock().unwrap().clone();
-                if let Some(ids) = opts.head_ids {
-                    self.logits_rows(&h, seq, last_only, &ids)
-                } else if opts.full {
-                    self.logits_chunked(&h, seq, last_only)
+                    self.slice_out(&h, seq, self.cfg.hidden_size, last_only)
                 } else {
-                    bail!("--stage logits requires --head-ids <ids> or --full-logits")
+                    let opts = self.logits_opts.lock().unwrap().clone();
+                    if let Some(ids) = opts.head_ids {
+                        self.logits_rows(&h, seq, last_only, &ids)
+                    } else if opts.full {
+                        self.logits_chunked(&h, seq, last_only)
+                    } else {
+                        bail!("--stage logits requires --head-ids <ids> or --full-logits")
+                    }
                 }
             }
             _ => self.slice_out(&x, seq, self.cfg.hidden_size, last_only),
-        }
+        };
+        self.prof_report();
+        result
     }
 
     fn slice_out(
@@ -450,17 +568,21 @@ impl Engine {
         let hidden = self.cfg.hidden_size;
         let h = self.alloc_bf16(seq * hidden)?;
         let mut h = h;
-        kernels::rmsnorm(
-            &self.gpu,
-            &self.kernels.rmsnorm,
-            x,
-            &w.input_norm,
-            &mut h,
-            seq,
-            hidden,
-            self.cfg.rms_norm_eps,
-            true,
-        )?;
+        timed!(
+            self,
+            "norm.input",
+            kernels::rmsnorm(
+                &self.gpu,
+                &self.kernels.rmsnorm,
+                x,
+                &w.input_norm,
+                &mut h,
+                seq,
+                hidden,
+                self.cfg.rms_norm_eps,
+                true,
+            )?
+        );
         self.dump_dev("01_input_norm", &h, seq, hidden)?;
 
         let mix = match &w.mixer {
@@ -476,23 +598,31 @@ impl Engine {
         }
 
         let mut x1 = self.alloc_bf16(seq * hidden)?;
-        kernels::add(&self.gpu, &self.kernels.add, x, &mix, &mut x1, seq * hidden)?;
+        timed!(
+            self,
+            "add.residual",
+            kernels::add(&self.gpu, &self.kernels.add, x, &mix, &mut x1, seq * hidden)?
+        );
         if capture {
             self.dump_dev("03_after_attn_residual", &x1, seq, hidden)?;
         }
 
         let mut h2 = self.alloc_bf16(seq * hidden)?;
-        kernels::rmsnorm(
-            &self.gpu,
-            &self.kernels.rmsnorm,
-            &x1,
-            &w.post_norm,
-            &mut h2,
-            seq,
-            hidden,
-            self.cfg.rms_norm_eps,
-            true,
-        )?;
+        timed!(
+            self,
+            "norm.post",
+            kernels::rmsnorm(
+                &self.gpu,
+                &self.kernels.rmsnorm,
+                &x1,
+                &w.post_norm,
+                &mut h2,
+                seq,
+                hidden,
+                self.cfg.rms_norm_eps,
+                true,
+            )?
+        );
         if capture {
             self.dump_dev("04_post_attn_norm", &h2, seq, hidden)?;
         }
@@ -519,18 +649,26 @@ impl Engine {
 
     fn mlp(&self, h: &CudaSlice<bf16>, seq: usize, w: &LayerWeights) -> Result<Buf> {
         let inter = self.cfg.intermediate_size;
-        let gate = self.gemm(h, seq, &w.gate_proj)?;
-        let up = self.gemm(h, seq, &w.up_proj)?;
+        let gate = timed!(self, "gemm.gate", self.gemm(h, seq, &w.gate_proj)?);
+        let up = timed!(self, "gemm.up", self.gemm(h, seq, &w.up_proj)?);
         let mut act = self.alloc_bf16(seq * inter)?;
-        kernels::silu_mul(
-            &self.gpu,
-            &self.kernels.silu_mul,
-            &gate,
-            &up,
-            &mut act,
-            seq * inter,
-        )?;
-        self.gemm(&act, seq, &w.down_proj)
+        timed!(
+            self,
+            "mlp.act",
+            kernels::silu_mul(
+                &self.gpu,
+                &self.kernels.silu_mul,
+                &gate,
+                &up,
+                &mut act,
+                seq * inter,
+            )?
+        );
+        Ok(timed!(
+            self,
+            "gemm.down",
+            self.gemm(&act, seq, &w.down_proj)?
+        ))
     }
 
     fn full_attention(
@@ -546,9 +684,9 @@ impl Engine {
             cfg.num_key_value_heads,
             cfg.head_dim,
         );
-        let qg = self.gemm(h, seq, &w.q_proj)?;
-        let kk = self.gemm(h, seq, &w.k_proj)?;
-        let vv = self.gemm(h, seq, &w.v_proj)?;
+        let qg = timed!(self, "gemm.q", self.gemm(h, seq, &w.q_proj)?);
+        let kk = timed!(self, "gemm.k", self.gemm(h, seq, &w.k_proj)?);
+        let vv = timed!(self, "gemm.v", self.gemm(h, seq, &w.v_proj)?);
         if capture {
             self.dump_dev("attn_q_proj", &qg, seq, w.q_proj.out())?;
             self.dump_dev("attn_k_proj", &kk, seq, kv * hd)?;
@@ -558,16 +696,20 @@ impl Engine {
         let (q, gate) = if cfg.attn_output_gate {
             let mut q = self.alloc_bf16(seq * heads * hd)?;
             let mut gate = self.alloc_bf16(seq * heads * hd)?;
-            kernels::split_q_gate(
-                &self.gpu,
-                &self.kernels.split_q_gate,
-                &qg,
-                &mut q,
-                &mut gate,
-                seq,
-                heads,
-                hd,
-            )?;
+            timed!(
+                self,
+                "attn.split",
+                kernels::split_q_gate(
+                    &self.gpu,
+                    &self.kernels.split_q_gate,
+                    &qg,
+                    &mut q,
+                    &mut gate,
+                    seq,
+                    heads,
+                    hd,
+                )?
+            );
             if capture {
                 self.dump_dev("attn_q", &q, seq, heads * hd)?;
                 self.dump_dev("attn_gate", &gate, seq, heads * hd)?;
@@ -579,57 +721,70 @@ impl Engine {
 
         let q = q;
         let mut qn = self.alloc_bf16(seq * heads * hd)?;
-        kernels::rmsnorm(
-            &self.gpu,
-            &self.kernels.rmsnorm,
-            &q,
-            &w.q_norm,
-            &mut qn,
-            seq * heads,
-            hd,
-            cfg.rms_norm_eps,
-            true,
-        )?;
+        timed!(
+            self,
+            "norm.q",
+            kernels::rmsnorm(
+                &self.gpu,
+                &self.kernels.rmsnorm,
+                &q,
+                &w.q_norm,
+                &mut qn,
+                seq * heads,
+                hd,
+                cfg.rms_norm_eps,
+                true,
+            )?
+        );
         if capture {
             self.dump_dev("attn_q_norm", &qn, seq, heads * hd)?;
         }
         let mut kn = self.alloc_bf16(seq * kv * hd)?;
-        kernels::rmsnorm(
-            &self.gpu,
-            &self.kernels.rmsnorm,
-            &kk,
-            &w.k_norm,
-            &mut kn,
-            seq * kv,
-            hd,
-            cfg.rms_norm_eps,
-            true,
-        )?;
+        timed!(
+            self,
+            "norm.k",
+            kernels::rmsnorm(
+                &self.gpu,
+                &self.kernels.rmsnorm,
+                &kk,
+                &w.k_norm,
+                &mut kn,
+                seq * kv,
+                hd,
+                cfg.rms_norm_eps,
+                true,
+            )?
+        );
         if capture {
             self.dump_dev("attn_k_norm", &kn, seq, kv * hd)?;
         }
 
         let rd = cfg.rotary_dim();
         let (cos, sin) = self.rope_tables(seq)?;
-        kernels::rope(
-            &self.gpu,
-            &self.kernels.rope,
-            &mut qn,
-            &mut kn,
-            &cos,
-            &sin,
-            seq,
-            heads,
-            kv,
-            hd,
-            rd / 2,
-        )?;
+        timed!(
+            self,
+            "rope",
+            kernels::rope(
+                &self.gpu,
+                &self.kernels.rope,
+                &mut qn,
+                &mut kn,
+                &cos,
+                &sin,
+                seq,
+                heads,
+                kv,
+                hd,
+                rd / 2,
+            )?
+        );
         if capture {
             self.dump_dev("attn_q_rope", &qn, seq, heads * hd)?;
             self.dump_dev("attn_k_rope", &kn, seq, kv * hd)?;
         }
 
         let mut attn = self.alloc_bf16(seq * heads * hd)?;
+        let __attn_t = self.prof_begin("attn");
         if self.warp_attention.load(Ordering::Relaxed) {
             let tc = match hd {
                 64 => Some(&self.kernels.attention_tc_64),
@@ -682,6 +837,7 @@ impl Engine {
                 1.0 / (hd as f32).sqrt(),
             )?;
         }
+        self.prof_end("attn", __attn_t);
         if capture {
             self.dump_dev("attn_weights_out", &attn, seq, heads * hd)?;
         }
@@ -689,14 +845,18 @@ impl Engine {
         let gated = match gate {
             Some(g) => {
                 let mut o = self.alloc_bf16(seq * heads * hd)?;
-                kernels::sigmoid_gate(
-                    &self.gpu,
-                    &self.kernels.sigmoid_gate,
-                    &attn,
-                    &g,
-                    &mut o,
-                    seq * heads * hd,
-                )?;
+                timed!(
+                    self,
+                    "attn.gate",
+                    kernels::sigmoid_gate(
+                        &self.gpu,
+                        &self.kernels.sigmoid_gate,
+                        &attn,
+                        &g,
+                        &mut o,
+                        seq * heads * hd,
+                    )?
+                );
                 o
             }
             None => attn,
@@ -704,7 +864,7 @@ impl Engine {
         if capture {
             self.dump_dev("attn_gated", &gated, seq, heads * hd)?;
         }
-        self.gemm(&gated, seq, &w.o_proj)
+        Ok(timed!(self, "gemm.o", self.gemm(&gated, seq, &w.o_proj)?))
     }
 
     fn gdn(&self, h: &CudaSlice<bf16>, seq: usize, w: &GdnWeights, capture: bool) -> Result<Buf> {
@@ -713,7 +873,7 @@ impl Engine {
         let (dk, dv) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
         let conv_dim = 2 * cfg.gdn_key_dim() + cfg.gdn_value_dim();
 
-        let qkv = self.gemm(h, seq, &w.in_proj_qkv)?;
+        let qkv = timed!(self, "gemm.in_qkv", self.gemm(h, seq, &w.in_proj_qkv)?);
         if capture {
             self.dump_dev("gdn_in_proj_qkv", &qkv, seq, conv_dim)?;
         }
@@ -725,22 +885,26 @@ impl Engine {
             );
         }
         let mut conv = self.alloc_bf16(seq * conv_dim)?;
-        kernels::conv1d_silu(
-            &self.gpu,
-            &self.kernels.conv1d_silu,
-            &qkv,
-            &w.conv1d,
-            &mut conv,
-            seq,
-            conv_dim,
-        )?;
+        timed!(
+            self,
+            "gdn.conv",
+            kernels::conv1d_silu(
+                &self.gpu,
+                &self.kernels.conv1d_silu,
+                &qkv,
+                &w.conv1d,
+                &mut conv,
+                seq,
+                conv_dim,
+            )?
+        );
         if capture {
             self.dump_dev("gdn_mixed_qkv_conv", &conv, seq, conv_dim)?;
         }
 
-        let z = self.gemm(h, seq, &w.in_proj_z)?;
-        let b = self.gemm(h, seq, &w.in_proj_b)?;
-        let a = self.gemm(h, seq, &w.in_proj_a)?;
+        let z = timed!(self, "gemm.z", self.gemm(h, seq, &w.in_proj_z)?);
+        let b = timed!(self, "gemm.b", self.gemm(h, seq, &w.in_proj_b)?);
+        let a = timed!(self, "gemm.a", self.gemm(h, seq, &w.in_proj_a)?);
         if capture {
             self.dump_dev("gdn_z", &z, seq, cfg.gdn_value_dim())?;
             self.dump_dev("gdn_b", &b, seq, nv)?;
@@ -757,25 +921,29 @@ impl Engine {
         let mut vf = vf;
         let mut g = g;
         let mut beta = beta;
-        kernels::gdn_prepare(
-            &self.gpu,
-            &self.kernels.gdn_prepare,
-            &conv,
-            &b,
-            &a,
-            &w.a_log,
-            &w.dt_bias,
-            &mut qf,
-            &mut kf,
-            &mut vf,
-            &mut g,
-            &mut beta,
-            seq,
-            nk,
-            nv,
-            dk,
-            dv,
-        )?;
+        timed!(
+            self,
+            "gdn.prepare",
+            kernels::gdn_prepare(
+                &self.gpu,
+                &self.kernels.gdn_prepare,
+                &conv,
+                &b,
+                &a,
+                &w.a_log,
+                &w.dt_bias,
+                &mut qf,
+                &mut kf,
+                &mut vf,
+                &mut g,
+                &mut beta,
+                seq,
+                nk,
+                nv,
+                dk,
+                dv,
+            )?
+        );
         if capture {
             let qfv = self.gpu.stream.clone_dtoh(&qf)?;
             let kfv = self.gpu.stream.clone_dtoh(&kf)?;
@@ -791,21 +959,73 @@ impl Engine {
 
         let mut state = self.gpu.stream.alloc_zeros::<f32>(nv * dk * dv)?;
         let mut core = self.alloc_bf16(seq * nv * dv)?;
-        kernels::gdn_recurrent(
-            &self.gpu,
-            &self.kernels.gdn_recurrent,
-            &qf,
-            &kf,
-            &vf,
-            &g,
-            &beta,
-            &mut state,
-            &mut core,
-            seq,
-            nv,
-            dk,
-            dv,
-        )?;
+        if self.gdn_split.load(Ordering::Relaxed) {
+            timed!(
+                self,
+                "gdn.recurrent",
+                kernels::gdn_recurrent_split(
+                    &self.gpu,
+                    &self.kernels.gdn_recurrent_split,
+                    &qf,
+                    &kf,
+                    &vf,
+                    &g,
+                    &beta,
+                    &mut state,
+                    &mut core,
+                    seq,
+                    nv,
+                    dk,
+                    dv,
+                )?
+            );
+        } else if self.gdn_shared.load(Ordering::Relaxed) {
+            let dv_chunks = if dv >= 64 {
+                self.gdn_chunks.load(Ordering::Relaxed).max(1).min(dv / 16)
+            } else {
+                1
+            };
+            timed!(
+                self,
+                "gdn.recurrent",
+                kernels::gdn_recurrent_shared(
+                    &self.gpu,
+                    &self.kernels.gdn_recurrent_shared,
+                    &qf,
+                    &kf,
+                    &vf,
+                    &g,
+                    &beta,
+                    &mut state,
+                    &mut core,
+                    seq,
+                    nv,
+                    dk,
+                    dv,
+                    dv_chunks,
+                )?
+            );
+        } else {
+            timed!(
+                self,
+                "gdn.recurrent",
+                kernels::gdn_recurrent(
+                    &self.gpu,
+                    &self.kernels.gdn_recurrent,
+                    &qf,
+                    &kf,
+                    &vf,
+                    &g,
+                    &beta,
+                    &mut state,
+                    &mut core,
+                    seq,
+                    nv,
+                    dk,
+                    dv,
+                )?
+            );
+        }
         if capture {
             self.dump_dev("gdn_recurrent_out", &core, seq, nv * dv)?;
             let sv = self.gpu.stream.clone_dtoh(&state)?;
@@ -813,21 +1033,25 @@ impl Engine {
         }
 
         let mut normed = self.alloc_bf16(seq * nv * dv)?;
-        kernels::rmsnorm_gated(
-            &self.gpu,
-            &self.kernels.rmsnorm_gated,
-            &core,
-            &z,
-            &w.norm,
-            &mut normed,
-            seq * nv,
-            dv,
-            cfg.rms_norm_eps,
-        )?;
+        timed!(
+            self,
+            "gdn.norm",
+            kernels::rmsnorm_gated(
+                &self.gpu,
+                &self.kernels.rmsnorm_gated,
+                &core,
+                &z,
+                &w.norm,
+                &mut normed,
+                seq * nv,
+                dv,
+                cfg.rms_norm_eps,
+            )?
+        );
         if capture {
             self.dump_dev("gdn_norm_out", &normed, seq * nv, dv)?;
         }
-        let out = self.gemm(&normed, seq, &w.out_proj)?;
+        let out = timed!(self, "gemm.out", self.gemm(&normed, seq, &w.out_proj)?);
         if capture {
             self.dump_dev("gdn_out_proj", &out, seq, self.cfg.hidden_size)?;
         }
@@ -1192,7 +1416,7 @@ impl Engine {
             in_: hidden,
             w,
         };
-        let logits = self.gemm(h, seq, &lw)?;
+        let logits = timed!(self, "head", self.gemm(h, seq, &lw)?);
         self.slice_out(&logits, seq, ids.len(), last_only)
     }
 
@@ -1225,7 +1449,7 @@ impl Engine {
                 in_: hidden,
                 w,
             };
-            let c = self.gemm(&x, rows, &lw)?;
+            let c = timed!(self, "head", self.gemm(&x, rows, &lw)?);
             out.extend(self.to_f32(&c, rows * n)?);
         }
         Ok(out)

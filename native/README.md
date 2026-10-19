@@ -118,24 +118,24 @@ Long-context latency (Marlin weights, resident, SM89 RTX 4090):
 
 | tokens | tiled FA2 | warp (`--legacy-attention`) | peak GPU mem |
 |---|---|---|---|
-| 1K | 0.959 s | 0.959 s | 13.1 GiB resident |
-| 4K | 3.99-4.04 s | 4.65 s | ~17.2 GiB |
-| 8K | 7.95-8.05 s | 9.88 s | ~17.6 GiB |
-| 16K | 16.10-16.32 s | 22.88 s | 18.9 GiB |
+| 1K | 0.486 s | 0.959 s | 13.1 GiB resident |
+| 4K | 2.12-2.18 s | 4.65 s | ~17.2 GiB |
+| 8K | 4.23-4.32 s | 9.88 s | ~17.6 GiB |
+| 16K | 8.62-8.85 s | 22.88 s | 18.9 GiB |
 
-The standalone attention kernel is 7-12x faster than the warp kernel, but the
-full forward is now **GEMM-bound**: ~0.96 ms/token (1K 0.96 s, 4K 4.0 s, 8K
-8.0 s, 16K 16.3 s). Attention is no longer the quadratic term; reaching
-<2 s at 4K requires a faster large-M W4A16 path, not a faster attention kernel.
+The tiled attention and the split-dk GDN recurrence (below) together cut
+long-context latency ~2x versus the previous warp + shared-GDN stack. The
+remaining time is dominated by the W4A16 GEMMs; attention is <1% at 1K and
+still small at 16K.
 
 Long-context quality gate against the CPU AWQ/SDPA probes
 (`/tmp/jev-native-ref/long-context/probes`, Marlin + tiled attention):
 
-| probe | final hidden max / mean / rel_rms / cosine | head logits (3721, 1802) | two-way prob delta | top-1 |
+| probe | final hidden max / mean / rel_rms / cosine | head logits diff (3721, 1802) | two-way prob delta | top-1 |
 |---|---|---|---|---|
-| 4K (4090 tok) | 0.0938 / 4.41e-3 / 0.783% / 0.999970 | [1.2344, 5.0] vs [1.2734, 5.0313] | 1.7e-4 | true |
-| 8K (8178 tok) | 0.0781 / 4.26e-3 / 0.805% / 0.999967 | [1.2109, 5.1563] vs [1.2188, 5.1563] | 1.5e-4 | true |
-| 16K (16383 tok) | 0.0703 / 4.14e-3 / 0.731% / 0.999974 | [1.2422, 5.2188] vs [1.2422, 5.25] | 5.6e-4 | true |
+| 4K (4090 tok) | 0.0625 / 4.60e-3 / 0.808% / 0.999967 | [0.0156, 0.0313] | 3.5e-4 | true |
+| 8K (8178 tok) | 0.0996 / 4.28e-3 / 0.795% / 0.999968 | [0.0156, 0.0313] | 3.0e-4 | true |
+| 16K (16383 tok) | 0.0469 / 4.01e-3 / 0.692% / 0.999976 | [0.0078, 0.0313] | 6.7e-4 | true |
 
 The probe `probs` include the decision-head transform (bias/temperature); the
 raw two-way softmax of the head logits is within 5.6e-4 of the golden raw
@@ -221,20 +221,38 @@ Resident (`--preload`, GPU 1 freed, 12.66 GiB used / 10.86 GiB free):
 |---|---|---|---|
 | 36 tokens | 174.7 ms | 84.8 ms | **45.1 ms** (3.87x) |
 | 76 tokens | 202.2 ms | 126.4 ms | **73.0 ms** (2.77x) |
-| 1024 tokens | 1261.2 ms | 1261.2 ms | **958.5 ms** (1.32x) |
+| 1024 tokens | 1261.2 ms | 1261.2 ms | **486.1 ms** (2.59x) |
 
 Marlin preload is 10.1 s (repack) and uses 13.1 GiB; the other paths preload in
 5.8 s / 12.7 GiB. Init 0.2 s. GPU samples: reference/fused ~184-231 W,
 Marlin ~45 ms at 36 tokens with 100% utilization. Marlin golden checks: layer 0
 mean 1.58e-4 / rel_rms 0.347%; final norm rel_rms 1.23%, cosine 0.999924.
 
-At 1K the gain is 1.32x: that case is compute-bound and cuBLAS+dequant was
-already efficient; the fixed 64-row M tile and re-reading W per M tile limit
-Marlin's large-M benefit. Two 128-thread large-M tile variants
-(`thread_n_blocks=8/4`, `thread_k_blocks=4/8`) were compiled and A/B'd at 1K:
-982.3 ms and 997.1 ms versus 984.3 ms for the default, with bit-identical
-outputs. There is no win, so the default 256-thread config stays and the
-variants were removed. Resident outputs are
+At 1K the gain is 2.59x (1261 -> 486 ms) after the GDN recurrence work below.
+Marlin alone was 1.32x: that case is compute-bound and cuBLAS+dequant was
+already efficient. Two 128-thread large-M tile variants (`thread_n_blocks=8/4`,
+`thread_k_blocks=4/8`) were compiled and A/B'd at 1K: 982.3 ms and 997.1 ms
+versus 984.3 ms for the default, with bit-identical outputs. There is no win,
+so the default 256-thread config stays.
+
+### GDN recurrence
+
+`gdn_recurrent_split` keeps the f32 recurrent state in dynamic shared memory and
+assigns four lanes to each value column; each lane owns `dk/4` state rows and
+the two dot products are reduced with two `__shfl_xor` steps. Grid is
+`heads * (dv/32)`, block is 128 threads, shared is `dk*(vc+1)*4` (16.9 KiB for
+dk=128). Per-layer cost at 1K drops from 13.35 ms to 3.41 ms (3.9x) and the
+end-to-end 1K forward from 958 ms to 486 ms. The decay + `kv` accumulation are
+fused into one pass; the math order is preserved (1K outputs are bit-identical
+to the previous kernel, 36-token golden unchanged).
+
+1K breakdown (486 ms forward): MLP GEMMs 204 ms (42%), GDN recurrence 164 ms
+(34%), other GEMMs 88 ms (18%), GDN conv 8.8 ms, MLP activation 6.7 ms,
+attention 4.0 ms, norms/residuals ~5 ms. (The profiler's `gemm.b` entry is an
+event-gap artifact; standalone it is 0.017 ms.)
+
+Fallbacks: `--gdn-shared` (single-column shared state, 856 ms at 1K) and
+`--legacy-gdn` (original global-state kernel). Resident outputs are
 bit-identical to the streaming (`--no-cache`) run. Golden after residency
 (hybrid): final norm rel_rms 1.07% (reference 1.25%), full logits rel_rms 0.24%,
 top-1 identical, two-way softmax identical at f32 print precision.
