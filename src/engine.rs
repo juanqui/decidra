@@ -8,11 +8,11 @@ use serde_json::Value;
 
 use crate::{
     DEFAULT_STRATEGY, NATIVE_CHOICE_OPTIONS,
+    backend::Backend,
     error::EngineError,
     head::{DecisionHead, FittedKind, Temperatures, scale_and_softmax},
     prompt::{self, build_content, content_text, label_names, validate_state},
     rng,
-    upstream::Upstream,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -102,7 +102,7 @@ pub struct DecisionEngine {
     pub fitted: Option<Arc<HashMap<String, FittedKind>>>,
     pub label_ids: Arc<Vec<u32>>,
     pub label_names: Arc<Vec<String>>,
-    pub upstream: Arc<Upstream>,
+    pub backend: Arc<dyn Backend>,
 }
 
 impl DecisionEngine {
@@ -111,7 +111,7 @@ impl DecisionEngine {
         temperatures: Arc<Temperatures>,
         fitted: Option<Arc<HashMap<String, FittedKind>>>,
         label_ids: Vec<u32>,
-        upstream: Arc<Upstream>,
+        backend: Arc<dyn Backend>,
     ) -> Self {
         Self {
             head,
@@ -119,7 +119,7 @@ impl DecisionEngine {
             fitted,
             label_ids: Arc::new(label_ids),
             label_names: Arc::new(label_names()),
-            upstream,
+            backend,
         }
     }
 
@@ -127,7 +127,7 @@ impl DecisionEngine {
         self.label_ids.len().min(256)
     }
 
-    /// Run one decision and return the option distribution plus upstream usage.
+    /// Run one decision and return the option distribution plus backend usage.
     pub async fn decide(
         &self,
         kind: Kind,
@@ -222,18 +222,41 @@ impl DecisionEngine {
         };
 
         let (parts, has_image) = prompt::parts(state);
+        if has_image {
+            return Err(EngineError::Unsupported(
+                "native vision not implemented: image states are not supported".to_owned(),
+            ));
+        }
         let content = build_content(kind.as_str(), &parts, question, options, &self.label_names);
-        let (logprobs, usage) = if has_image {
-            self.upstream.logprobs_chat(&content, &ids).await?
-        } else {
-            let text = content_text(&content);
-            self.upstream.logprobs_text(&text, &ids).await?
-        };
+        let text = content_text(&content);
+        let logits = self.backend.logits(&text, &ids).await?;
+        if logits.len() != ids.len() {
+            return Err(EngineError::BadResponse(format!(
+                "backend returned {} logits for {} requested ids",
+                logits.len(),
+                ids.len()
+            )));
+        }
+        // Raw logits and log-probabilities differ by a constant (log Z); the
+        // head softmax normalizer cancels it, so the existing math is unchanged.
+        let logprobs: HashMap<u32, f64> = ids
+            .iter()
+            .copied()
+            .zip(logits.iter().map(|value| *value as f64))
+            .collect();
+        let prompt_tokens = self.backend.prompt_tokens(&text);
         metrics::histogram!("jev_decide_pass_options").record(options.len() as f64);
+        metrics::counter!("jev_backend_prompt_tokens_total").increment(prompt_tokens);
 
         let fitted = self.fitted.as_ref().and_then(|map| map.get(kind.as_str()));
         let probabilities =
             scale_and_softmax(&logprobs, &ids, &bias, self.temperatures.get(kind), fitted);
+        // One forward produces one decision read-out position.
+        let usage = Usage {
+            prompt_tokens,
+            completion_tokens: 1,
+            requests: 1,
+        };
         Ok((probabilities, usage))
     }
 

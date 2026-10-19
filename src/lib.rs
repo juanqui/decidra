@@ -1,19 +1,23 @@
 //! JEV decision server for the `JEV-27B-VL` AWQ W4A16 artifact.
 //!
 //! The HTTP/API layer, tokenization, prompt construction, decision-head math,
-//! concurrency control, signing, and metrics live here. Token generation and the
-//! quantized kernels live in vLLM on the configured backend URL.
+//! concurrency control, signing, and metrics live here. Inference runs in the
+//! in-process `jev-native` CUDA engine (feature `native`); tests use
+//! [`backend::MockBackend`]. There is no HTTP upstream, Python, PyTorch, or
+//! vLLM on the runtime path.
 
 pub mod api;
+pub mod backend;
 pub mod config;
 pub mod engine;
 pub mod error;
 pub mod head;
+#[cfg(feature = "native")]
+pub mod native_backend;
 pub mod prompt;
 pub mod pyjson;
 pub mod rng;
 pub mod telemetry;
-pub mod upstream;
 
 /// Wire protocol name shared with the fp8 stack and the Python shim.
 pub const PROTOCOL: &str = "jev27-bare-v1";

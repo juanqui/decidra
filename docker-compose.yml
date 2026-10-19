@@ -1,40 +1,46 @@
-# jev-engine only. The vLLM backend is launched separately on GPU 1 with
-# scripts/run-vllm.sh and exposed on the host at 127.0.0.1:8002.
+# jev-engine with the in-process native CUDA backend.
+#
+# The HTTP server itself is CPU-side; the native engine holds GPU 1 inside the
+# same process. No vLLM, Python, or separate model server is involved.
 #
 #   docker compose up -d --build
 #   docker compose logs -f
 #   docker compose ps
 #
-# No GPU is reserved for the Rust server. GPU 0 is not used by this stack.
+# GPU 0 is not used by this stack.
 
 services:
   jev-engine:
     build:
       context: .
       dockerfile: Dockerfile
-    image: jev-engine:0.1.0
+    image: jev-engine:0.2.0
     container_name: jev-engine
     restart: unless-stopped
     ports:
       - "${JEV_SERVER_PORT:-8501}:8080"
     environment:
-      JEV_VLLM_URL: ${JEV_VLLM_URL:-http://host.docker.internal:8002}
-      JEV_VLLM_MODEL: ${JEV_VLLM_MODEL:-jev-awq}
+      JEV_NATIVE_MODEL: /models/awq-w4a16-v2
       JEV_CHECKPOINT: /models/awq-w4a16-v2
+      JEV_NATIVE_CACHE: "true"
       JEV_BIND_ADDR: 0.0.0.0:8080
       JEV_MAX_CONCURRENCY: ${JEV_MAX_CONCURRENCY:-8}
-      JEV_REQUEST_TIMEOUT_SECS: ${JEV_REQUEST_TIMEOUT_SECS:-600}
       JEV_METRICS_ENABLED: "true"
       # Set in the host environment or a .env file (never commit it).
       JEV_SIGNING_KEY: ${JEV_SIGNING_KEY:-}
     volumes:
-      # Read-only: tokenizer, decision_head/, and calibration.json only.
+      # Read-only: packed weights, tokenizer, decision_head/, and calibration.json.
       - ${JEV_MODELS_DIR:-/srv/models/jev-awq}:/models:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["1"]
+              capabilities: [gpu]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 300s

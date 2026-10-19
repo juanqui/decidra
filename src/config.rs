@@ -1,33 +1,35 @@
 //! Environment configuration. Every deployment knob is explicit and validated at startup.
 
-use std::{net::SocketAddr, path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
 
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
-pub const DEFAULT_VLLM_URL: &str = "http://127.0.0.1:8002";
 pub const DEFAULT_MODEL: &str = "jev-awq";
 pub const DEFAULT_CHECKPOINT: &str = "/srv/models/jev-awq/awq-w4a16-v2";
 pub const DEFAULT_HF_SNAPSHOT: &str = "/srv/models/hf/hub/models--autotrust--JEV-27B-VL/snapshots/ba3f0d584994b37998f235c0a3f6f1beff32ba1e";
 pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
-pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
-pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_SERVED_IDENTITY: &str = "autotrust/JEV-27B-VL@ba3f0d58+awq-w4a16";
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind_addr: SocketAddr,
-    pub vllm_url: String,
-    pub vllm_model: String,
+    /// Model id advertised by `/v1/models` (`JEV_MODEL`).
+    pub model_id: String,
     pub checkpoint: PathBuf,
     pub tokenizer: Option<PathBuf>,
     pub calibration: Option<PathBuf>,
     pub calibration_fitted: Option<PathBuf>,
     pub hf_snapshot: PathBuf,
+    /// AWQ artifact opened by the native engine (`JEV_NATIVE_MODEL`).
+    pub native_model: PathBuf,
+    /// Keep packed decoder weights resident on the GPU (`JEV_NATIVE_CACHE`).
+    pub native_cache: bool,
+    /// Use the fused W4A16 kernel when available (`JEV_NATIVE_FUSED_W4A16`).
+    /// Off by default: the correctness path dequantizes + cuBLAS BF16 GEMM.
+    pub native_fused_w4a16: bool,
     pub max_concurrency: usize,
-    pub request_timeout: Duration,
-    pub connect_timeout: Duration,
     pub signing_key: Option<Vec<u8>>,
     pub metrics_enabled: bool,
     pub max_body_bytes: usize,
@@ -42,15 +44,7 @@ impl Config {
             .parse::<SocketAddr>()
             .context("JEV_BIND_ADDR must be a socket address such as 0.0.0.0:8080")?;
 
-        let vllm_url = env_string("JEV_VLLM_URL")
-            .unwrap_or_else(|| DEFAULT_VLLM_URL.to_owned())
-            .trim_end_matches('/')
-            .to_owned();
-        validate_url(&vllm_url)?;
-
-        let vllm_model = env_string("JEV_VLLM_MODEL")
-            .or_else(|| env_string("JEV_MODEL"))
-            .unwrap_or_else(|| DEFAULT_MODEL.to_owned());
+        let model_id = env_string("JEV_MODEL").unwrap_or_else(|| DEFAULT_MODEL.to_owned());
 
         let checkpoint = PathBuf::from(
             env_string("JEV_CHECKPOINT").unwrap_or_else(|| DEFAULT_CHECKPOINT.to_owned()),
@@ -62,21 +56,15 @@ impl Config {
         let calibration = env_string("JEV_CALIBRATION").map(PathBuf::from);
         let calibration_fitted = env_string("JEV_CALIBRATION_FITTED").map(PathBuf::from);
 
+        let native_model = PathBuf::from(
+            env_string("JEV_NATIVE_MODEL").unwrap_or_else(|| checkpoint.display().to_string()),
+        );
+        let native_cache = env_bool("JEV_NATIVE_CACHE")?.unwrap_or(true);
+        let native_fused_w4a16 = env_bool("JEV_NATIVE_FUSED_W4A16")?.unwrap_or(false);
+
         let max_concurrency = env_usize("JEV_MAX_CONCURRENCY")?.unwrap_or(DEFAULT_MAX_CONCURRENCY);
         if max_concurrency == 0 {
             bail!("JEV_MAX_CONCURRENCY must be at least 1");
-        }
-        let request_timeout = Duration::from_secs(
-            env_u64("JEV_REQUEST_TIMEOUT_SECS")?.unwrap_or(DEFAULT_REQUEST_TIMEOUT_SECS),
-        );
-        if request_timeout.is_zero() {
-            bail!("JEV_REQUEST_TIMEOUT_SECS must be greater than 0");
-        }
-        let connect_timeout = Duration::from_secs(
-            env_u64("JEV_CONNECT_TIMEOUT_SECS")?.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
-        );
-        if connect_timeout.is_zero() {
-            bail!("JEV_CONNECT_TIMEOUT_SECS must be greater than 0");
         }
 
         let signing_key = match std::env::var("JEV_SIGNING_KEY") {
@@ -94,16 +82,16 @@ impl Config {
 
         Ok(Self {
             bind_addr,
-            vllm_url,
-            vllm_model,
+            model_id,
             checkpoint,
             tokenizer,
             calibration,
             calibration_fitted,
             hf_snapshot,
+            native_model,
+            native_cache,
+            native_fused_w4a16,
             max_concurrency,
-            request_timeout,
-            connect_timeout,
             signing_key,
             metrics_enabled,
             max_body_bytes,
@@ -116,36 +104,10 @@ impl Config {
     }
 }
 
-fn validate_url(url: &str) -> Result<()> {
-    let parsed = reqwest::Url::parse(url)
-        .with_context(|| format!("JEV_VLLM_URL is not a valid URL: {url}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        bail!(
-            "JEV_VLLM_URL must use http or https, got {}",
-            parsed.scheme()
-        );
-    }
-    if parsed.query().is_some() || parsed.fragment().is_some() {
-        bail!("JEV_VLLM_URL must not contain a query or fragment");
-    }
-    Ok(())
-}
-
 fn env_string(name: &str) -> Option<String> {
     match std::env::var(name) {
         Ok(value) if !value.is_empty() => Some(value),
         _ => None,
-    }
-}
-
-fn env_u64(name: &str) -> Result<Option<u64>> {
-    match env_string(name) {
-        Some(value) => {
-            Ok(Some(value.parse::<u64>().with_context(|| {
-                format!("{name} must be an unsigned integer")
-            })?))
-        }
-        None => Ok(None),
     }
 }
 

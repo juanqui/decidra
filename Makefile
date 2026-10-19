@@ -1,13 +1,16 @@
 CARGO ?= cargo
 SHELL := /bin/bash
 
-.PHONY: build test fmt clippy smoke run check-config eval
+.PHONY: build test test-native fmt clippy native-check smoke run check-config eval
 
 build:
-	$(CARGO) build --release --locked
+	$(CARGO) build --release --locked --features native
 
 test:
 	$(CARGO) test --locked
+
+test-native:
+	./scripts/native-smoke.sh
 
 fmt:
 	$(CARGO) fmt --all -- --check
@@ -15,11 +18,14 @@ fmt:
 clippy:
 	$(CARGO) clippy --all-targets -- -D warnings
 
+native-check:
+	$(CARGO) run --release --locked --features native -- --native-check
+
 smoke:
 	./scripts/smoke.sh
 
 run:
-	./scripts/run-server.sh
+	./scripts/run-native.sh
 
 check-config:
 	$(CARGO) run --release --locked -- --check-config

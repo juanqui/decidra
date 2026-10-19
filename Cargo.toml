@@ -2,7 +2,7 @@
 name = "jev-engine"
 version = "0.1.0"
 edition = "2024"
-description = "JEV decision API server backed by vLLM (AWQ W4A16 on one RTX 4090)"
+description = "JEV decision API server backed by the native CUDA engine (AWQ W4A16 on one RTX 4090)"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 rust-version = "1.85"
@@ -10,6 +10,12 @@ rust-version = "1.85"
 [workspace]
 members = ["native"]
 resolver = "3"
+
+[features]
+default = []
+# Links the in-process `jev-native` CUDA engine. Off by default so `cargo test`
+# builds the API against `MockBackend` without a CUDA toolchain.
+native = ["dep:jev-native"]
 
 [dependencies]
 anyhow = "1"
@@ -21,7 +27,7 @@ hex = "0.4"
 hmac = "0.12"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+jev-native = { path = "native", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"

@@ -285,7 +285,7 @@ fn display_paths(paths: &[PathBuf]) -> String {
 
 /// Apply head bias, per-kind temperature (and optional fitted calibration), then softmax.
 ///
-/// `logprobs` is the vLLM map from token id to logprob. Tokens the backend did not
+/// `logprobs` maps token id to raw logit or logprob. Tokens the backend did not
 /// return fall back to `-1e9`, matching the reference implementation. Fitted bias
 /// entries beyond the supplied vector are treated as zero instead of panicking; the
 /// shipped fit only covers the native 16-way head, while serving accepts up to 256

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Smoke-test a running jev-engine instance. Requires a ready vLLM backend for
-# the decision call; /health, /v1/models, and /v1/decide/info do not.
+# Smoke-test a running jev-engine instance (native backend). python3 is used
+# only for JSON assertions in this development script.
 set -euo pipefail
 
 BASE="${JEV_SMOKE_URL:-${JEV_URL:-http://127.0.0.1:8501}}"

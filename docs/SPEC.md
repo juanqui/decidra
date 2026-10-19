@@ -1,20 +1,20 @@
 # jev-engine API specification
 
 This document is the contract implemented by `src/`. It ports the behavior of
-`/srv/models/jev-awq/decide_shim.py` for the `JEV-27B-VL` AWQ W4A16 artifact served by
-vLLM as `jev-awq` (default `http://127.0.0.1:8002`). Where this document and the Python
-shim differ, the difference is called out explicitly.
+`/srv/models/jev-awq/decide_shim.py` for the `JEV-27B-VL` AWQ W4A16 artifact, served by
+the in-process native CUDA engine (`jev-native`) as `jev-awq`. Where this document and the
+Python shim differ, the difference is called out explicitly.
 
 ## 1. Conventions
 
 - All request and response bodies are UTF-8 JSON.
 - Model ids: the client-facing name is `autotrust/JEV-27B-VL`; `/v1/models` also lists
-  `autotrust/JEV-27B` and the configured vLLM id (`jev-awq`).
+  `autotrust/JEV-27B` and the configured id (`JEV_MODEL`, default `jev-awq`).
 - The wire protocol string is always `jev27-bare-v1`.
 - Probabilities are floats in `[0, 1]` and sum to 1 up to floating-point error.
 - `state` is a string, a JSON object, or an array of content parts.
 - A client request that fails validation returns **400**.
-- An upstream vLLM HTTP 4xx/5xx returns **502**; an upstream timeout returns **504**.
+- A native backend failure returns **502**; a backend timeout returns **504**.
 - Malformed JSON, wrong field types, and unsupported enum values never panic; they return
   structured errors.
 
@@ -25,15 +25,14 @@ shim differ, the difference is called out explicitly.
   "detail": "human-readable message",
   "error": {
     "message": "human-readable message",
-    "type": "invalid_request_error | upstream_error | upstream_timeout | internal_error",
+    "type": "invalid_request_error | backend_error | backend_timeout | not_implemented_error | internal_error",
     "code": 400
   }
 }
 ```
 
 `detail` is included for compatibility with clients written against FastAPI's
-`HTTPException`. Streaming passthrough does not use this envelope; it relays the upstream
-status and bytes.
+`HTTPException`.
 
 ## 2. States and content parts
 
@@ -57,9 +56,8 @@ For each element in order:
 | object with `type == "text"` | the object unchanged |
 | anything else (number, bool, null, array, object) | `{"type":"text","text": json.dumps(value)}` |
 
-The list is considered an image request if at least one part is an image. At most one image
-is accepted; more than one returns 400
-`this backend reads one image per request, got N`.
+The list may contain image parts, but the native backend is text-only: any image part
+returns 400 `native vision not implemented: image states are not supported`.
 
 ### Prompt
 
@@ -79,27 +77,9 @@ The exact text prompt, used by `/v1/completions` for every text-only pass:
 - For `choice`, `{lines}` is `A) option0\nB) option1\n...`, using the label table below.
 - For `noul` and `score`, `{lines}` is the options joined with `\n`.
 
-For image requests the same three sections are represented as chat content parts:
-
-```text
-[{"type":"text","text":"[kind] ...\n[state] "},
- ...state parts...,
- {"type":"text","text":"\n[question] ...\n[options]\n...\n[decision]:"}]
-```
-
-### Raw chat template
-
-Image requests send this per-request `chat_template` string:
-
-```text
-{%- for m in messages -%}{%- if m['content'] is string -%}{{ m['content'] }}{%- else -%}
-{%- for c in m['content'] -%}{%- if c['type'] == 'text' -%}{{ c['text'] }}{%- else -%}
-<|vision_start|><|image_pad|><|vision_end|>{%- endif -%}{%- endfor -%}{%- endif -%}
-{%- endfor -%}
-```
-
-(without the line breaks shown here for readability). It is sent with
-`add_generation_prompt: false`.
+The prompt is tokenized with `add_special_tokens=false` and passed to the native engine,
+which returns raw logits for the requested head ids at the last position. Image parts never
+reach the engine; they are rejected earlier with 400.
 
 ## 3. Labels
 
@@ -128,8 +108,8 @@ For one pass over options:
   (i.e. while `lo+i < hi`), otherwise `0.0`.
 - `noul`/`score`: option `i` uses `verbalizer_ids[lo+i]` and `bias[lo+i]`.
 
-The upstream returns logprobs keyed by token id. Missing ids use `-1e9`, and values are
-clamped from below at `-1e9`:
+The backend returns raw logits for the token ids in `ids`. Missing ids use `-1e9`, and
+values are clamped from below at `-1e9`:
 
 ```text
 scaled[i] = (max(logprob(token_i), -1e9) + bias_i) / T_kind
@@ -153,55 +133,26 @@ p[i] = exp(scaled[i] - max(scaled)) / sum_j exp(scaled[j] - max(scaled))
 Tie-breaking for the reported `choice_index` is Python's `max(range(n), key=...)`: the lowest
 index wins on exact ties.
 
-## 5. Upstream read-out
+## 5. Native backend read-out
 
-### Text
+`Backend::logits(prompt, ids)` receives the exact text prompt and the head token ids. The
+native implementation:
 
-For each block of at most 128 ids, `POST /v1/completions` with:
+1. Tokenizes `prompt` with the existing `tokenizers` tokenizer and
+   `add_special_tokens=false`.
+2. Calls `jev_native::Engine::decision_logits(tokens, ids)` on one blocking worker.
+3. Returns raw `f32` logits at the last position, positionally aligned with `ids`.
 
-```json
-{
-  "model": "jev-awq",
-  "prompt": "<exact prompt>",
-  "max_tokens": 1,
-  "temperature": 1.0,
-  "top_p": 1.0,
-  "top_k": 0,
-  "min_p": 0.0,
-  "repetition_penalty": 1.0,
-  "add_special_tokens": false,
-  "return_tokens_as_token_ids": true,
-  "logprobs": 128,
-  "logprob_token_ids": [3721, 1802]
-}
-```
+The engine keeps all packed decoder weights resident after `preload_all()`; a request does
+no weight I/O. Forwards are serialized by a mutex because the CUDA context/stream is not
+safe for concurrent use.
 
-`logprobs` is the chunk length. The parsed logprobs are
-`choices[0].logprobs.top_logprobs[0]`, an object whose keys are `"token_id:<id>"`.
-Usage is accumulated from `usage.prompt_tokens` and `usage.completion_tokens`; each block
-counts as one model request.
+Raw logits differ from log-probabilities by `log Z`, a constant for a fixed prompt. The
+head applies bias, temperature, and optional fitted calibration before softmax, so the
+normalizer cancels and the resulting probabilities are identical to the old logprob path.
 
-### Image
-
-`POST /v1/chat/completions` with the same sampling fields plus:
-
-```json
-{
-  "messages": [{"role": "user", "content": [...]}],
-  "chat_template": "<raw template>",
-  "add_generation_prompt": false,
-  "logprobs": true,
-  "top_logprobs": 1,
-  "logprob_token_ids": [3721, 1802]
-}
-```
-
-Logprobs are parsed from
-`choices[0].logprobs.content[0].top_logprobs`, an array of
-`{"token": "token_id:<id>", "logprob": <float>}`. Usage accounting is identical.
-
-Any malformed upstream shape (missing choice, non-numeric logprob, malformed token key,
-non-JSON body) returns 502 with `invalid backend response`.
+A malformed backend result (length mismatch, non-finite values, engine error) returns 502
+with `backend request failed` or `invalid backend response`.
 
 ## 6. `POST /v1/decide`
 
@@ -223,7 +174,7 @@ non-JSON body) returns 502 with `invalid backend response`.
 - `choice`: 2 to `max_options` options are required.
 - `noul`: options are exactly `["false","true"]`; any supplied `options` are ignored.
 - `score`: options are exactly `["0","1","2","3","4","5"]`.
-- More than one image part is a 400.
+- Any image part is a 400 (`native vision not implemented`).
 
 ### Strategy resolution
 
@@ -305,7 +256,7 @@ unit tests compare full permutations against CPython for `n = 17` and `n = 32`.
 ```
 
 `confidence` is additive relative to the Python shim. `num_model_requests` is the number of
-upstream passes (1, 3, or 4 in typical cases; more group passes for large tournaments).
+backend passes (1, 3, or 4 in typical cases; more group passes for large tournaments).
 
 ## 7. `POST /v1/decisions`
 
@@ -335,7 +286,7 @@ Input handling (`_decisions_state`):
 - A string is the state.
 - A list of messages: string content is appended; for array content, `input_text` parts
   append `str(part.text)` and any `input_image` part returns 400
-  `input_image content parts are not supported: this front is text-only`.
+  `native vision not implemented: input_image content parts are not supported`.
 - Parts are joined with `"\n\n"`.
 - Anything else is treated as empty text (the shim would raise on non-iterable input).
 
@@ -394,11 +345,8 @@ independent single-pass decisions (no tournament/permute), with its own error en
   - string → text; object → CPython `json.dumps` text; array → text parts concatenated
     with `"\n"`.
   - `{"type":"text","text":...}` appends text.
-  - `{"type":"image_url","image_url":{"url":"..."}}` (or a string `image_url`) appends an
-    image; a missing/empty URL is a 400.
-  - `{"image":"..."}` appends an image when the value is a string.
-  - Other parts are dumped as JSON text.
-  - More than one image is a 400.
+  - Image parts are parsed for validation but any image returns 400
+    `native vision not implemented: image states are not supported`.
 - Each question must be an object with non-empty `instructions` after Python `.strip()`.
 - `noul`: if `criteria` is an object and `true` or `false` is non-null, append
   `"\nAnswer true when: <true>\nAnswer false when: <false>"` to the state text. A missing
@@ -407,14 +355,14 @@ independent single-pass decisions (no tournament/permute), with its own error en
   `[a-z0-9-]{1,64}`. Options are `"key: value"` when the value is non-null, else `"key"`.
 - `score` is rejected with 400 `score questions are not served by this backend`; any other
   type is rejected with 400 using the Python repr of the value.
-- All questions are validated before any upstream call.
+- All questions are validated before any backend forward.
 
 ### Execution
 
 For each question, `s1_pass` runs **once** with the same decision-head bias, per-kind
 temperature, fitted calibration (if enabled), and softmax as `/v1/decide`. There is no
-tournament or permute. The prompt state is `[text + "\n"]`, plus the one normalized image
-part when present. Questions execute sequentially.
+tournament or permute. The prompt state is `[text + "\n"]`. Questions execute
+sequentially.
 
 ### Response
 
@@ -449,20 +397,25 @@ part when present. Questions execute sequentially.
   `cost` is 0; `num_model_requests` is the number of passes.
 - Errors use the xPNP envelope:
   `{"error":{"message":"...","code":400}}`. Backend failures become
-  `{"error":{"message":"backend: ...","code":502|504}}` with the server-wide upstream
+  `{"error":{"message":"backend: ...","code":502|504}}` with the server-wide backend
   status policy. `/v1/systemone` is not signed (same as the shim).
 
-## 9. Passthrough routes
+## 9. Generation routes
 
-`POST /v1/chat/completions` and `POST /v1/completions`:
+`POST /v1/chat/completions` and `POST /v1/completions` always return **501** with:
 
-- Body must be a JSON object; otherwise 400.
-- `model` is overwritten with the configured vLLM id (`jev-awq`).
-- All other fields are forwarded unchanged.
-- Non-streaming responses preserve the upstream status, body bytes, and `content-type`.
-- `stream: true` relays upstream bytes as they arrive with `text/event-stream`. The
-  concurrency permit is held until the stream ends.
-- Passthrough errors are not signed.
+```json
+{
+  "detail": "native generation not implemented: this server exposes decision endpoints only",
+  "error": {
+    "message": "native generation not implemented: this server exposes decision endpoints only",
+    "type": "not_implemented_error",
+    "code": 501
+  }
+}
+```
+
+The body is not parsed and nothing is proxied. These routes are not signed.
 
 ## 10. Signing
 
@@ -520,18 +473,19 @@ recorder is not installed.
 | `choice` with 0, 1, or >max options | 400 with the exact count. |
 | `noul`/`score` with supplied `options` | Supplied options ignored. |
 | Null or scalar `state` | 400. |
-| More than one image | 400. |
-| `input_image` in `/v1/decisions` | 400, text-only front. |
+| Any image part | 400, `native vision not implemented`. |
+| `input_image` in `/v1/decisions` | 400, `native vision not implemented`. |
 | `/v1/systemone` questions missing/not object/empty | 400, `questions must be a non-empty object`. |
 | `/v1/systemone` more than 8 questions | 400, `at most 8 questions per request`. |
 | `/v1/systemone` `score` question | 400, `score questions are not served by this backend`. |
 | `/v1/systemone` bad criterion key | 400, `choice keys must match [a-z0-9-]+, got '<key>'`. |
-| `/v1/systemone` image state | One image maximum; `image_url` must carry a non-empty URL. |
+| `/v1/systemone` image state | 400, `native vision not implemented`. |
 | Unknown question type | 400, Python-repr of the value. |
-| Upstream 4xx/5xx | 502, upstream status and first 600 characters in the message. |
-| Upstream timeout | 504. |
-| Upstream non-JSON / bad logprob shape | 502, `invalid backend response`. |
-| Missing logprob for a requested token | Treated as `-1e9` before bias/temperature. |
+| `/v1/chat/completions`, `/v1/completions` | 501, `native generation not implemented`. |
+| Native engine failure | 502, `backend request failed`. |
+| Backend timeout | 504, `backend request timed out`. |
+| Malformed/non-finite logits | 502, `invalid backend response`. |
+| Missing logit for a requested token | Treated as `-1e9` before bias/temperature. |
 | Ties in `choice_index` | Lowest index. |
 | Fitted bias shorter than options | Missing entries `0.0`; no panic. |
 | Empty probability vector | Internal 500 (should be unreachable). |
@@ -546,8 +500,8 @@ recorder is not installed.
   permutations match the reference.
 - Softmax uses the same formula. `exp` may differ from CPython's libm by one unit in the
   last place on some platforms; probability vectors should agree to `~1e-15`.
-- Upstream error status mapping, the additive `confidence` field, one-image validation, and
+- Backend error status mapping, the additive `confidence` field, text-only validation, and
   the structured error envelope are intentional differences from the Python shim.
 - `/v1/systemone` ports the shim handler, including its separate error envelope; it is not signed.
-- The server never starts or stops vLLM and never touches the production ports `8001` and
-  `8500`.
+- The server never starts or stops another model process and never touches the production
+  ports `8001` and `8500`.

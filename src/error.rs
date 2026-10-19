@@ -9,19 +9,19 @@ use axum::{
 };
 use serde_json::json;
 
-/// Errors raised while building requests to, or interpreting answers from, vLLM.
+/// Errors raised while loading the native backend or running a decision pass.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
     #[error("invalid configuration: {0}")]
     Config(String),
-    #[error("upstream request failed: {0}")]
-    Upstream(String),
-    #[error("upstream request timed out after {0:?}")]
+    #[error("backend request failed: {0}")]
+    Backend(String),
+    #[error("backend request timed out after {0:?}")]
     Timeout(Duration),
-    #[error("upstream returned HTTP {status}: {body}")]
-    UpstreamStatus { status: u16, body: String },
-    #[error("invalid upstream response: {0}")]
+    #[error("invalid backend response: {0}")]
     BadResponse(String),
+    #[error("unsupported by the native backend: {0}")]
+    Unsupported(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -46,7 +46,7 @@ impl ApiError {
     pub fn bad_gateway(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_GATEWAY,
-            kind: "upstream_error",
+            kind: "backend_error",
             message: message.into(),
         }
     }
@@ -54,7 +54,15 @@ impl ApiError {
     pub fn gateway_timeout(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::GATEWAY_TIMEOUT,
-            kind: "upstream_timeout",
+            kind: "backend_timeout",
+            message: message.into(),
+        }
+    }
+
+    pub fn not_implemented(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            kind: "not_implemented_error",
             message: message.into(),
         }
     }
@@ -73,17 +81,15 @@ impl From<EngineError> for ApiError {
         match error {
             EngineError::Config(message) => ApiError::internal(message),
             EngineError::Timeout(timeout) => {
-                ApiError::gateway_timeout(format!("upstream request timed out after {timeout:?}"))
+                ApiError::gateway_timeout(format!("backend request timed out after {timeout:?}"))
             }
-            EngineError::Upstream(message) => {
-                ApiError::bad_gateway(format!("upstream request failed: {message}"))
-            }
-            EngineError::UpstreamStatus { status, body } => {
-                ApiError::bad_gateway(format!("backend: HTTP {status}: {body}"))
+            EngineError::Backend(message) => {
+                ApiError::bad_gateway(format!("backend request failed: {message}"))
             }
             EngineError::BadResponse(message) => {
                 ApiError::bad_gateway(format!("invalid backend response: {message}"))
             }
+            EngineError::Unsupported(message) => ApiError::not_implemented(message),
             EngineError::Internal(message) => ApiError::internal(message),
         }
     }

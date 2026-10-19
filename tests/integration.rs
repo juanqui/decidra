@@ -1,4 +1,4 @@
-//! End-to-end API tests against a self-contained mock vLLM upstream.
+//! End-to-end API tests against a self-contained mock backend.
 
 use std::{
     path::PathBuf,
@@ -7,142 +7,67 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
+    Router,
     body::{Body, Bytes, to_bytes},
-    extract::State,
     http::{HeaderMap, Method, Request, StatusCode, header::CONTENT_TYPE},
-    response::{IntoResponse, Response},
-    routing::post,
 };
 use hmac::{Hmac, Mac};
-use jev_engine::{api::AppState, config::Config, prompt::RAW_TEMPLATE};
-use serde_json::{Map, Value, json};
+use jev_engine::{
+    api::AppState,
+    backend::{Backend, MockBackend},
+    config::Config,
+    error::EngineError,
+};
+use serde_json::{Value, json};
 use sha2::Sha256;
-use tokio::net::TcpListener;
 use tower::ServiceExt;
 
-#[derive(Clone)]
-struct MockState {
-    requests: Arc<Mutex<Vec<Value>>>,
-}
+type Prompts = Arc<Mutex<Vec<(String, Vec<u32>)>>>;
 
-async fn mock_completion(State(state): State<MockState>, Json(body): Json<Value>) -> Response {
-    state.requests.lock().unwrap().push(body.clone());
-    let text = body_text(&body);
-    if text.contains("FAIL") {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "upstream exploded").into_response();
-    }
-    if text.contains("SLOW") {
-        tokio::time::sleep(Duration::from_millis(300)).await;
-    }
-    if text.contains("BADJSON") {
-        return (StatusCode::OK, "this is not json").into_response();
-    }
-    let is_chat = body.get("messages").is_some();
-
-    if body.get("logprob_token_ids").is_none() {
-        if body.get("stream").and_then(Value::as_bool) == Some(true) {
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(CONTENT_TYPE, "text/event-stream")
-                .body(Body::from(
-                    "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\ndata: [DONE]\n\n",
-                ))
-                .unwrap();
+fn mock_backend(prompts: Prompts) -> Arc<dyn Backend> {
+    let backend = MockBackend::new(move |prompt: &str, ids: &[u32]| {
+        prompts
+            .lock()
+            .unwrap()
+            .push((prompt.to_owned(), ids.to_vec()));
+        if prompt.contains("FAIL") {
+            return Err(EngineError::Backend("mock backend exploded".to_owned()));
         }
-        return Json(json!({
-            "id": "mock-completion",
-            "object": "text_completion",
-            "model": body.get("model").cloned().unwrap_or(Value::Null),
-            "choices": [{"text": "ok"}],
-        }))
-        .into_response();
-    }
-
-    let ids: Vec<u32> = body
-        .get("logprob_token_ids")
-        .and_then(Value::as_array)
-        .unwrap_or(&Vec::new())
-        .iter()
-        .filter_map(Value::as_u64)
-        .map(|id| id as u32)
-        .collect();
-    let preferred = if text.starts_with("[kind] noul") {
-        1802
-    } else if text.starts_with("[kind] score") {
-        18
-    } else {
-        34
-    };
-    let logprob = |id: u32| if id == preferred { 0.0 } else { -8.0 };
-
-    if is_chat {
-        let entries: Vec<Value> = ids
+        if prompt.contains("BADJSON") {
+            return Err(EngineError::BadResponse("not valid logits".to_owned()));
+        }
+        if prompt.contains("SLOW") {
+            return Err(EngineError::Timeout(Duration::from_secs(1)));
+        }
+        let preferred = if prompt.starts_with("[kind] noul") {
+            1802
+        } else if prompt.starts_with("[kind] score") {
+            18
+        } else {
+            34
+        };
+        Ok(ids
             .iter()
-            .map(|id| json!({"token": format!("token_id:{id}"), "logprob": logprob(*id)}))
-            .collect();
-        Json(json!({
-            "choices": [{"logprobs": {"content": [{"top_logprobs": entries}]}}],
-            "usage": {"prompt_tokens": 11, "completion_tokens": 1},
-        }))
-        .into_response()
-    } else {
-        let mut entries = Map::new();
-        for id in &ids {
-            entries.insert(format!("token_id:{id}"), json!(logprob(*id)));
-        }
-        Json(json!({
-            "choices": [{"logprobs": {"top_logprobs": [entries]}}],
-            "usage": {"prompt_tokens": 10, "completion_tokens": 1},
-        }))
-        .into_response()
-    }
+            .map(|id| if *id == preferred { 0.0 } else { -8.0 })
+            .collect())
+    })
+    .with_prompt_tokens(10);
+    Arc::new(backend)
 }
 
-fn body_text(body: &Value) -> String {
-    if let Some(prompt) = body.get("prompt").and_then(Value::as_str) {
-        return prompt.to_owned();
-    }
-    body.pointer("/messages/0/content")
-        .and_then(Value::as_array)
-        .map(|parts| {
-            parts
-                .iter()
-                .filter_map(|part| part.get("text").and_then(Value::as_str))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-async fn spawn_mock() -> (String, Arc<Mutex<Vec<Value>>>) {
-    let requests = Arc::new(Mutex::new(Vec::new()));
-    let app = Router::new()
-        .route("/v1/completions", post(mock_completion))
-        .route("/v1/chat/completions", post(mock_completion))
-        .with_state(MockState {
-            requests: requests.clone(),
-        });
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (format!("http://{address}"), requests)
-}
-
-fn test_config(vllm_url: String) -> Config {
+fn test_config() -> Config {
     Config {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
-        vllm_url,
-        vllm_model: "jev-awq".to_owned(),
+        model_id: "jev-awq".to_owned(),
         checkpoint: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"),
         tokenizer: None,
         calibration: None,
         calibration_fitted: None,
         hf_snapshot: PathBuf::from("/nonexistent/hf-snapshot"),
+        native_model: PathBuf::from("/nonexistent/native-model"),
+        native_cache: true,
+        native_fused_w4a16: false,
         max_concurrency: 4,
-        request_timeout: Duration::from_secs(5),
-        connect_timeout: Duration::from_secs(2),
         signing_key: None,
         metrics_enabled: false,
         max_body_bytes: 8 * 1024 * 1024,
@@ -150,18 +75,16 @@ fn test_config(vllm_url: String) -> Config {
     }
 }
 
-async fn app_for() -> (Router, Arc<Mutex<Vec<Value>>>) {
-    let (url, requests) = spawn_mock().await;
-    let config = test_config(url);
-    let state = AppState::load(config).unwrap();
-    (state.router(), requests)
+async fn app_for() -> (Router, Prompts) {
+    let prompts: Prompts = Arc::new(Mutex::new(Vec::new()));
+    let state = AppState::load(test_config(), mock_backend(prompts.clone())).unwrap();
+    (state.router(), prompts)
 }
 
-async fn app_with(config: Config) -> (Router, Arc<Mutex<Vec<Value>>>) {
-    let (url, requests) = spawn_mock().await;
-    let mut config = config;
-    config.vllm_url = url;
-    (AppState::load(config).unwrap().router(), requests)
+async fn app_with(config: Config) -> (Router, Prompts) {
+    let prompts: Prompts = Arc::new(Mutex::new(Vec::new()));
+    let state = AppState::load(config, mock_backend(prompts.clone())).unwrap();
+    (state.router(), prompts)
 }
 
 async fn call(
@@ -225,11 +148,9 @@ fn close(a: f64, b: f64) -> bool {
 
 #[tokio::test]
 async fn noul_decision_signing_metadata_and_metrics() {
-    let (url, requests) = spawn_mock().await;
-    let mut config = test_config(url);
+    let mut config = test_config();
     config.signing_key = Some(b"secret-key".to_vec());
-    let state = AppState::load(config).unwrap();
-    let app = state.router();
+    let (app, prompts) = app_with(config).await;
 
     let (status, headers, bytes) = call(&app, Method::GET, "/health", None).await;
     assert_eq!(status, StatusCode::OK);
@@ -278,6 +199,7 @@ async fn noul_decision_signing_metadata_and_metrics() {
     assert_eq!(response["usage"]["total_tokens"], 11);
     assert_eq!(response["num_model_requests"], 1);
     assert!(response["confidence"].as_f64().unwrap() > 0.99);
+
     let probabilities = response["probabilities"].as_array().unwrap();
     assert_eq!(probabilities.len(), 2);
     assert!(close(
@@ -289,22 +211,11 @@ async fn noul_decision_signing_metadata_and_metrics() {
     ));
 
     {
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 1);
-        let upstream = &requests[0];
-        assert_eq!(upstream["model"], "jev-awq");
-        assert_eq!(upstream["max_tokens"], 1);
-        assert_eq!(upstream["temperature"], 1.0);
-        assert_eq!(upstream["top_p"], 1.0);
-        assert_eq!(upstream["top_k"], 0);
-        assert_eq!(upstream["min_p"], 0.0);
-        assert_eq!(upstream["repetition_penalty"], 1.0);
-        assert_eq!(upstream["add_special_tokens"], false);
-        assert_eq!(upstream["return_tokens_as_token_ids"], true);
-        assert_eq!(upstream["logprobs"], 2);
-        assert_eq!(upstream["logprob_token_ids"], json!([3721, 1802]));
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].1, vec![3721, 1802]);
         assert_eq!(
-            upstream["prompt"],
+            prompts[0].0,
             "[kind] noul\n[state] hello\n[question] Is it safe?\n[options]\nfalse\ntrue\n[decision]:"
         );
     }
@@ -326,12 +237,13 @@ async fn noul_decision_signing_metadata_and_metrics() {
         header(&headers, "x-jev-signature").as_deref(),
         Some(signature(b"secret-key", &bytes).as_str())
     );
-    assert!(String::from_utf8_lossy(&bytes).contains("input_image"));
+    assert!(String::from_utf8_lossy(&bytes).contains("native vision not implemented"));
+    assert_eq!(prompts.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
 async fn choice_single_tournament_and_permute() {
-    let (app, requests) = app_for().await;
+    let (app, prompts) = app_for().await;
     let options: Vec<String> = (0..3).map(|index| format!("option-{index}")).collect();
     let body = json!({"kind": "choice", "state": "s", "question": "q", "options": options});
     let (status, _, bytes) = call(&app, Method::POST, "/v1/decide", Some(&body)).await;
@@ -339,9 +251,9 @@ async fn choice_single_tournament_and_permute() {
     let response = decode(&bytes);
     assert_eq!(response["adaptation"], "native");
     assert_eq!(response["choice"], "option-2");
-    assert_eq!(requests.lock().unwrap().len(), 1);
+    assert_eq!(prompts.lock().unwrap().len(), 1);
     assert_eq!(
-        requests.lock().unwrap()[0]["prompt"],
+        prompts.lock().unwrap()[0].0,
         "[kind] choice\n[state] s\n[question] q\n[options]\nA) option-0\nB) option-1\nC) option-2\n[decision]:"
     );
 
@@ -362,7 +274,7 @@ async fn choice_single_tournament_and_permute() {
         1.0
     ));
     // Two 9/8-option groups, then a 16-option final.
-    assert_eq!(requests.lock().unwrap().len(), 1 + 3);
+    assert_eq!(prompts.lock().unwrap().len(), 1 + 3);
     assert!(String::from_utf8_lossy(&bytes).contains("tournament"));
 
     let body = json!({
@@ -374,10 +286,10 @@ async fn choice_single_tournament_and_permute() {
     });
     let (status, _, first_bytes) = call(&app, Method::POST, "/v1/decide", Some(&body)).await;
     assert_eq!(status, StatusCode::OK);
-    let before = requests.lock().unwrap().len();
+    let before = prompts.lock().unwrap().len();
     let (status, _, second_bytes) = call(&app, Method::POST, "/v1/decide", Some(&body)).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(requests.lock().unwrap().len(), before + 4);
+    assert_eq!(prompts.lock().unwrap().len(), before + 4);
     let first = decode(&first_bytes);
     let second = decode(&second_bytes);
     assert_eq!(first["adaptation"], "permute");
@@ -395,7 +307,7 @@ async fn choice_single_tournament_and_permute() {
 
 #[tokio::test]
 async fn decisions_predicate_choice_and_score_mapping() {
-    let (app, requests) = app_for().await;
+    let (app, prompts) = app_for().await;
     let body = json!({
         "model": "client-model",
         "input": [{"role": "user", "content": [
@@ -439,25 +351,18 @@ async fn decisions_predicate_choice_and_score_mapping() {
     assert_eq!(response["usage"]["total_tokens"], 33);
 
     {
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 3);
-        for request in requests.iter() {
-            let prompt = request["prompt"].as_str().unwrap();
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 3);
+        for (prompt, _) in prompts.iter() {
             assert!(prompt.starts_with("[kind] "));
             assert!(prompt.contains("[state] context one\n\ncontext two\n[question]"));
         }
         assert!(
-            requests[1]["prompt"]
-                .as_str()
-                .unwrap()
+            prompts[1]
+                .0
                 .contains("A) small: little\nB) medium\nC) large: big")
         );
-        assert!(
-            requests[2]["prompt"]
-                .as_str()
-                .unwrap()
-                .contains("bad\nok\ngood\ngreat")
-        );
+        assert!(prompts[2].0.contains("bad\nok\ngood\ngreat"));
     }
 
     let body = json!({
@@ -475,8 +380,8 @@ async fn decisions_predicate_choice_and_score_mapping() {
 }
 
 #[tokio::test]
-async fn image_state_uses_chat_completions_with_raw_template() {
-    let (app, requests) = app_for().await;
+async fn image_states_are_rejected_without_a_backend_call() {
+    let (app, prompts) = app_for().await;
     let body = json!({
         "kind": "noul",
         "state": [
@@ -486,72 +391,44 @@ async fn image_state_uses_chat_completions_with_raw_template() {
         "question": "Is it a cat?"
     });
     let (status, _, bytes) = call(&app, Method::POST, "/v1/decide", Some(&body)).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&bytes)
-    );
-    assert_eq!(decode(&bytes)["choice"], "true");
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&bytes).contains("native vision not implemented"));
 
-    let requests = requests.lock().unwrap();
-    assert_eq!(requests.len(), 1);
-    let upstream = &requests[0];
-    assert!(upstream.get("prompt").is_none());
-    assert_eq!(upstream["chat_template"], RAW_TEMPLATE);
-    assert_eq!(upstream["add_generation_prompt"], false);
-    assert_eq!(upstream["logprobs"], true);
-    assert_eq!(upstream["top_logprobs"], 1);
-    assert_eq!(upstream["add_special_tokens"], false);
-    assert_eq!(upstream["logprob_token_ids"], json!([3721, 1802]));
-    assert_eq!(
-        upstream["messages"][0]["content"][0]["text"],
-        "[kind] noul\n[state] "
-    );
-    assert_eq!(
-        upstream["messages"][0]["content"][1]["text"],
-        "look at this"
-    );
-    assert_eq!(upstream["messages"][0]["content"][2]["type"], "image_url");
-    assert_eq!(
-        upstream["messages"][0]["content"][2]["image_url"]["url"],
-        "data:image/png;base64,AAAA"
-    );
-    assert_eq!(
-        upstream["messages"][0]["content"][3]["text"],
-        "\n[question] Is it a cat?\n[options]\nfalse\ntrue\n[decision]:"
-    );
+    let body = json!({
+        "state": ["look at this", {"image": "data:image/png;base64,AAAA"}],
+        "questions": {"notable": {"type": "noul", "instructions": "Is this notable?"}}
+    });
+    let (status, _, bytes) = call(&app, Method::POST, "/v1/systemone", Some(&body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&bytes).contains("native vision not implemented"));
+    assert!(prompts.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn proxy_rewrites_model_and_streams() {
-    let (app, requests) = app_for().await;
+async fn generation_endpoints_return_501() {
+    let (app, prompts) = app_for().await;
     let body = json!({"model": "client-model", "prompt": "hello", "max_tokens": 4});
-    let (status, headers, bytes) = call(&app, Method::POST, "/v1/completions", Some(&body)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        header(&headers, "content-type").as_deref(),
-        Some("application/json")
+    let (status, _, bytes) = call(&app, Method::POST, "/v1/completions", Some(&body)).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    let error = decode(&bytes);
+    assert_eq!(error["error"]["type"], "not_implemented_error");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("native generation not implemented")
     );
-    assert_eq!(decode(&bytes)["model"], "jev-awq");
-    assert_eq!(requests.lock().unwrap()[0]["model"], "jev-awq");
 
-    let body = json!({"model": "client-model", "messages": [{"role": "user", "content": "hi"}], "stream": true});
-    let (status, headers, bytes) =
-        call(&app, Method::POST, "/v1/chat/completions", Some(&body)).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        header(&headers, "content-type").as_deref(),
-        Some("text/event-stream")
-    );
-    let text = String::from_utf8_lossy(&bytes);
-    assert!(text.contains("data: {\"choices\""));
-    assert!(text.contains("[DONE]"));
+    let body = json!({"messages": [{"role": "user", "content": "hi"}], "stream": true});
+    let (status, _, bytes) = call(&app, Method::POST, "/v1/chat/completions", Some(&body)).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
+    assert!(String::from_utf8_lossy(&bytes).contains("native generation not implemented"));
+    assert!(prompts.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn systemone_noul_choice_image_and_validation() {
-    let (app, requests) = app_for().await;
+async fn systemone_noul_choice_and_validation() {
+    let (app, prompts) = app_for().await;
 
     // noul with criteria, object state, and exact usage accounting.
     let body = json!({
@@ -611,11 +488,11 @@ async fn systemone_noul_choice_image_and_validation() {
     assert_eq!(response["usage"]["num_model_requests"], 2);
 
     {
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), 2);
-        let noul = requests[0]["prompt"].as_str().unwrap();
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        let noul = prompts[0].0.as_str();
         assert!(noul.contains("[state] {\"ticket\": \"refund\", \"amount\": 42}\nAnswer true when: no abuse\nAnswer false when: abuse\n\n[question] Is this safe?"));
-        let choice = requests[1]["prompt"].as_str().unwrap();
+        let choice = prompts[1].0.as_str();
         assert!(
             choice.contains(
                 "[options]\nA) billing: charges\nB) support: bugs\nC) sales\n[decision]:"
@@ -623,42 +500,7 @@ async fn systemone_noul_choice_image_and_validation() {
         );
     }
 
-    // Image state goes through the raw chat template.
-    let before = requests.lock().unwrap().len();
-    let body = json!({
-        "state": ["look at this", {"image": "data:image/png;base64,AAAA"}],
-        "questions": {
-            "notable": {"type": "noul", "instructions": "Is this notable?"}
-        }
-    });
-    let (status, _, bytes) = call(&app, Method::POST, "/v1/systemone", Some(&body)).await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "{}",
-        String::from_utf8_lossy(&bytes)
-    );
-    assert!(
-        decode(&bytes)["answers"]["notable"]["noul"]
-            .as_f64()
-            .unwrap()
-            > 0.99
-    );
-    {
-        let requests = requests.lock().unwrap();
-        assert_eq!(requests.len(), before + 1);
-        let upstream = &requests[before];
-        assert!(upstream.get("prompt").is_none());
-        assert_eq!(upstream["chat_template"], RAW_TEMPLATE);
-        assert_eq!(
-            upstream["messages"][0]["content"][1]["text"],
-            "look at this\n"
-        );
-        assert_eq!(upstream["messages"][0]["content"][2]["type"], "image_url");
-    }
-
-    // Validation failures use the xPNP error envelope and make no upstream calls.
-    let before = requests.lock().unwrap().len();
+    // Validation failures use the xPNP error envelope and no backend calls.
     let mut nine = serde_json::Map::new();
     for index in 0..9 {
         nine.insert(
@@ -666,6 +508,7 @@ async fn systemone_noul_choice_image_and_validation() {
             json!({"type": "noul", "instructions": "is it?"}),
         );
     }
+    let before = prompts.lock().unwrap().len();
     let body = json!({"state": "x", "questions": nine});
     let (status, bytes) = call_raw(
         &app,
@@ -735,12 +578,12 @@ async fn systemone_noul_choice_image_and_validation() {
         decode(&bytes)["error"]["message"],
         "state must be a string, an object, or an array"
     );
-    assert_eq!(requests.lock().unwrap().len(), before);
+    assert_eq!(prompts.lock().unwrap().len(), before);
 }
 
 #[tokio::test]
-async fn validation_and_upstream_error_semantics() {
-    let (app, _requests) = app_for().await;
+async fn validation_and_backend_error_semantics() {
+    let (app, _prompts) = app_for().await;
     let (status, bytes) = call_raw(&app, "/v1/decide", "{not json").await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(String::from_utf8_lossy(&bytes).contains("invalid JSON body"));
@@ -768,26 +611,35 @@ async fn validation_and_upstream_error_semantics() {
     let (status, bytes) =
         call_raw(&app, "/v1/decide", &serde_json::to_string(&body).unwrap()).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert!(String::from_utf8_lossy(&bytes).contains("one image per request"));
+    assert!(String::from_utf8_lossy(&bytes).contains("native vision not implemented"));
 
     let body = json!({"kind": "noul", "state": "s", "question": "FAIL"});
     let (status, bytes) =
         call_raw(&app, "/v1/decide", &serde_json::to_string(&body).unwrap()).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
     let error = decode(&bytes);
-    assert_eq!(error["error"]["type"], "upstream_error");
-    assert!(error["detail"].as_str().unwrap().contains("500"));
+    assert_eq!(error["error"]["type"], "backend_error");
+    assert!(
+        error["detail"]
+            .as_str()
+            .unwrap()
+            .contains("mock backend exploded")
+    );
 
     let body = json!({"kind": "noul", "state": "s", "question": "BADJSON"});
-    let (status, _) = call_raw(&app, "/v1/decide", &serde_json::to_string(&body).unwrap()).await;
+    let (status, bytes) =
+        call_raw(&app, "/v1/decide", &serde_json::to_string(&body).unwrap()).await;
     assert_eq!(status, StatusCode::BAD_GATEWAY);
+    assert!(
+        decode(&bytes)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid backend response")
+    );
 
-    let mut config = test_config(String::new());
-    config.request_timeout = Duration::from_millis(50);
-    let (app, _) = app_with(config).await;
     let body = json!({"kind": "noul", "state": "s", "question": "SLOW"});
     let (status, bytes) =
         call_raw(&app, "/v1/decide", &serde_json::to_string(&body).unwrap()).await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
-    assert_eq!(decode(&bytes)["error"]["type"], "upstream_timeout");
+    assert_eq!(decode(&bytes)["error"]["type"], "backend_timeout");
 }

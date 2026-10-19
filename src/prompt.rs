@@ -1,8 +1,8 @@
 //! Prompt construction and the wide-choice label table.
 //!
 //! This is a direct port of `decide_shim.py`'s `LABELS`, `_single_token_labels`,
-//! `_parts`, `build_content`, and `RAW_TEMPLATE`. The prompt layout is part of the
-//! model's trained protocol; changing a space or a newline changes the distribution.
+//! `_parts`, and `build_content`. The prompt layout is part of the model's
+//! trained protocol; changing a space or a newline changes the distribution.
 
 use std::path::{Path, PathBuf};
 
@@ -16,10 +16,6 @@ use crate::pyjson;
 /// The shim's prompt context used to verify that a label is a single token at the
 /// decision position.
 pub const LABEL_CONTEXT: &str = "x\n{}) y";
-
-/// Raw Qwen chat template that splices vision tokens at image parts. Sent per request
-/// to vLLM for image decisions, with `add_generation_prompt: false`.
-pub const RAW_TEMPLATE: &str = "{%- for m in messages -%}{%- if m['content'] is string -%}{{ m['content'] }}{%- else -%}{%- for c in m['content'] -%}{%- if c['type'] == 'text' -%}{{ c['text'] }}{%- else -%}<|vision_start|><|image_pad|><|vision_end|>{%- endif -%}{%- endfor -%}{%- endif -%}{%- endfor -%}";
 
 /// `string.ascii_uppercase` then `itertools.product(uppercase, repeat=2)`: A..Z, AA..ZZ.
 pub fn label_names() -> Vec<String> {
@@ -221,8 +217,8 @@ fn text_part(text: String) -> Value {
     Value::Object(part)
 }
 
-/// Port of `build_content`. The returned parts are joined with the empty string for
-/// text-only prompts and sent as chat `content` for image prompts.
+/// Port of `build_content`. The returned parts are joined with the empty string
+/// for the text-only native path.
 pub fn build_content(
     kind: &str,
     parts: &[Value],

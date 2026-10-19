@@ -3,7 +3,7 @@
 
 1. 256-option choice through /v1/decide (default wide-choice strategy).
 2. OpenAI-style /v1/decisions with predicate + choice + score questions.
-3. One image decision with a generated 512x512 PNG (skipped if PIL is missing).
+3. Image state must be rejected with 400 (native vision is not implemented).
 
 Writes a JSON record and the PNG used. Does not benchmark.
 """
@@ -156,26 +156,23 @@ def check_image(url: str, png_path: Path, timeout: float) -> dict[str, Any]:
     }
     with requests.Session() as session:
         status, payload, elapsed = post(session, url + "/v1/decide", body, timeout)
-    probabilities = payload.get("probabilities") if isinstance(payload, dict) else None
-    ok = (
-        status == 200
-        and isinstance(probabilities, list)
-        and len(probabilities) == 3
-        and abs(sum(probabilities) - 1.0) <= 1e-6
-        and payload.get("choice") in ("red", "blue", "green")
-        and (payload.get("usage") or {}).get("prompt_tokens", 0) > 0
-    )
+    message = ""
+    if isinstance(payload, dict):
+        message = str(
+            (payload.get("error") or {}).get("message")
+            or payload.get("detail")
+            or ""
+        )
+    ok = status == 400 and "native vision not implemented" in message
     return {
-        "name": "image_choice",
+        "name": "image_rejected",
         "ok": bool(ok),
         "status": status,
         "elapsed_s": elapsed,
         "png": str(png_path),
         "png_bytes": len(raw),
         "png_size": list(image.size),
-        "choice": payload.get("choice") if isinstance(payload, dict) else None,
-        "probabilities": probabilities,
-        "usage": payload.get("usage") if isinstance(payload, dict) else None,
+        "message": message,
         "error": None if ok else payload,
     }
 
@@ -204,7 +201,7 @@ def main(argv: list[str] | None = None) -> int:
             print(
                 f"{check['name']}: {'PASS' if check['ok'] else 'FAIL'} "
                 f"status={check['status']} elapsed={check['elapsed_s']:.2f}s "
-                f"choice={check.get('choice')} usage={check.get('usage')}"
+                f"choice={check.get('choice')} message={check.get('message')} "
             )
     print(f"wrote {out}")
     return 0 if result["pass"] else 1

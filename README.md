@@ -1,53 +1,55 @@
 # jev-engine
 
 Production Rust API/decision server for **`JEV-27B-VL` AWQ W4A16** on one RTX 4090.
-It exposes the JEV System 1 decision protocol, the OpenAI decisions shape, and transparent
-OpenAI chat/completions passthrough, while vLLM owns token generation and the quantized
-kernels.
+It exposes the JEV System 1 decision protocol and the OpenAI Decisions shape, and it
+runs inference **in-process** through the custom Rust + CUDA engine in
+[`native/`](native/README.md). There is no vLLM, Python, PyTorch, or HTTP upstream on
+the runtime path.
 
-The server deliberately does **not** start, stop, supervise, or benchmark vLLM. Point it at
-an already-running backend with `JEV_VLLM_URL` (default `http://127.0.0.1:8002`).
+The server owns the parts where exactness and operational control matter:
 
-## Why vLLM kernels
-
-The AWQ artifact needs the best available kernel stack for this exact model on Ada:
-
-- **Marlin W4A16 GEMM** for the 4-bit compressed-tensors matmuls.
-- **FlashInfer / FlashAttention** for attention.
-- **FLA / FlashInfer GDN** for the hybrid linear-attention layers.
-
-Reimplementing any of that in Rust would be slower and would change the numerics. The Rust
-process owns the parts where exactness and operational control matter:
-
-- HTTP/API surface, validation, error semantics.
+- HTTP/API surface, validation, error semantics, HMAC signing, and metrics.
 - Tokenizer-derived wide-choice label table and startup parity checks.
 - Prompt construction byte-for-byte compatible with the Python reference.
 - Decision-head bias, per-kind temperature, optional fitted calibration, softmax.
-- Concurrency limits, upstream timeouts, connection reuse.
-- HMAC-SHA256 response signing and Prometheus metrics.
+- Tournament/permute scheduling, serialized native forwards, and usage accounting.
 
 ## Architecture
 
 ```text
-                    ┌──────────────────────────── jev-engine ───────────────────────────┐
- client ──HTTP────▶ │ axum router                                                       │
-                    │  ├─ GET  /health, /v1/models, /v1/decide/info, /metrics            │
-                    │  ├─ POST /v1/decide ──▶ DecisionEngine ──▶ Upstream ──┐            │
-                    │  │       prompt + label ids + head math              │            │
-                    │  ├─ POST /v1/decisions ─▶ DecisionEngine ────────────┤            │
-                    │  ├─ POST /v1/chat/completions ─▶ passthrough ────────┤            │
-                    │  ├─ POST /v1/completions ─────▶ passthrough ────────┤            │
-                    │  └─ middleware: HMAC signing, HTTP/upstream metrics  │            │
-                    └──────────────────────────────────────────────────────┼────────────┘
-                                                                           │ semaphore + keep-alive
-                                                                           ▼
-                                                    vLLM 0.31.0  (AWQ W4A16, GPU 1)
-                                                    /v1/completions, /v1/chat/completions
+                    ┌────────────────────── jev-engine (one process) ────────────────────┐
+ client ──HTTP────▶ │ axum router                                                        │
+                    │  ├─ GET  /health, /v1/models, /v1/decide/info, /metrics             │
+                    │  ├─ POST /v1/decide ──▶ DecisionEngine ──▶ Backend trait            │
+                    │  │       prompt + label ids + head math        │                   │
+                    │  ├─ POST /v1/decisions ─▶ DecisionEngine ──────┤                   │
+                    │  ├─ POST /v1/systemone ─▶ DecisionEngine ──────┤                   │
+                    │  ├─ POST /v1/chat/completions, /v1/completions ── 501              │
+                    │  └─ middleware: HMAC signing, HTTP metrics                         │
+                    │                                          │                         │
+                    │                                          ▼                         │
+                    │                      NativeBackend (tokenizers + jev-native)       │
+                    │                      spawn_blocking + mutex (one forward at a time)│
+                    └──────────────────────────────────────────┼─────────────────────────┘
+                                                               ▼
+                                          GPU 1: AWQ W4A16 packed weights resident,
+                                          custom CUDA kernels + cuBLAS BF16 GEMM
 ```
 
-One shared `reqwest::Client` (rustls, keep-alive) is used for every upstream request. A
-`tokio::sync::Semaphore` bounds concurrent upstream calls, including the parallel passes of
-`tournament` and `permute`. There is no unbounded `tokio::spawn`.
+Everything decoded or generated is produced locally. The HTTP server is CPU-side; the
+native engine selects GPU 1 through `CUDA_VISIBLE_DEVICES=1` and opens ordinal 0 of the
+visible set.
+
+### Backends
+
+- `native` (feature `native`, shipped): in-process `jev_native::Engine`. Loads
+  `/srv/models/jev-awq/awq-w4a16-v2`, uploads the packed W4A16 decoder weights once
+  (`preload_all`), and keeps them resident.
+- `MockBackend` (always compiled): deterministic test backend used by unit and
+  integration tests. No GPU or native crate needed.
+
+`cargo test` builds against the mock only. `cargo build --release --features native`
+builds the shipped binary.
 
 ### Exactness details
 
@@ -61,108 +63,143 @@ These are not cosmetic; each one changes the prompt or the distribution:
   are identical to the Python reference.
 - Label ids are derived with the real tokenizer using the reference's single-token rule.
   Startup fails if the first 16 ids are not the decision head's trained A-P verbalizers.
-- Prompt bytes, option lines, image part placement, and the raw chat template are ported
-  directly from `decide_shim.py`.
+- Prompt bytes and option lines are ported directly from `decide_shim.py`.
+- The native engine returns raw logits for the requested head token ids. Raw logits and
+  log-probabilities differ by a constant `log Z`; the head softmax normalizer cancels it,
+  so the existing bias/temperature/fitted-calibration math is unchanged.
 
 ## Repository layout
 
 ```text
 src/
-  main.rs       CLI, tracing, startup, graceful shutdown
-  api.rs        axum routes, request/response types, decisions mapping, proxy, middleware
-  engine.rs     single / tournament / permute strategies and usage accounting
-  head.rs       decision_head.json + calibration.json loading, bias/temperature/softmax
-  prompt.rs     label table, _parts, build_content, RAW_TEMPLATE, tokenizer loading
-  pyjson.rs     CPython-compatible JSON/str/truthiness rendering
-  rng.rs        CPython-compatible MT19937 and `random.sample` permutations
-  upstream.rs   vLLM client, logprob parsing, streaming proxy, concurrency limiter
-  config.rs     environment configuration and defaults
-  error.rs      upstream errors and structured API errors
-  telemetry.rs  Prometheus recorder installation
+  main.rs           CLI, tracing, startup, graceful shutdown, --native-check
+  api.rs            axum routes, request/response types, decisions mapping, middleware
+  backend.rs        Backend trait + MockBackend
+  native_backend.rs jev-native + tokenizers adapter (spawn_blocking, serialized forwards)
+  engine.rs         single / tournament / permute strategies and usage accounting
+  head.rs           decision_head.json + calibration.json loading, bias/temperature/softmax
+  prompt.rs         label table, _parts, build_content, tokenizer loading
+  pyjson.rs         CPython-compatible JSON/str/truthiness rendering
+  rng.rs            CPython-compatible MT19937 and `random.sample` permutations
+  config.rs         environment configuration and defaults
+  error.rs          backend errors and structured API errors
+  telemetry.rs      Prometheus recorder installation
+native/             custom CUDA/cuBLAS engine (workspace member)
 tests/
-  integration.rs          mock-vLLM end-to-end tests (noul/choice/score/image/signing/proxy)
-  fixtures/               tiny tokenizer + real decision-head metadata (no weights)
-eval/                     independent Python harness, baselines, offline mock
-scripts/                  GPU 1 vLLM launch, server run, smoke, full eval
-docs/SPEC.md              API contract, math, and edge cases
-docs/RESULTS.md           measured exactness, drift, benchmarks, GPU saturation
-docs/KERNELS.md           SM89 kernel selection and alternatives
-docs/DEPLOY.md            one-GPU deployment, ports, health, restart
+  integration.rs    mock-backend end-to-end tests
+  native_smoke.rs   one real GPU forward, ignored by default
+  fixtures/         tiny tokenizer + real decision-head metadata (no weights)
+eval/               independent Python harness, saved baselines, offline mock
+scripts/            native smoke, server run, smoke, evaluation
+docs/SPEC.md        API contract, math, and edge cases
+docs/RESULTS.md     correctness evidence; native benchmarks pending
+docs/KERNELS.md     native SM89 kernel stack
+docs/DEPLOY.md      one-GPU deployment, ports, health, restart
 ```
 
 ## Build and run
 
-Prerequisites: stable Rust with edition 2024 support (see `rust-toolchain.toml`), and a
-reachable vLLM backend.
+Build prerequisites:
+
+- Stable Rust with edition 2024 support (see `rust-toolchain.toml`).
+- CUDA toolkit `nvcc` at build time for the native kernels, or Docker so `native/build.rs`
+  can compile them in a container (`JEV_NVCC`, `JEV_CUDA_IMAGE`).
+
+Runtime prerequisites (no toolkit needed):
+
+- NVIDIA driver exposing `libcuda.so.1`.
+- `libcublas.so.13` and `libcublasLt.so.13` (CUDA 13). Point `JEV_CUDA_LIBS` at their
+  directory if they are not on the loader path.
+- RTX 4090 / sm_89.
 
 ```bash
-cargo build --release
-cargo test
+cargo test                                    # mock backend; no GPU
 cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
+cargo build --release --features native
 ```
 
-Validate tokenizer/head/calibration without serving:
+Validate tokenizer/head/calibration without touching the GPU:
 
 ```bash
 cargo run --release -- --check-config
 ```
 
+`--check-config` loads the real tokenizer and decision head, derives the wide-choice
+labels with the reference single-token rule, asserts the first 16 ids equal
+`decision_head.verbalizer_ids[8:24]`, prints the resolved paths and temperatures, and
+exits. It does **not** load the native engine.
+
+Run one real forward on GPU 1, then exit:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 \
+JEV_CUDA_LIBS=/path/to/cublas \
+cargo run --release --features native -- --native-check
+```
+
+or use the ignored integration smoke test:
+
+```bash
+JEV_CUDA_LIBS=/path/to/cublas ./scripts/native-smoke.sh
+```
+
 Run the server:
 
 ```bash
-JEV_VLLM_URL=http://127.0.0.1:8002 \
-JEV_CHECKPOINT=/srv/models/jev-awq/awq-w4a16-v2 \
+CUDA_VISIBLE_DEVICES=1 \
+JEV_NATIVE_MODEL=/srv/models/jev-awq/awq-w4a16-v2 \
 JEV_BIND_ADDR=0.0.0.0:8080 \
-JEV_MAX_CONCURRENCY=8 \
-JEV_REQUEST_TIMEOUT_SECS=600 \
 JEV_SIGNING_KEY="$(cat /run/secrets/jev-signing-key)" \
 ./target/release/jev-engine
 ```
 
-`--check-config` prints the resolved paths, label count, temperatures, and the derived
-256 choice label ids, then exits. Startup always performs the same validation and refuses
-to serve on a tokenizer/head mismatch.
+or `./scripts/run-native.sh` (sets `CUDA_VISIBLE_DEVICES=1`, builds with
+`--features native`, default bind `0.0.0.0:8501`).
 
 ## Deployment assets
 
-- `scripts/run-vllm.sh` — disposable GPU 1 test backend on port 8002, with health wait.
-- `scripts/run-server.sh` — build and run the Rust server (default `0.0.0.0:8501`).
+- `scripts/run-native.sh` — build and run the native-backend server (GPU 1).
+- `scripts/native-smoke.sh` — one real forward against the AWQ checkpoint.
+- `scripts/run-server.sh` — compatibility wrapper around `run-native.sh`.
 - `scripts/smoke.sh` — health/models/info plus one real decision.
-- `scripts/run-eval.sh` — exactness, saved-baseline suite, bench, and functional checks.
-- `Dockerfile` — multi-stage server image; no weights.
-- `docker-compose.yml` — server only, model mounted read-only, host vLLM via `host.docker.internal`.
-- `eval/` — independent Python evaluation harness and saved baselines.
-- `docs/DEPLOY.md` — GPU selection, ports, health checks, restart, and troubleshooting.
-- `docs/RESULTS.md` — measured exactness, baseline drift, benchmarks, and GPU saturation.
-- `docs/KERNELS.md` — selected SM89 kernels and why they are the best available.
+- `scripts/run-eval.sh` — saved-baseline suite, benchmark, functional and signing checks.
+- `Dockerfile` — CUDA devel builder + CUDA runtime image; no weights.
+- `docker-compose.yml` — one process, model mounted read-only, GPU 1 reserved.
+- `eval/` — independent Python evaluation harness and saved baselines (dev tooling).
+- `docs/` — contract, kernel stack, results, deployment.
 
-The Rust server uses no GPU. The test backend uses GPU 1 only; GPU 0 is not used by this
-stack.
+GPU 0 is not used by this stack. Inside a container, reserve GPU 1
+(`--gpus '"device=1"'` or the Compose reservation) and do not set
+`CUDA_VISIBLE_DEVICES` yourself: the runtime exposes the selected device as ordinal 0.
 
 ## Configuration
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `JEV_BIND_ADDR` | `0.0.0.0:8080` | Listen address. |
-| `JEV_VLLM_URL` | `http://127.0.0.1:8002` | vLLM base URL; trailing `/` is removed. |
-| `JEV_VLLM_MODEL` | `jev-awq` | Model name sent upstream. |
-| `JEV_MODEL` | — | Alias for `JEV_VLLM_MODEL` when that is unset. |
-| `JEV_CHECKPOINT` | `/srv/models/jev-awq/awq-w4a16-v2` | AWQ artifact directory. |
+| `JEV_MODEL` | `jev-awq` | Model id returned by `/v1/models`. |
+| `JEV_CHECKPOINT` | `/srv/models/jev-awq/awq-w4a16-v2` | Artifact with tokenizer/head/calibration. |
+| `JEV_NATIVE_MODEL` | `$JEV_CHECKPOINT` | Checkpoint opened by the native engine. |
+| `JEV_NATIVE_CACHE` | `true` | Keep packed decoder weights resident on the GPU. |
+| `JEV_NATIVE_FUSED_W4A16` | `false` | Use the fused W4A16 kernel when available; the default correctness path dequantizes + cuBLAS BF16 GEMM. |
 | `JEV_TOKENIZER` | checkpoint `tokenizer.json` | Tokenizer file or directory override. |
 | `JEV_CALIBRATION` | discovered | `calibration.json` override. |
 | `JEV_CALIBRATION_FITTED` | unset | Optional `fit_bias.py` output. Unset/absent disables it. |
 | `JEV_HF_SNAPSHOT` | `.../snapshots/ba3f0d58...` | Fallback for artifacts missing from the AWQ dir. |
-| `JEV_MAX_CONCURRENCY` | `8` | Max concurrent upstream HTTP requests (semaphore). |
-| `JEV_REQUEST_TIMEOUT_SECS` | `600` | Per-upstream decision request timeout. Timeouts become HTTP 504. |
-| `JEV_CONNECT_TIMEOUT_SECS` | `10` | TCP connect timeout. |
+| `JEV_MAX_CONCURRENCY` | `8` | Max concurrent decision passes (forwards are serialized by the engine). |
 | `JEV_SIGNING_KEY` | unset | Enables `x-jev-signature`; empty string disables. |
 | `JEV_METRICS_ENABLED` | `true` | Install the Prometheus recorder. |
-| `JEV_MAX_BODY_BYTES` | `67108864` | Axum request body limit (images as data URLs). |
+| `JEV_MAX_BODY_BYTES` | `67108864` | Axum request body limit. |
 | `JEV_SERVED_IDENTITY` | `autotrust/JEV-27B-VL@ba3f0d58+awq-w4a16` | `model` returned by `/v1/systemone`. |
+| `JEV_CUDA_LIBS` | unset | Directory prepended to `LD_LIBRARY_PATH` for `libcublas.so.13`/`libcublasLt.so.13`. |
+| `CUDA_VISIBLE_DEVICES` | `1` in launch scripts | Selects GPU 1 before the native engine opens ordinal 0. |
 | `RUST_LOG` | `jev_engine=info` | `tracing-subscriber` filter. |
 
-Calibration discovery order, relative to the checkpoint then the HF snapshot:
+`JEV_NATIVE_DEVICE` is not used: the native API opens ordinal 0 of the visible set, so
+device selection is done before process start with `CUDA_VISIBLE_DEVICES`.
+
+Head/calibration discovery order, relative to the checkpoint then the HF snapshot:
 
 1. `<checkpoint>/decision_head/decision_head.json`
 2. `<checkpoint>/adapter_vllm/decision_head.json`
@@ -170,22 +207,22 @@ Calibration discovery order, relative to the checkpoint then the HF snapshot:
 4. the same names under `JEV_HF_SNAPSHOT`
 
 Calibration follows the same pattern with `decision_head/calibration.json` then
-`calibration.json`. The production artifact at `/srv/models/jev-awq/awq-w4a16-v2` resolves
-to `decision_head/decision_head.json` and `decision_head/calibration.json`.
+`calibration.json`. `adapter_vllm` is an existing directory name in the artifact, not a
+runtime dependency.
 
 ## Endpoints
 
 | Method | Path | Purpose |
 |---|---|---|
 | `GET` | `/health` | Liveness and public model name. |
-| `GET` | `/v1/models` | `autotrust/JEV-27B-VL`, `autotrust/JEV-27B`, and the upstream id. |
+| `GET` | `/v1/models` | `autotrust/JEV-27B-VL`, `autotrust/JEV-27B`, and the configured id. |
 | `GET` | `/v1/decide/info` | Protocol, max options, native 16, temperatures, default strategy. |
 | `GET` | `/metrics` | Prometheus text exposition. |
 | `POST` | `/v1/decide` | JEV native decision (`noul`, `score`, `choice`). |
 | `POST` | `/v1/decisions` | OpenAI Decisions API shape (`predicate`, `choice`, `score`). |
-| `POST` | `/v1/systemone` | xPNP hosted System One (`noul`/`choice`, text or one image). |
-| `POST` | `/v1/chat/completions` | Transparent vLLM passthrough, model rewritten. |
-| `POST` | `/v1/completions` | Transparent vLLM passthrough, model rewritten. |
+| `POST` | `/v1/systemone` | xPNP hosted System One (`noul`/`choice`, text only). |
+| `POST` | `/v1/chat/completions` | **501** — native generation not implemented. |
+| `POST` | `/v1/completions` | **501** — native generation not implemented. |
 
 Examples:
 
@@ -199,11 +236,6 @@ curl -s http://127.0.0.1:8080/v1/decide \
   -d '{"kind":"choice","state":"screenshot text","question":"Pick the best category",
        "options":["billing","abuse","spam"],"strategy":"auto"}'
 
-curl -s http://127.0.0.1:8080/v1/decide \
-  -H 'content-type: application/json' \
-  -d '{"kind":"choice","state":["look at this",{"image":"data:image/png;base64,..."}],
-       "question":"Is the receipt visible?","options":["no","yes"]}'
-
 curl -s http://127.0.0.1:8080/v1/systemone \
   -H 'content-type: application/json' \
   -d '{"state":"Customer: my card was charged twice.",
@@ -212,10 +244,9 @@ curl -s http://127.0.0.1:8080/v1/systemone \
                             "criteria":{"billing":"charges","support":"bugs","sales":"pricing"}}}}'
 ```
 
-Image states mix text and at most one image; `{"image": "..."}` and OpenAI
-`{"type":"image_url","image_url":{"url":"..."}}` parts are both accepted. Image decisions go
-to vLLM `/v1/chat/completions` with the reference raw template and
-`add_generation_prompt: false`.
+Text decisions are the supported surface. Any state containing an image part is rejected
+with **400** (`native vision not implemented`); no image is proxied anywhere. Generation
+endpoints return **501** with an OpenAI-shaped `not_implemented_error` envelope.
 
 ## Strategies
 
@@ -223,12 +254,16 @@ to vLLM `/v1/chat/completions` with the reference raw template and
 
 - `auto` is `tournament`; for choices of 16 or fewer, every strategy degrades to a single
   pass (the reference behavior). `adaptation` reports `native` for those cases.
-- `single` sends one 1-token read-out over all options (up to 256 ids, chunked by 128).
-- `tournament` splits options into `ceil(n/16)` near-equal groups, reads each group, keeps the
-  winner of each group plus the best remaining options up to 16, runs one final 16-way pass,
-  and combines group and final distributions using the reference formula.
+- `single` runs one read-out over all options (up to 256 ids).
+- `tournament` splits options into `ceil(n/16)` near-equal groups, reads each group, keeps
+  the winner of each group plus the best remaining options up to 16, runs one final 16-way
+  pass, and combines group and final distributions using the reference formula.
 - `permute` runs the identity order plus three CPython-compatible shuffles seeded by
   `crc32(question)` and averages the mapped-back probabilities.
+
+Passes are issued concurrently by the async layer but the native engine serializes
+forwards through a mutex. A wide choice therefore costs several sequential forwards; the
+scheduler still bounds outstanding work with `JEV_MAX_CONCURRENCY`.
 
 See `docs/SPEC.md` for the exact equations.
 
@@ -242,10 +277,10 @@ x-jev-signature: sha256=<hex HMAC-SHA256 over the exact response body bytes>
 ```
 
 This includes `/v1/decide/info` and error responses on those paths. `/health`, `/metrics`,
-`/v1/models`, and the passthrough routes are not signed. The signature is calculated after
-the body is produced and before it is sent; `content-type` is preserved.
+`/v1/models`, and the 501 generation routes are not signed. The signature is calculated
+after the body is produced and before it is sent; `content-type` is preserved.
 
-Verify with Python:
+Verify with Python (tooling only, not runtime):
 
 ```python
 import hashlib, hmac
@@ -253,102 +288,82 @@ expected = "sha256=" + hmac.new(key, body, hashlib.sha256).hexdigest()
 assert expected == headers["x-jev-signature"]
 ```
 
-## Correctness and evaluation
+## Tests and evaluation
 
 ```bash
-cargo test
-cargo run --release -- --check-config
+cargo test                                    # 31 unit + 7 integration, mock backend
+cargo build --release --features native
+JEV_CUDA_LIBS=/path/to/cublas ./scripts/native-smoke.sh
 ```
 
-`--check-config` is the important production check:
+- Unit tests cover the exact text prompt, image-part parsing/rejection,
+  Python-compatible JSON rendering, label derivation, bias/temperature/softmax, fitted
+  calibration, CRC32 + MT19937 permutations, and tournament math.
+- Integration tests use `MockBackend` and exercise noul/choice/score, tournament/permute
+  pass counts, `/v1/decisions`, xPNP System One validation, signing, 400/501/502/504
+  semantics, and malformed JSON.
+- `native_smoke.rs` is `#[ignore]` and runs one real forward when the checkpoint and GPU
+  are available.
+- `--check-config` validates tokenizer/head/calibration without a GPU.
 
-- Loads the real tokenizer and decision head.
-- Derives the wide-choice labels with the reference single-token rule.
-- Asserts that the first 16 ids equal `decision_head.verbalizer_ids[8:24]`.
-- Prints `max_options` (256 with the production Qwen tokenizer).
-
-Unit tests cover the exact text prompt, image part placement, Python-compatible JSON
-rendering, label derivation, bias/temperature/softmax, fitted calibration, CRC32 + MT19937
-permutation vectors generated from CPython, tournament grouping/combination, and logprob
-parsing.
-
-Integration tests spin up a mock vLLM (axum) and exercise noul/choice/score, tournament and
-permute request counts, image chat-completions requests, OpenAI decisions mapping, xPNP
-System One (noul/choice/image/validation), model rewriting, streaming passthrough, signing,
-400/502/504 semantics, and malformed JSON.
-
-To evaluate against the Python reference or a saved baseline, use the independent harness
-in `eval/` (no model import, no GPU control):
-
-```bash
-cd eval
-python3 -m pip install -r requirements.txt
-python3 smoke_test.py -v          # offline mock; no server required
-```
-
-With vLLM on `127.0.0.1:8002` and the Rust server on `127.0.0.1:8501` already running:
+To evaluate a running server against the saved production-v2 baseline:
 
 ```bash
 ./scripts/run-eval.sh
 ```
 
-It runs the direct-vLLM exactness check, the saved-v2 baseline comparison (strict and
-documented-tolerance variants), the combined benchmark, functional checks (256 choices,
-`/v1/decisions`, image), optional signing (set `JEV_EVAL_SIGNING_KEY`), and writes reports
-to `eval/out/`. It never starts or stops GPU services.
+It runs the saved-baseline comparison (strict and documented-tolerance variants), the
+combined benchmark, functional checks (256 choices, `/v1/decisions`), optional signing
+(set `JEV_EVAL_SIGNING_KEY`), and writes reports to `eval/out/`. It never starts or stops
+GPU services.
 
-Measured live results (2026-10-19):
+### Measured results
 
-- Rust `/v1/decide` vs a direct vLLM logprob read-out: **28/28**, max delta **4.44e-16**,
-  mean KL **3.53e-18**, 0 errors.
-- Vs the saved production-v2 baseline: top-1 **28/28**, mean KL **1.505e-5**, mean MAE
-  **6.83e-4**, max delta **4.933e-3** (`r22`), 0 errors. The gap is deterministic serving
-  drift; the documented cross-build tolerance is **0.01**, while the strict `1e-3` gate
-  fails by design.
-- Benchmarks: 512 short + 32 long requests, **0 errors**; short throughput plateaus at
-  **34.2 req/s** (c8); long prefill sustains **3,077-3,188 tok/s**.
-- Functional: 256-option choice (17 requests, 1.08 s), `/v1/decisions`, 512x512 image,
-  and HMAC signing all pass.
+Correctness (native engine, from `native/README.md`, validated against CPU golden data):
 
-See [`docs/RESULTS.md`](docs/RESULTS.md) for tables and [`eval/README.md`](eval/README.md)
-for exact commands and tolerance rationale. Kernel selection is documented in
-[`docs/KERNELS.md`](docs/KERNELS.md).
+- AWQ 27B layer outputs: cosine ≥ **0.99995**; final norm **0.9999221**; full logits
+  **0.9999969**.
+- Top-1 token and last logit identical to golden (`867`, `3.578125`); two-way softmax
+  **0.8568** vs golden **0.8559**.
+- Merged-BF16 tiny model: every stage at the bf16 rounding floor.
 
-Manual comparison remains possible by sending identical bodies to the shim and the Rust
-front and comparing `probabilities`, `choice`, `adaptation`, and usage. Prompt bytes and
-label ids should match exactly; `permute` uses the same four option orders as Python, so a
-difference there is a real regression rather than RNG drift.
+Server throughput and latency under concurrent API load are **not yet benchmarked**.
+Single-forward native measurements on GPU 1 with resident packed weights
+(`native/README.md`) are:
 
-(`localhost:8500` is the existing Python shim; do not expose it to the internet in place of
-the signed Rust front.)
+| prompt | reference path (dequant + cuBLAS) | fused `JEV_NATIVE_FUSED_W4A16=true` |
+|---|---|---|
+| 36 tokens | 176.6 ms (first request 267 ms) | 405 ms |
+| 76 tokens | 202.9 ms | 460 ms |
+| 1024 tokens | 1277.6 ms | 2689 ms |
+
+Preload is **5.8 s** (12.4 GiB packed weights resident); init is 0.2 s. During the
+36-token reference run the GPU was at 100% utilization and ~231 W peak. Outputs are
+bit-identical to the streaming path, and the golden checks are unchanged.
+
+The fused W4A16 kernel is numerically correct but slower than dequantize-to-BF16 +
+cuBLAS on this workload, so it stays off by default. The server adds tokenization, head
+math, and JSON on top of these forward times.
+
+Live API comparison against the saved AWQ v2 baseline (28 rows, release binary on GPU 1):
+top-1 **28/28**, mean KL **4.50e-5**, mean MAE **1.143e-3**, max delta **9.734e-3**.
+These deltas are cross-engine BF16 numerical drift, not API differences. The acceptance
+run uses `max_mae 0.0025` / `max_delta 0.01`; the strict `max_mae 0.0005` run is recorded
+and expected to fail. See `docs/RESULTS.md` for per-kind tables. Run
+`scripts/run-eval.sh` against a deployed server to reproduce the comparison and benchmark;
+do not reuse the old vLLM-front throughput claims.
 
 ## One-GPU deployment example (GPU 1 only)
 
-The Rust process needs no GPU. GPU work belongs exclusively to the separately managed vLLM
-test instance on **GPU 1**, listening on the test port **8002**. Do not touch the production
-stack's ports (`8001`, `8500`) or its model directory.
+The HTTP server is CPU-side; the native engine uses **GPU 1** inside the same process.
+Do not touch the production stack's ports (`8001`, `8500`) or its model directory.
 
 ```bash
-# Terminal 1: the test backend, GPU 1 only, port 8002.
-# This command is illustrative; vLLM lifecycle is owned by the deployment tooling.
-CUDA_VISIBLE_DEVICES=1 vllm serve /srv/models/jev-awq/awq-w4a16-v2 \
-  --served-model-name jev-awq \
-  --host 127.0.0.1 --port 8002 \
-  --logprobs-mode processed_logprobs \
-  --max-model-len 16384 \
-  --enable-prefix-caching \
-  --mamba-cache-mode align \
-  --limit-mm-per-prompt '{"image": 1}' \
-  --max-num-seqs 8 \
-  --trust-request-chat-template \
-  --gpu-memory-utilization 0.95 \
-  --kv-cache-dtype fp8
-
-# Terminal 2: the Rust front.
-export JEV_VLLM_URL=http://127.0.0.1:8002
+export CUDA_VISIBLE_DEVICES=1
+export JEV_NATIVE_MODEL=/srv/models/jev-awq/awq-w4a16-v2
 export JEV_CHECKPOINT=/srv/models/jev-awq/awq-w4a16-v2
 export JEV_BIND_ADDR=0.0.0.0:8080
-export JEV_MAX_CONCURRENCY=8
+export JEV_CUDA_LIBS=/path/to/cublas
 export JEV_SIGNING_KEY="$(cat /run/secrets/jev-signing-key)"
 exec ./target/release/jev-engine
 ```
@@ -357,17 +372,19 @@ Example systemd unit:
 
 ```ini
 [Unit]
-Description=JEV decision server (Rust front for vLLM)
+Description=JEV decision server (native CUDA backend)
 After=network-online.target
 
 [Service]
 Type=simple
 User=jev
 WorkingDirectory=/opt/jev-engine
-Environment=JEV_VLLM_URL=http://127.0.0.1:8002
+Environment=CUDA_VISIBLE_DEVICES=1
+Environment=JEV_NATIVE_MODEL=/srv/models/jev-awq/awq-w4a16-v2
 Environment=JEV_CHECKPOINT=/srv/models/jev-awq/awq-w4a16-v2
 Environment=JEV_BIND_ADDR=0.0.0.0:8080
-Environment=JEV_MAX_CONCURRENCY=8
+# Optional: directory with libcublas.so.13 / libcublasLt.so.13.
+#Environment=JEV_CUDA_LIBS=/opt/cuda-libs
 # Provide JEV_SIGNING_KEY through this mode-0600 file (or a systemd credential),
 # never on the command line. Remove the line to run unsigned.
 EnvironmentFile=-/etc/jev-engine/env
@@ -388,26 +405,30 @@ WantedBy=multi-user.target
 
 ## Performance notes
 
-- Every decision read-out asks for exactly **one token** (`max_tokens: 1`). Latency is
-  dominated by prompt prefill, not decode.
-- Wide choices multiply prefill work: a 256-option tournament makes 16 group passes plus one
-  final pass; a permute makes 4 passes. Passes run concurrently but are bounded by
-  `JEV_MAX_CONCURRENCY` and share the same semaphore as normal traffic.
-- Use `JEV_MAX_CONCURRENCY` at or below vLLM's `--max-num-seqs` so the front does not queue
-  work the backend cannot batch. Keep-alive avoids a TCP/TLS setup per pass.
-- vLLM prefix caching helps because every pass repeats the same state/question prefix with a
-  different option block.
-- Rust overhead is small relative to prefill; the measurable levers are option count,
-  strategy, prompt length, and backend batch capacity.
+- The native engine loads all packed decoder weights once at startup (~12.4 GiB, ~5.8 s
+  preload) and keeps them resident. First request latency does not include a checkpoint
+  upload.
+- One forward produces one decision read-out position. Latency is dominated by prefill;
+  nothing is decoded. Single-forward measurements: 176.6 ms (36 tokens), 202.9 ms
+  (76 tokens), 1277.6 ms (1024 tokens).
+- Wide choices multiply forwards: a 256-option tournament makes 16 group passes plus one
+  final pass; a permute makes 4 passes. The engine serializes them, so `permute` and
+  `tournament` scale roughly linearly with pass count.
+- The `single` strategy is the lowest-latency option for ≤16 choices.
+- `JEV_NATIVE_FUSED_W4A16=true` selects the fused kernel. It is numerically correct but
+  slower than the default dequant + cuBLAS path on this GPU/workload (405 vs 176.6 ms at
+  36 tokens), so keep it off unless a new kernel changes that.
+- The default path dequantizes each module into a BF16 workspace and uses cuBLAS BF16
+  GEMM.
 
 Prometheus metrics exposed:
 
 - `jev_http_requests_total{method,path,status}`
 - `jev_http_request_duration_seconds{path}`
 - `jev_http_requests_in_flight`
-- `jev_upstream_requests_total{endpoint,status}`
-- `jev_upstream_request_duration_seconds{endpoint}`
-- `jev_upstream_tokens_total{direction}`
+- `jev_backend_requests_total{status}`
+- `jev_backend_forward_seconds`
+- `jev_backend_prompt_tokens_total`
 - `jev_decide_total{kind,strategy}`
 - `jev_decide_options`, `jev_decide_pass_options`
 - `jev_decisions_total{kind}`
@@ -415,21 +436,21 @@ Prometheus metrics exposed:
 
 ## Behavioral notes and intentional differences
 
-- Upstream vLLM 4xx/5xx responses are surfaced as structured **502**; upstream timeouts as
-  **504**; request validation stays **400**. The Python shim propagated the upstream status
-  directly.
-- `/v1/decide` additionally reports `confidence` (the top probability), as requested for this
-  service. The Python shim omits it.
+- Native engine failures are surfaced as structured **502**; backend timeouts as **504**;
+  request validation stays **400**.
+- Image states return **400** (`native vision not implemented`).
+- `/v1/chat/completions` and `/v1/completions` return **501**
+  (`native generation not implemented`). They never proxy to another process.
+- `/v1/decide` additionally reports `confidence` (the top probability), as requested for
+  this service. The Python shim omits it.
 - `/v1/systemone` is ported from the shim's xPNP handler: one pass per question, no
-  tournament/permute, at most 8 questions, `noul`/`choice` only, and one image maximum.
-- Image states are rejected client-side with 400 when more than one image is present.
+  tournament/permute, at most 8 questions, `noul`/`choice` only, text only.
 - Optional fitted calibration is applied to raw head logits exactly like the shim. If a fit
-  file supplies fewer biases than the served option count (the shipped fit covers 9 choice
-  slots, while serving allows 16-256), missing entries are treated as zero rather than
-  panicking.
-- Response JSON key order and error envelopes are stable but not byte-identical to FastAPI's
-  `{"detail": ...}`; signed consumers should verify the signature over whatever body is
-  returned.
+  file supplies fewer biases than the served option count, missing entries are treated as
+  zero rather than panicking.
+- Response JSON key order and error envelopes are stable but not byte-identical to
+  FastAPI's `{"detail": ...}`; signed consumers should verify the signature over whatever
+  body is returned.
 
 See `docs/SPEC.md` for the full contract and edge cases.
 

@@ -1,7 +1,7 @@
-//! Axum application: JEV decision endpoints, OpenAI-compatible decisions, passthrough,
-//! HMAC signing, and Prometheus metrics.
+//! Axum application: JEV decision endpoints, OpenAI-compatible decisions,
+//! HMAC signing, and Prometheus metrics. Generation endpoints return 501.
 
-use std::{path::PathBuf, sync::Arc, time::Instant};
+use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -25,21 +25,24 @@ use uuid::Uuid;
 
 use crate::{
     DEFAULT_STRATEGY, MAX_OPTIONS, NATIVE_CHOICE_OPTIONS, PROTOCOL, PUBLIC_ALIAS, PUBLIC_MODEL,
+    backend::Backend,
     config::Config,
     engine::{DecisionEngine, Kind, Strategy, Usage},
     error::{ApiError, EngineError},
-    head::{self, FittedKind},
+    head::{self, DecisionHead, FittedKind, Temperatures},
     prompt::{self, LABEL_CONTEXT},
-    upstream::Upstream,
 };
 
 const SIGNATURE_HEADER: &str = "x-jev-signature";
 const SIGNATURE_BODY_LIMIT: usize = 128 * 1024 * 1024;
+const GENERATION_UNSUPPORTED: &str =
+    "native generation not implemented: this server exposes decision endpoints only";
 
 /// Startup diagnostics, also printed by `--check-config`.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct LoadReport {
     pub checkpoint: PathBuf,
+    pub native_model: PathBuf,
     pub tokenizer: PathBuf,
     pub head: PathBuf,
     pub calibration: PathBuf,
@@ -47,9 +50,73 @@ pub struct LoadReport {
     pub max_options: usize,
     pub native_choice_options: usize,
     pub temperatures: Value,
-    pub vllm_url: String,
-    pub model: String,
+    pub backend: String,
     pub signing_enabled: bool,
+}
+
+/// Everything loaded from disk that shapes probabilities, without an inference
+/// backend. `--check-config` stops here; `serve` adds the native engine.
+pub struct Metadata {
+    pub head: DecisionHead,
+    pub temperatures: Temperatures,
+    pub fitted: Option<HashMap<String, FittedKind>>,
+    pub label_ids: Vec<u32>,
+    pub report: LoadReport,
+}
+
+/// Load and validate the tokenizer, decision head, calibration, and labels.
+pub fn load_metadata(config: &Config) -> Result<Metadata> {
+    let loaded = head::load(
+        &config.checkpoint,
+        config.calibration.as_deref(),
+        config.calibration_fitted.as_deref(),
+        &config.hf_snapshot,
+    )
+    .with_context(|| {
+        format!(
+            "loading decision head/calibration from {} (HF fallback {})",
+            config.checkpoint.display(),
+            config.hf_snapshot.display()
+        )
+    })?;
+    let (tokenizer, tokenizer_path) = prompt::load_tokenizer(
+        &config.checkpoint,
+        config.tokenizer.as_deref(),
+        &config.hf_snapshot,
+    )?;
+    let label_ids = prompt::derive_label_ids(&tokenizer, LABEL_CONTEXT, MAX_OPTIONS)?;
+    prompt::validate_label_parity(&label_ids, &loaded.head)?;
+    if label_ids.len() < MAX_OPTIONS {
+        tracing::warn!(
+            labels = label_ids.len(),
+            "tokenizer yields fewer than 256 wide-choice labels; max_options is reduced"
+        );
+    }
+    if label_ids.len() < 2 {
+        bail!("tokenizer must yield at least 2 single-token labels");
+    }
+
+    let native_choice_options = loaded.head.choice[1] - loaded.head.choice[0];
+    let report = LoadReport {
+        checkpoint: config.checkpoint.clone(),
+        native_model: config.native_model.clone(),
+        tokenizer: tokenizer_path,
+        head: loaded.head_path.clone(),
+        calibration: loaded.calibration_path.clone(),
+        fitted: loaded.fitted_path.clone(),
+        max_options: label_ids.len().min(MAX_OPTIONS),
+        native_choice_options,
+        temperatures: loaded.temperatures.raw.clone(),
+        backend: "not loaded (check-config)".to_owned(),
+        signing_enabled: config.signing_enabled(),
+    };
+    Ok(Metadata {
+        head: loaded.head,
+        temperatures: loaded.temperatures,
+        fitted: loaded.fitted,
+        label_ids,
+        report,
+    })
 }
 
 #[derive(Clone)]
@@ -62,81 +129,30 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Load and validate the tokenizer, decision head, calibration, and HTTP client.
-    pub fn load(config: Config) -> Result<Self> {
-        let loaded = head::load(
-            &config.checkpoint,
-            config.calibration.as_deref(),
-            config.calibration_fitted.as_deref(),
-            &config.hf_snapshot,
-        )
-        .with_context(|| {
-            format!(
-                "loading decision head/calibration from {} (HF fallback {})",
-                config.checkpoint.display(),
-                config.hf_snapshot.display()
-            )
-        })?;
-        let (tokenizer, tokenizer_path) = prompt::load_tokenizer(
-            &config.checkpoint,
-            config.tokenizer.as_deref(),
-            &config.hf_snapshot,
-        )?;
-        let label_ids = prompt::derive_label_ids(&tokenizer, LABEL_CONTEXT, MAX_OPTIONS)?;
-        prompt::validate_label_parity(&label_ids, &loaded.head)?;
-        if label_ids.len() < MAX_OPTIONS {
-            tracing::warn!(
-                labels = label_ids.len(),
-                "tokenizer yields fewer than 256 wide-choice labels; max_options is reduced"
-            );
-        }
-        if label_ids.len() < 2 {
-            bail!("tokenizer must yield at least 2 single-token labels");
-        }
+    /// Build the application around an inference backend.
+    pub fn load(config: Config, backend: Arc<dyn Backend>) -> Result<Self> {
+        let metadata = load_metadata(&config)?;
+        Ok(Self::from_metadata(config, metadata, backend))
+    }
 
-        let upstream = Arc::new(
-            Upstream::new(
-                config.vllm_url.clone(),
-                config.vllm_model.clone(),
-                config.max_concurrency,
-                config.request_timeout,
-                config.connect_timeout,
-            )
-            .context("building vLLM client")?,
-        );
-
-        let native_choice_options = loaded.head.choice[1] - loaded.head.choice[0];
-        let report = LoadReport {
-            checkpoint: config.checkpoint.clone(),
-            tokenizer: tokenizer_path,
-            head: loaded.head_path.clone(),
-            calibration: loaded.calibration_path.clone(),
-            fitted: loaded.fitted_path.clone(),
-            max_options: label_ids.len().min(MAX_OPTIONS),
-            native_choice_options,
-            temperatures: loaded.temperatures.raw.clone(),
-            vllm_url: config.vllm_url.clone(),
-            model: config.vllm_model.clone(),
-            signing_enabled: config.signing_enabled(),
-        };
-
-        let fitted: Option<Arc<std::collections::HashMap<String, FittedKind>>> =
-            loaded.fitted.map(Arc::new);
+    pub fn from_metadata(config: Config, metadata: Metadata, backend: Arc<dyn Backend>) -> Self {
+        let mut report = metadata.report;
+        report.backend = backend.name().to_owned();
+        let fitted = metadata.fitted.map(Arc::new);
         let engine = Arc::new(DecisionEngine::new(
-            Arc::new(loaded.head),
-            Arc::new(loaded.temperatures),
+            Arc::new(metadata.head),
+            Arc::new(metadata.temperatures),
             fitted,
-            label_ids,
-            upstream,
+            metadata.label_ids,
+            backend,
         ));
-
-        Ok(Self {
+        Self {
             engine,
             signing_key: config.signing_key.clone().map(Arc::new),
             config: Arc::new(config),
             metrics: None,
             load_report: report,
-        })
+        }
     }
 
     pub fn with_metrics(mut self, handle: PrometheusHandle) -> Self {
@@ -175,21 +191,17 @@ async fn health(State(_state): State<AppState>) -> Json<Value> {
 }
 
 async fn models(State(state): State<AppState>) -> Json<Value> {
-    let data: Vec<Value> = [
-        PUBLIC_MODEL,
-        PUBLIC_ALIAS,
-        state.engine.upstream.model.as_str(),
-    ]
-    .into_iter()
-    .map(|name| {
-        json!({
-            "id": name,
-            "object": "model",
-            "created": 0,
-            "owned_by": "autotrust",
+    let data: Vec<Value> = [PUBLIC_MODEL, PUBLIC_ALIAS, state.config.model_id.as_str()]
+        .into_iter()
+        .map(|name| {
+            json!({
+                "id": name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "autotrust",
+            })
         })
-    })
-    .collect();
+        .collect();
     Json(json!({"object": "list", "data": data}))
 }
 
@@ -244,11 +256,10 @@ async fn decide(
     let kind = Kind::parse(&request.kind)
         .ok_or_else(|| ApiError::bad_request("kind must be noul|score|choice"))?;
     prompt::validate_state(&request.state).map_err(ApiError::bad_request)?;
-    let images = prompt::image_count(&request.state);
-    if images > 1 {
-        return Err(ApiError::bad_request(format!(
-            "this backend reads one image per request, got {images}"
-        )));
+    if prompt::image_count(&request.state) > 0 {
+        return Err(ApiError::bad_request(
+            "native vision not implemented: image states are not supported",
+        ));
     }
 
     let max_options = state.engine.max_options();
@@ -334,7 +345,7 @@ async fn decisions(
     let Json(request) = payload.map_err(json_rejection)?;
     let state_text = decisions_state(&request.input)?.ok_or_else(|| {
         ApiError::bad_request(
-            "input_image content parts are not supported: this front is text-only",
+            "native vision not implemented: input_image content parts are not supported",
         )
     })?;
     let state_value = Value::String(state_text);
@@ -705,6 +716,12 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
         Ok(parts) => parts,
         Err(message) => return s1_error(StatusCode::BAD_REQUEST, message),
     };
+    if image.is_some() {
+        return s1_error(
+            StatusCode::BAD_REQUEST,
+            "native vision not implemented: image states are not supported",
+        );
+    }
 
     let mut plans = Vec::with_capacity(questions.len());
     for (name, question) in questions {
@@ -837,10 +854,7 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
                 .unwrap_or_default()
         };
         let mut state_parts = vec![Value::String(plan.state_text.clone())];
-        if let Some(image) = &image {
-            state_parts.push(image.clone());
-        }
-        let state_value = Value::Array(state_parts);
+        let state_value = Value::Array(std::mem::take(&mut state_parts));
         let (probabilities, pass_usage) = match state
             .engine
             .s1_pass(kind, &state_value, &plan.instructions, &options)
@@ -918,52 +932,14 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
     .into_response()
 }
 
-async fn chat_completions(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> Result<Response, ApiError> {
-    proxy(state, "/v1/chat/completions", body).await
+/// The native engine implements decision read-outs only. Generation is not
+/// proxied to any other process.
+async fn chat_completions() -> ApiError {
+    ApiError::not_implemented(GENERATION_UNSUPPORTED)
 }
 
-async fn completions(State(state): State<AppState>, body: Bytes) -> Result<Response, ApiError> {
-    proxy(state, "/v1/completions", body).await
-}
-
-async fn proxy(state: AppState, path: &'static str, body: Bytes) -> Result<Response, ApiError> {
-    let mut value: Value = serde_json::from_slice(&body)
-        .map_err(|error| ApiError::bad_request(format!("invalid JSON body: {error}")))?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| ApiError::bad_request("request body must be a JSON object"))?;
-    object.insert(
-        "model".to_owned(),
-        Value::String(state.engine.upstream.model.clone()),
-    );
-    let streaming = object.get("stream").and_then(Value::as_bool) == Some(true);
-
-    if streaming {
-        return state
-            .engine
-            .upstream
-            .proxy_stream(path, &value)
-            .await
-            .map_err(ApiError::from);
-    }
-
-    let upstream = state
-        .engine
-        .upstream
-        .proxy_json(path, &value)
-        .await
-        .map_err(ApiError::from)?;
-    let mut response = Response::new(Body::from(upstream.body));
-    *response.status_mut() = upstream.status;
-    response.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_str(&upstream.content_type)
-            .unwrap_or_else(|_| HeaderValue::from_static("application/json")),
-    );
-    Ok(response)
+async fn completions() -> ApiError {
+    ApiError::not_implemented(GENERATION_UNSUPPORTED)
 }
 
 fn json_rejection(rejection: JsonRejection) -> ApiError {
