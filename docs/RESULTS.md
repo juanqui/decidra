@@ -94,11 +94,13 @@ measurement files are kept only for drift context.
 - Preload with Marlin: 10.1 s clean, 13.1 GiB resident (10.06 s observed in the gated
   run); 13,358 MiB in-process.
 - Long context, single request (exceeds the 16,384-token batch cap, so it runs alone):
-  **18,653 tokens -> 200 in 9.84 s**, choice `true` (0.988); **35,310 tokens -> 200 in
-  20.15 s**, choice `true` (0.9884); no timeout/OOM. Three repeat runs per size were
-  identical in status/choice and within 0.05 s. One early 17.7K probe returned a single
-  502 (`jev_backend_requests_total{status="error"} 1`); it did not reproduce in six
-  subsequent 16K/32K runs, all 200.
+  **17,668 tokens -> 200 in 9.27-9.38 s**, choice `true`; **35,310 tokens -> 200 in
+  20.15-20.16 s**, choice `true` (0.9884); no timeout/OOM. The verified maximum is
+  **35,310 tokens** on the 24 GB GPU. Stability: **10 consecutive 17.7K runs and 3
+  consecutive 35.3K runs all returned 200 with choice `true`**, and
+  `jev_backend_requests_total{status="error"}` stayed at **0** (no error series
+  exported). One earlier 17.7K probe returned a single 502; it did not reproduce in
+  these 13 runs nor in six prior 16K/32K runs, and the root cause was not captured.
 - Short benchmark, serialized build (16 unique requests/level, gated): c=1
   **16.444 req/s**, p50 **60.9 ms**; c=4 **16.826 req/s**, p50 **225.7 ms**. Throughput
   was flat because forwards were serialized; c=4 latency was queueing.
@@ -151,10 +153,9 @@ CUDA context. Batch formation:
 
 Lone requests pay the window; `JEV_NATIVE_BATCH_WINDOW_US=0` removes it. The default
 2 ms window is the smallest that keeps a lone request near 62 ms p50. The worker
-executes one batch at a time, and `JEV_MAX_CONCURRENCY` is accepted/logged but not
-enforced as a semaphore in this build, so it neither bounds queued passes nor creates
-parallel forwards. Throughput saturates at batch 4; `MAX_BATCH=8` allows a burst to
-drain in one pass, while 12/16 measured no gain and worse p50.
+executes one batch at a time; there is no separate in-flight semaphore, so extra
+concurrency only queues. Throughput saturates at batch 4; `MAX_BATCH=8` allows a burst
+to drain in one pass, while 12/16 measured no gain and worse p50.
 
 Metrics: `jev_native_batch_size`, `jev_native_batch_queue_depth`,
 `jev_native_batch_wait_seconds`, plus the existing `jev_backend_*` counters.

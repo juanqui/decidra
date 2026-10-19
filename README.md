@@ -194,7 +194,6 @@ GPU 0 is not used by this stack. Inside a container, reserve GPU 1
 | `JEV_CALIBRATION` | discovered | `calibration.json` override. |
 | `JEV_CALIBRATION_FITTED` | unset | Optional `fit_bias.py` output. Unset/absent disables it. |
 | `JEV_HF_SNAPSHOT` | `.../snapshots/ba3f0d58...` | Fallback for artifacts missing from the AWQ dir. |
-| `JEV_MAX_CONCURRENCY` | `8` | Accepted and logged but not enforced as a semaphore in this build; forwards are serialized by the engine. |
 | `JEV_SIGNING_KEY` | unset | Enables `x-jev-signature`; empty string disables. |
 | `JEV_METRICS_ENABLED` | `true` | Install the Prometheus recorder. |
 | `JEV_MAX_BODY_BYTES` | `67108864` | Axum request body limit. |
@@ -266,9 +265,9 @@ endpoints return **501** with an OpenAI-shaped `not_implemented_error` envelope.
 - `permute` runs the identity order plus three CPython-compatible shuffles seeded by
   `crc32(question)` and averages the mapped-back probabilities.
 
-Passes are issued concurrently by the async layer but the native engine serializes
-forwards through a mutex. A wide choice therefore costs several sequential forwards; the
-scheduler still bounds outstanding work with `JEV_MAX_CONCURRENCY`.
+Passes are issued concurrently by the async layer but the batch worker serializes
+forwards. A wide choice therefore costs several sequential forwards; passes queue for
+the worker instead of running in parallel.
 
 See `docs/SPEC.md` for the exact equations.
 
@@ -389,9 +388,10 @@ Batch correctness: a batch of one is bit-identical to the single-call path. Batc
 their single-request probabilities by at most **4.2e-5** with identical top-1, and the
 28-row suite max delta is **1.010e-2**, inside the 0.011 gate.
 
-Long context runs alone (it exceeds the 16,384-token batch cap): **18,653 tokens ->
-200 in 9.84 s**, choice `true` (0.988); **35,310 tokens -> 200 in 20.15 s**, choice
-`true` (0.9884); no timeout/OOM.
+Long context runs alone (it exceeds the 16,384-token batch cap): **17,668 tokens ->
+200 in 9.3 s** and **35,310 tokens -> 200 in 20.2 s**, both choice `true` (the 35K
+result is the verified maximum on the 24 GB GPU). Repeated runs (10x 17.7K, 3x 35.3K)
+all returned 200 with zero backend errors and no timeout/OOM.
 
 ## One-GPU deployment example (GPU 1 only)
 
@@ -484,9 +484,6 @@ WantedBy=multi-user.target
 - With Marlin off, `JEV_NATIVE_FUSED_W4A16=true` selects the hybrid fused policy (fused for
   `N >= 5120 && M <= 256`), and the remaining path dequantizes into a BF16 workspace for
   cuBLAS BF16 GEMM.
-- `JEV_MAX_CONCURRENCY` is accepted and logged but not enforced as a semaphore in this
-  build; the batch worker executes one batch at a time, so extra concurrency only
-  queues.
 
 Prometheus metrics exposed:
 

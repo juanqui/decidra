@@ -150,7 +150,6 @@ async fn serve() -> Result<()> {
         head = %state.load_report.head.display(),
         calibration = %state.load_report.calibration.display(),
         max_options = state.load_report.max_options,
-        max_concurrency = state.config.max_concurrency,
         signing = state.config.signing_enabled(),
         metrics = state.config.metrics_enabled,
         "starting jev-engine"

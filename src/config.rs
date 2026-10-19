@@ -8,7 +8,6 @@ pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 pub const DEFAULT_MODEL: &str = "jev-awq";
 pub const DEFAULT_CHECKPOINT: &str = "/srv/models/jev-awq/awq-w4a16-v2";
 pub const DEFAULT_HF_SNAPSHOT: &str = "/srv/models/hf/hub/models--autotrust--JEV-27B-VL/snapshots/ba3f0d584994b37998f235c0a3f6f1beff32ba1e";
-pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 /// Measured throughput saturates at batch 4 (~2,130-2,180 tok/s on ~71-token
 /// requests); 8 is kept so a burst drains in one pass without costing steady
@@ -54,7 +53,6 @@ pub struct Config {
     /// Maximum total prompt tokens per batch (`JEV_NATIVE_MAX_BATCH_TOKENS`).
     /// A single larger request runs alone.
     pub native_max_batch_tokens: usize,
-    pub max_concurrency: usize,
     pub signing_key: Option<Vec<u8>>,
     pub metrics_enabled: bool,
     pub max_body_bytes: usize,
@@ -112,11 +110,6 @@ impl Config {
             native_batch_window_us = 0;
         }
 
-        let max_concurrency = env_usize("JEV_MAX_CONCURRENCY")?.unwrap_or(DEFAULT_MAX_CONCURRENCY);
-        if max_concurrency == 0 {
-            bail!("JEV_MAX_CONCURRENCY must be at least 1");
-        }
-
         let signing_key = match std::env::var("JEV_SIGNING_KEY") {
             Ok(key) if !key.is_empty() => Some(key.into_bytes()),
             _ => None,
@@ -146,7 +139,6 @@ impl Config {
             native_max_batch,
             native_batch_window_us,
             native_max_batch_tokens,
-            max_concurrency,
             signing_key,
             metrics_enabled,
             max_body_bytes,

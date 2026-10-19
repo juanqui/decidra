@@ -27,7 +27,6 @@ services:
       # Fallback only: JEV_NATIVE_MARLIN=false JEV_NATIVE_FUSED_W4A16=true
       JEV_NATIVE_FUSED_W4A16: ${JEV_NATIVE_FUSED_W4A16:-false}
       JEV_BIND_ADDR: 0.0.0.0:8080
-      JEV_MAX_CONCURRENCY: ${JEV_MAX_CONCURRENCY:-8}
       JEV_METRICS_ENABLED: "true"
       # Set in the host environment or a .env file (never commit it).
       JEV_SIGNING_KEY: ${JEV_SIGNING_KEY:-}

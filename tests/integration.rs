@@ -72,7 +72,6 @@ fn test_config() -> Config {
         native_max_batch: 8,
         native_batch_window_us: 2_000,
         native_max_batch_tokens: 16_384,
-        max_concurrency: 4,
         signing_key: None,
         metrics_enabled: false,
         max_body_bytes: 8 * 1024 * 1024,

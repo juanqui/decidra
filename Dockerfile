@@ -64,7 +64,6 @@ ENV JEV_BIND_ADDR=0.0.0.0:8080 \
     JEV_CHECKPOINT=/models/awq-w4a16-v2 \
     JEV_NATIVE_CACHE=true \
     JEV_NATIVE_MARLIN=true \
-    JEV_MAX_CONCURRENCY=8 \
     JEV_METRICS_ENABLED=true \
     LD_LIBRARY_PATH=/opt/jev/cudalibs:/usr/local/cuda/lib64
 

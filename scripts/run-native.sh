@@ -26,7 +26,6 @@ export JEV_NATIVE_CACHE="${JEV_NATIVE_CACHE:-true}"
 export JEV_NATIVE_MARLIN="${JEV_NATIVE_MARLIN:-true}"
 export JEV_NATIVE_FUSED_W4A16="${JEV_NATIVE_FUSED_W4A16:-true}"
 export JEV_BIND_ADDR="${JEV_BIND_ADDR:-0.0.0.0:8501}"
-export JEV_MAX_CONCURRENCY="${JEV_MAX_CONCURRENCY:-8}"
 export JEV_METRICS_ENABLED="${JEV_METRICS_ENABLED:-true}"
 
 # cuBLAS/cuBLASLt location. The native engine loads them dynamically. Prefer the
