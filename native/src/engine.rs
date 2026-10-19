@@ -18,7 +18,13 @@ use crate::weights::{
     FullAttentionWeights, GdnWeights, LayerWeights, LinearWeight, MixerWeights, WeightProvider,
 };
 
-type BufferPool = Arc<Mutex<HashMap<usize, Vec<CudaSlice<bf16>>>>>;
+struct PoolState {
+    free: Mutex<HashMap<usize, Vec<CudaSlice<bf16>>>>,
+    /// When set (very long prefills), dropped buffers are released to the
+    /// driver instead of retained, to keep peak memory inside 24 GiB.
+    low_mem: AtomicBool,
+}
+type BufferPool = Arc<PoolState>;
 
 /// Recycled device buffer. Returning outputs to the pool avoids per-GEMM
 /// cuMemAlloc: on this driver a fresh allocation of some sizes costs ~0.6 ms,
@@ -54,7 +60,10 @@ impl std::ops::DerefMut for Buf {
 impl Drop for Buf {
     fn drop(&mut self) {
         if let Some(s) = self.slice.take() {
-            let mut pool = self.pool.lock().unwrap();
+            if self.pool.low_mem.load(Ordering::Relaxed) {
+                return; // s drops here -> cuMemFree
+            }
+            let mut pool = self.pool.free.lock().unwrap();
             // Keep at most two buffers per size so long-running servers with
             // many prompt lengths do not accumulate device memory.
             let keep = pool.get(&s.len()).map(|v| v.len() < 2).unwrap_or(true);
@@ -196,7 +205,10 @@ impl Engine {
             dump_dir: Mutex::new(None),
             dequant_ws: Mutex::new(None),
             logits_opts: Mutex::new(LogitsOpts::default()),
-            pool: Arc::new(Mutex::new(HashMap::new())),
+            pool: Arc::new(PoolState {
+                free: Mutex::new(HashMap::new()),
+                low_mem: AtomicBool::new(false),
+            }),
             cache_weights: AtomicBool::new(true),
             fused_w4a16: AtomicBool::new(false),
             fused_min_n: std::sync::atomic::AtomicUsize::new(5120),
@@ -394,12 +406,12 @@ impl Engine {
 
     fn alloc_bf16(&self, n: usize) -> Result<Buf> {
         {
-            let mut pool = self.pool.lock().unwrap();
+            let mut pool = self.pool.free.lock().unwrap();
             if pool.len() > 128 {
                 pool.clear();
             }
         }
-        if let Some(v) = self.pool.lock().unwrap().get_mut(&n) {
+        if let Some(v) = self.pool.free.lock().unwrap().get_mut(&n) {
             if let Some(s) = v.pop() {
                 return Ok(Buf {
                     slice: Some(s),
@@ -494,6 +506,11 @@ impl Engine {
             );
         }
         self.prof.entries.lock().unwrap().clear();
+        let low_mem = seq >= 24_576;
+        let was_low = self.pool.low_mem.swap(low_mem, Ordering::Relaxed);
+        if low_mem && !was_low {
+            self.pool.free.lock().unwrap().clear();
+        }
         let mut x = x;
         for i in start..=last {
             let w = timed!(self, "weights", self.layer_weights(i)?);
@@ -673,6 +690,8 @@ impl Engine {
                 seq * inter,
             )?
         );
+        drop(gate);
+        drop(up);
         Ok(timed!(
             self,
             "gemm.down",
@@ -723,6 +742,7 @@ impl Engine {
                 self.dump_dev("attn_q", &q, seq, heads * hd)?;
                 self.dump_dev("attn_gate", &gate, seq, heads * hd)?;
             }
+            drop(qg);
             (q, Some(gate))
         } else {
             (qg, None)
@@ -787,6 +807,8 @@ impl Engine {
                 rd / 2,
             )?
         );
+        drop(cos);
+        drop(sin);
         if capture {
             self.dump_dev("attn_q_rope", &qn, seq, heads * hd)?;
             self.dump_dev("attn_k_rope", &kn, seq, kv * hd)?;
@@ -847,6 +869,9 @@ impl Engine {
             )?;
         }
         self.prof_end("attn", __attn_t);
+        drop(qn);
+        drop(kn);
+        drop(vv);
         if capture {
             self.dump_dev("attn_weights_out", &attn, seq, heads * hd)?;
         }
@@ -866,6 +891,8 @@ impl Engine {
                         seq * heads * hd,
                     )?
                 );
+                drop(attn);
+                drop(g);
                 o
             }
             None => attn,
@@ -953,6 +980,10 @@ impl Engine {
                 dv,
             )?
         );
+        drop(qkv);
+        drop(conv);
+        drop(b);
+        drop(a);
         if capture {
             let qfv = self.gpu.stream.clone_dtoh(&qf)?;
             let kfv = self.gpu.stream.clone_dtoh(&kf)?;
@@ -1036,6 +1067,11 @@ impl Engine {
                 )?
             );
         }
+        drop(qf);
+        drop(kf);
+        drop(vf);
+        drop(g);
+        drop(beta);
         if capture {
             self.dump_dev("gdn_recurrent_out", &core, seq, nv * dv)?;
             let sv = self.gpu.stream.clone_dtoh(&state)?;
@@ -1058,6 +1094,8 @@ impl Engine {
                 cfg.rms_norm_eps,
             )?
         );
+        drop(core);
+        drop(z);
         if capture {
             self.dump_dev("gdn_norm_out", &normed, seq * nv, dv)?;
         }

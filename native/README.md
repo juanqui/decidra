@@ -122,6 +122,7 @@ Long-context latency (Marlin weights, resident, SM89 RTX 4090):
 | 4K | 2.12-2.18 s | 4.65 s | ~17.2 GiB |
 | 8K | 4.23-4.32 s | 9.88 s | ~17.6 GiB |
 | 16K | 8.62-8.85 s | 22.88 s | 18.9 GiB |
+| 32K (32,763 tok) | 18.6-19.0 s | - | 19.1 GiB |
 
 The tiled attention and the split-dk GDN recurrence (below) together cut
 long-context latency ~2x versus the previous warp + shared-GDN stack. The
@@ -136,6 +137,7 @@ Long-context quality gate against the CPU AWQ/SDPA probes
 | 4K (4090 tok) | 0.0625 / 4.60e-3 / 0.808% / 0.999967 | [0.0156, 0.0313] | 3.5e-4 | true |
 | 8K (8178 tok) | 0.0996 / 4.28e-3 / 0.795% / 0.999968 | [0.0156, 0.0313] | 3.0e-4 | true |
 | 16K (16383 tok) | 0.0469 / 4.01e-3 / 0.692% / 0.999976 | [0.0078, 0.0313] | 6.7e-4 | true |
+| 32K (32763 tok) | 0.0469 / 4.18e-3 / 0.727% / 0.999974 | [0.0078, 0.0313] | 6.0e-4 | true |
 
 The probe `probs` include the decision-head transform (bias/temperature); the
 raw two-way softmax of the head logits is within 5.6e-4 of the golden raw
@@ -146,8 +148,13 @@ positions of the 76/1K/4K/8K/16K prompts also match the 36-token golden head
 logits within max 0.051-0.086 / mean 0.014-0.018.
 
 K/V are transient per layer (bf16, no persistent KV cache, no FP8 KV); the GDN
-state is f32. 16K peaks at 18.9 GiB including the 13.1 GiB resident weights, so
-24 GiB fits with headroom.
+state is f32. 16K peaks at 18.9 GiB including the 13.1 GiB resident weights.
+32K (32,763-token CPU-AWQ probe, expected `true`, golden P(true)=0.98315) is the
+verified maximum: 18.6-19.0 s full forward, 19.1 GiB peak, 100% utilization,
+~455 W, ~4.4 GiB headroom on 24 GiB. For `seq >= 24576` the buffer pool releases
+dropped large tensors instead of retaining them and large MLP/attention/GDN
+intermediates are dropped as soon as they are consumed; 1K/16K timings are
+unchanged (486 ms / 8.86 s).
 
 ## Weight sources
 
