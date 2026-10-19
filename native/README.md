@@ -118,10 +118,11 @@ Long-context latency (Marlin weights, resident, SM89 RTX 4090):
 | 8K | 9.88 s | 19.17 s | 17.6 GiB |
 | 16K | 22.88 s | (not run; ~60 s by fit) | 18.9 GiB |
 
-There is no CPU AWQ golden at 4K/8K/16K. Quality is checked causally: the first
-36 positions of every long prompt are the golden 36-token prompt, and the head
-logits at positions 0..35 match the 36-token golden within max 0.051-0.125 /
-mean 0.014-0.016 (Marlin + warp attention: 4K max 0.082, 8K 0.051, 16K 0.051).
+There is no CPU AWQ golden beyond 36 tokens. Quality is checked causally: the
+first 36 positions of the 76/1K/4K/8K/16K prompts are the golden prompt, and the
+head logits at positions 0..35 match the 36-token golden within max
+0.051-0.086 / mean 0.014-0.018 (Marlin + warp attention: 76 0.086, 1K 0.078,
+4K 0.082, 8K 0.051, 16K 0.051).
 K/V are transient per layer (bf16, no persistent KV cache, no FP8 KV); the GDN
 state is f32. 16K peaks at 18.9 GiB including the 13.1 GiB resident weights, so
 24 GiB fits with headroom.
