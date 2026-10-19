@@ -1,5 +1,5 @@
 //! In-process backend: the native CUDA engine (`jev-native`) and the existing
-//! `tokenizers` tokenizer. No HTTP hop, no Python, no vLLM.
+//! `tokenizers` tokenizer. No HTTP hop, no Python, no external model server.
 //!
 //! `jev_native::Engine` is `Send` but owns one CUDA context/stream and is not
 //! safe for concurrent forwards. Calls are serialized through a mutex and moved

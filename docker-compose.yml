@@ -1,7 +1,7 @@
 # jev-engine with the in-process native CUDA backend.
 #
 # The HTTP server itself is CPU-side; the native engine holds GPU 1 inside the
-# same process. No vLLM, Python, or separate model server is involved.
+# same process. No external model server, Python, or separate process is involved.
 #
 #   docker compose up -d --build
 #   docker compose logs -f

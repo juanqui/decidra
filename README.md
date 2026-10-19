@@ -3,7 +3,7 @@
 Production Rust API/decision server for **`JEV-27B-VL` AWQ W4A16** on one RTX 4090.
 It exposes the JEV System 1 decision protocol and the OpenAI Decisions shape, and it
 runs inference **in-process** through the custom Rust + CUDA engine in
-[`native/`](native/README.md). There is no vLLM, Python, PyTorch, or HTTP upstream on
+[`native/`](native/README.md). There is no external model server, Python, PyTorch, or HTTP upstream on
 the runtime path.
 
 The server owns the parts where exactness and operational control matter:
@@ -202,13 +202,11 @@ device selection is done before process start with `CUDA_VISIBLE_DEVICES`.
 Head/calibration discovery order, relative to the checkpoint then the HF snapshot:
 
 1. `<checkpoint>/decision_head/decision_head.json`
-2. `<checkpoint>/adapter_vllm/decision_head.json`
-3. `<checkpoint>/decision_head.json`
-4. the same names under `JEV_HF_SNAPSHOT`
+2. `<checkpoint>/decision_head.json`
+3. the same names under `JEV_HF_SNAPSHOT`
 
 Calibration follows the same pattern with `decision_head/calibration.json` then
-`calibration.json`. `adapter_vllm` is an existing directory name in the artifact, not a
-runtime dependency.
+`calibration.json`.
 
 ## Endpoints
 
@@ -350,9 +348,9 @@ serialized; c=4 is queueing, not batching.
 Live API comparison against the **CPU AWQ golden** (`eval/data/awq-cpu-suite28.json`,
 28 rows): top-1 **28/28**, mean KL **3.06e-5**, mean MAE **8.45e-4**, max delta
 **1.0345e-2** (`r20`). Acceptance uses `top1 1.0`, `max_kl 0.001`, `mean_mae 0.001`,
-`max_delta 0.011` and passes. The historical vLLM baseline gives top-1 28/28, mean KL
-8.07e-5, mean MAE 1.64e-3, max delta 1.45e-2; the vLLM result itself differs from CPU
-golden by max 0.01377 / mean MAE 0.00156, so it is context only. See `docs/RESULTS.md`
+`max_delta 0.011` and passes. The historical production-v2 baseline gives top-1 28/28,
+mean KL 8.07e-5, mean MAE 1.64e-3, max delta 1.45e-2; that baseline itself differs from
+CPU golden by max 0.01377 / mean MAE 0.00156, so it is context only. See `docs/RESULTS.md`
 for per-kind tables. Run `scripts/run-eval.sh` to reproduce.
 
 ## One-GPU deployment example (GPU 1 only)

@@ -4,8 +4,8 @@ Self-contained Python 3 harness for the `/v1/decide` protocol. It exercises a ru
 `jev-engine` over HTTP; it never imports the model, starts/stops a serving process, or
 touches a GPU. The only local server it starts is a deterministic stdlib mock.
 
-The runtime under test is the in-process native CUDA backend. There is no direct-vLLM
-comparison anymore; native-engine numerics are validated against CPU golden tensors in
+The runtime under test is the in-process native CUDA backend. There is no direct
+oracle read-out; native-engine numerics are validated against CPU golden tensors in
 [`../native/README.md`](../native/README.md) and summarized in
 [`../docs/RESULTS.md`](../docs/RESULTS.md).
 
@@ -23,7 +23,7 @@ comparison anymore; native-engine numerics are validated against CPU golden tens
 | `smoke_test.py` | Offline end-to-end test: client → mock → suite → bench → report. |
 | `data/suite.jsonl` | The 28 suite prompts, reconstructed from the canonical suite JSONL. |
 | `data/awq-cpu-suite28.json` | CPU AWQ golden results; default reference and acceptance baseline. |
-| `data/awq-v2-suite.json` | Historical production-v2 (vLLM-era) results; drift context only. |
+| `data/awq-v2-suite.json` | Historical production-v2 (previous serving stack) results; drift context only. |
 | `data/awq-v4-suite.json` | Saved AWQ-v4 results, for historical cross-quantization comparisons. |
 | `data/decision_head.json`, `data/calibration.json` | Decision-head bias/verbalizers and per-kind temperatures. |
 | `data/fitted-calibration.json` | Optional serving-side fit; not enabled by default. |
@@ -42,7 +42,7 @@ Every saved `*-suite.json` contains results only (`id`, `truth`, `kind`, `choice
 the canonical suite used by the original evaluation (`suite.jsonl`, ids `r01`..`r28`).
 The saved baselines contain results only. `awq-cpu-suite28.json` is the CPU AWQ golden
 result (the correct acceptance reference for the native engine). `awq-v2-suite.json` was
-collected on the previous vLLM serving stack and is kept as historical drift context; it
+collected on the previous serving stack and is kept as historical drift context; it
 differs from the CPU golden by max **0.01377** / mean MAE **0.00156** on its own.
 
 ## Offline smoke test
@@ -68,7 +68,7 @@ The script runs:
    recorded rather than fatal).
 2. The same CPU golden comparison with the acceptance tolerance
    (`top-1 1.0`, `max_kl 0.001`, `max_mae 0.001`, `max_delta 0.011`).
-3. The historical vLLM production-v2 comparison, labeled as context only.
+3. The historical production-v2 comparison, labeled as context only.
 4. The combined short/long benchmark.
 5. Functional checks (256 choices, `/v1/decisions`, image rejection).
 6. Optional signing when `JEV_EVAL_SIGNING_KEY` is set.
@@ -80,7 +80,7 @@ Reports land in `eval/out/`. Override the target with `JEV_EVAL_RUST_URL`.
 `suite.py` compares probability distributions row by row. The acceptance baseline is the
 CPU AWQ golden (dequantized with `compressed_tensors` offline); native BF16 kernels differ
 from it by a small amount. Measure the actual deltas on each deployment. The historical
-vLLM baseline is useful for context but is not an acceptance gate: that baseline itself
+v2 baseline is useful for context but is not an acceptance gate: that baseline itself
 differs from CPU AWQ by max 0.01377 / mean MAE 0.00156. A change in top-1 agreement, or a
 CPU-golden tolerance failure, is a real regression. Native-engine golden checks
 (layer/final-norm cosine and logits) are the primary numerical evidence.

@@ -1,7 +1,8 @@
 # Native kernel stack
 
 The shipped runtime is Rust + custom CUDA kernels, with cuBLAS/cuBLASLt used for BF16
-matrix multiplies. There is no vLLM, PyTorch, Triton, FlashInfer, or Python in the process.
+matrix multiplies. There is no external model server, PyTorch, Triton, FlashInfer, or
+Python in the process.
 
 Target: RTX 4090 / sm_89. `native/build.rs` compiles `native/kernels/kernels.cu` to a
 cubin; `cudarc` loads the CUDA driver, the cubin module, and cuBLAS dynamically. The host

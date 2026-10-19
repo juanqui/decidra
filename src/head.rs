@@ -145,20 +145,12 @@ pub fn load(
 ) -> Result<LoadedHead> {
     let mut head_candidates = candidates(
         checkpoint,
-        &[
-            "decision_head/decision_head.json",
-            "adapter_vllm/decision_head.json",
-            "decision_head.json",
-        ],
+        &["decision_head/decision_head.json", "decision_head.json"],
     );
     if checkpoint != snapshot {
         head_candidates.extend(candidates(
             snapshot,
-            &[
-                "adapter_vllm/decision_head.json",
-                "decision_head/decision_head.json",
-                "decision_head.json",
-            ],
+            &["decision_head/decision_head.json", "decision_head.json"],
         ));
     }
     let head_path = first_existing(&head_candidates).ok_or_else(|| {

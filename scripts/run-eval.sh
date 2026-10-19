@@ -87,15 +87,15 @@ echo "== CPU AWQ golden (primary): acceptance"
   --out "$OUT/suite_rust_vs_cpu.json"
 
 echo
-echo "== historical vLLM production-v2 baseline (context only, not acceptance)"
-# The vLLM-era baseline itself differs from CPU AWQ golden by max 0.01377 /
-# mean MAE 0.00156, so it cannot be the native acceptance gate.
+echo "== historical production-v2 baseline (previous serving stack; context only)"
+# That baseline itself differs from CPU AWQ golden by max 0.01377 / mean MAE
+# 0.00156, so it cannot be the native acceptance gate.
 "$PYTHON" suite.py \
   --a-url "$RUST_URL" \
   --baseline data/awq-v2-suite.json \
   --min-top1 1.0 --max-kl 0.001 --max-mae 0.0025 --max-delta 0.02 \
   --no-strict \
-  --out "$OUT/suite_rust_vs_vllm_historical.json"
+  --out "$OUT/suite_rust_vs_v2_historical.json"
 
 if [[ "$SKIP_BENCH" != "1" ]]; then
   echo

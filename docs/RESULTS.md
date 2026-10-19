@@ -1,6 +1,6 @@
 # Correctness and performance results
 
-All results below are for the native backend. The old vLLM-based measurements are
+All results below are for the native backend. Previous serving-stack measurements are
 superseded and are not part of this deployment.
 
 ## Native engine numerics
@@ -75,12 +75,12 @@ Acceptance gates: `top1 1.0`, `max_kl 0.001`, `mean_mae 0.001`, `max_delta 0.011
 delta gate. The strict `mean_mae 0.0005` / `max_delta 0.001` run is recorded separately
 and fails as expected.
 
-### Historical vLLM production-v2 baseline (context only)
+### Historical production-v2 baseline (context only)
 
 Against `eval/data/awq-v2-suite.json`: top-1 **28/28**, mean KL **8.070e-5**, mean MAE
 **1.640e-3**, max delta **1.4533e-2** (`r22`). This baseline is not an acceptance gate:
-the vLLM-era result itself differs from CPU AWQ golden by max **0.01377** / mean MAE
-**0.00156**. The CPU golden is the correct reference.
+it was collected on a vLLM-based stack and itself differs from CPU AWQ golden by max
+**0.01377** / mean MAE **0.00156**. The CPU golden is the correct reference.
 
 ### Live endpoint verification
 
@@ -124,7 +124,7 @@ API-level behavior: short benchmark on the live server (16 unique requests per l
 hybrid default) measured c=1 **8.440 req/s**, p50 **123.7 ms**; c=4 **8.484 req/s**,
 p50 **459.3 ms**, ~**587 tok/s**. Throughput is flat because the engine serializes
 forwards; c=4 latency is queueing, not batching. Do not claim concurrency scaling. Do not
-reuse the previous vLLM-front numbers. Record fresh numbers with:
+reuse the previous serving-stack numbers. Record fresh numbers with:
 
 ```bash
 ./scripts/run-eval.sh

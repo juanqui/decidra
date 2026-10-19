@@ -10,7 +10,7 @@ produced with: ``/opt/decider-stack/deploy/suite.jsonl`` (the default of the
 repo's ``run_suite.py``).  A copy lives at ``data/suite.jsonl`` so this harness
 is self-contained.  ``data/awq-cpu-suite28.json`` is the CPU AWQ golden result
 and the default reference backend.  ``data/awq-v2-suite.json`` is the historical
-production-v2 (vLLM-era) result, kept for drift context only;
+production-v2 (previous serving stack) result, kept for drift context only;
 ``data/awq-v4-suite.json`` is kept for historical cross-quantization comparisons.
 
 Two modes

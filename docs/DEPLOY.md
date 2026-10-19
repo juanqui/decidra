@@ -9,8 +9,8 @@ CPU   ── jev-engine HTTP server ── 0.0.0.0:8501 ── clients / proxy �
 ```
 
 One process, one GPU. The axum server is CPU-side; inference runs through
-`jev_native::Engine` on GPU 1 and keeps packed weights resident. There is no vLLM,
-Python, PyTorch, or separate model server.
+`jev_native::Engine` on GPU 1 and keeps packed weights resident. There is no external
+model server, Python, or PyTorch in the process.
 
 ## Ports and devices
 
@@ -25,7 +25,7 @@ Device selection is process-level: the native engine opens ordinal 0 of the visi
 so `CUDA_VISIBLE_DEVICES=1` is the supported way to pin GPU 1. `JEV_NATIVE_DEVICE` is not
 read.
 
-Port `8501` is chosen so the existing Python front on `8500` and its production vLLM on
+Port `8501` is chosen so the existing Python front on `8500` and its production backend on
 `8001` remain untouched.
 
 ## Prerequisites
@@ -161,7 +161,7 @@ in production.
 | `/v1/decide` returns 502 | Native forward failed (check logs); no fallback backend exists. |
 | `/v1/decide` returns 400 for image states | Expected: native vision is not implemented. |
 | `/v1/chat/completions` returns 501 | Expected: native generation is not implemented. |
-| OOM during preload | Free GPU 1; do not run vLLM or another model process there. |
+| OOM during preload | Free GPU 1; do not run another model process there. |
 
-Never expose the Python shim on `8500` or the production vLLM on `8001` as part of this
+Never expose the Python shim on `8500` or the production backend on `8001` as part of this
 deployment.
