@@ -22,7 +22,8 @@ comparison anymore; native-engine numerics are validated against CPU golden tens
 | `mock_server.py` | Deterministic stdlib mock of the decision API (no GPU, no model). |
 | `smoke_test.py` | Offline end-to-end test: client → mock → suite → bench → report. |
 | `data/suite.jsonl` | The 28 suite prompts, reconstructed from the canonical suite JSONL. |
-| `data/awq-v2-suite.json` | Saved production-v2 results, used as the regression baseline. |
+| `data/awq-cpu-suite28.json` | CPU AWQ golden results; default reference and acceptance baseline. |
+| `data/awq-v2-suite.json` | Historical production-v2 (vLLM-era) results; drift context only. |
 | `data/awq-v4-suite.json` | Saved AWQ-v4 results, for historical cross-quantization comparisons. |
 | `data/decision_head.json`, `data/calibration.json` | Decision-head bias/verbalizers and per-kind temperatures. |
 | `data/fitted-calibration.json` | Optional serving-side fit; not enabled by default. |
@@ -39,8 +40,10 @@ python3 -m pip install -r requirements.txt
 Every saved `*-suite.json` contains results only (`id`, `truth`, `kind`, `choice`,
 `probabilities`), not prompts. The prompts in `data/suite.jsonl` were reconstructed from
 the canonical suite used by the original evaluation (`suite.jsonl`, ids `r01`..`r28`).
-The saved baselines were collected on the previous serving stack; they are regression
-references, not a numerical oracle for the native engine.
+The saved baselines contain results only. `awq-cpu-suite28.json` is the CPU AWQ golden
+result (the correct acceptance reference for the native engine). `awq-v2-suite.json` was
+collected on the previous vLLM serving stack and is kept as historical drift context; it
+differs from the CPU golden by max **0.01377** / mean MAE **0.00156** on its own.
 
 ## Offline smoke test
 
@@ -61,22 +64,23 @@ No server or GPU is required.
 
 The script runs:
 
-1. The saved-v2 baseline comparison with strict gates (`--no-strict`, so failures are
+1. The CPU AWQ golden comparison with strict gates (`--no-strict`, so failures are
    recorded rather than fatal).
-2. The same comparison with the documented cross-engine tolerance
-   (`top-1 1.0`, `max_kl 0.001`, `max_mae 0.0025`, `max_delta 0.01`).
-3. The combined short/long benchmark.
-4. Functional checks (256 choices, `/v1/decisions`, image rejection).
-5. Optional signing when `JEV_EVAL_SIGNING_KEY` is set.
+2. The same CPU golden comparison with the acceptance tolerance
+   (`top-1 1.0`, `max_kl 0.001`, `max_mae 0.001`, `max_delta 0.011`).
+3. The historical vLLM production-v2 comparison, labeled as context only.
+4. The combined short/long benchmark.
+5. Functional checks (256 choices, `/v1/decisions`, image rejection).
+6. Optional signing when `JEV_EVAL_SIGNING_KEY` is set.
 
 Reports land in `eval/out/`. Override the target with `JEV_EVAL_RUST_URL`.
 
 ## Tolerances
 
-`suite.py` compares probability distributions row by row. The tolerance run exists
-because the saved baseline came from a different engine build and serving stack; the
-native BF16 kernels legitimately differ by ~1e-3 per probability. Measured on the AWQ v2
-suite: top-1 **28/28**, mean KL **4.50e-5**, mean MAE **1.143e-3**, max delta **9.734e-3**
-(`r22`). The acceptance tolerance is therefore `max_mae 0.0025`, `max_delta 0.01`. A change
-in top-1 agreement, or a tolerance failure, is a real regression. Native-engine golden
-checks (layer/final-norm cosine and logits) are the primary numerical evidence.
+`suite.py` compares probability distributions row by row. The acceptance baseline is the
+CPU AWQ golden (dequantized with `compressed_tensors` offline); native BF16 kernels differ
+from it by a small amount. Measure the actual deltas on each deployment. The historical
+vLLM baseline is useful for context but is not an acceptance gate: that baseline itself
+differs from CPU AWQ by max 0.01377 / mean MAE 0.00156. A change in top-1 agreement, or a
+CPU-golden tolerance failure, is a real regression. Native-engine golden checks
+(layer/final-norm cosine and logits) are the primary numerical evidence.

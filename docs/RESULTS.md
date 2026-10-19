@@ -48,67 +48,83 @@ differs by 9.4e-4. Large-activation `max_abs` is exactly one BF16 ulp.
 - `--check-config` validates the production tokenizer/head labels without loading the GPU.
 - `scripts/native-smoke.sh` runs one real forward and asserts two finite head logits.
 
-### Live server vs saved AWQ v2 baseline
+### Live server vs CPU AWQ golden (primary)
 
-Measured with the release binary on GPU 1 (resident weights, `JEV_NATIVE_FUSED_W4A16=false`)
-against `eval/data/awq-v2-suite.json`, 28 rows:
+Measured with the release binary on GPU 1 (resident weights, hybrid fused policy
+`JEV_NATIVE_FUSED_W4A16=true`, the server default) against
+`eval/data/awq-cpu-suite28.json`, 28 rows:
 
 | metric | value |
 |---|---|
 | rows compared | 28/28, 0 errors |
 | top-1 agreement | **1.0 (28/28)** |
-| mean KL | **4.496e-5** |
-| mean MAE | **1.143e-3** |
-| max delta | **9.734e-3** (`r22`) |
+| mean KL | **3.055e-5** |
+| mean MAE | **8.452e-4** |
+| max delta | **1.0345e-2** (`r20`, choice) |
 
 Per kind:
 
 | kind | rows | top-1 | mean KL | mean MAE | max delta |
 |---|---|---|---|---|---|
-| choice | 15 | 1.0 | 1.437e-5 | 3.876e-4 | 4.434e-3 |
-| noul | 8 | 1.0 | 4.030e-5 | 2.081e-3 | 9.734e-3 |
-| score | 5 | 1.0 | 1.436e-4 | 1.908e-3 | 6.767e-3 |
+| choice | 15 | 1.0 | 2.590e-5 | 5.924e-4 | 1.0345e-2 |
+| noul | 8 | 1.0 | 8.925e-6 | 8.831e-4 | 3.194e-3 |
+| score | 5 | 1.0 | 7.885e-5 | 1.543e-3 | 8.081e-3 |
 
-The baseline was collected on the previous serving stack, so these deltas are cross-engine
-numerical drift (consistent with the ~1% BF16 rel_rms above), not API differences. The
-acceptance run uses `max_mae 0.0025`, `max_delta 0.01`; the strict `max_mae 0.0005` gate is
-recorded but expected to fail.
+Acceptance gates: `top1 1.0`, `max_kl 0.001`, `mean_mae 0.001`, `max_delta 0.011`.
+**PASS.** The result is at BF16 noise; the largest row is 1.0345e-2 against a 1.1e-2
+delta gate. The strict `mean_mae 0.0005` / `max_delta 0.001` run is recorded separately
+and fails as expected.
 
-Live endpoint verification (same release binary):
+### Historical vLLM production-v2 baseline (context only)
+
+Against `eval/data/awq-v2-suite.json`: top-1 **28/28**, mean KL **8.070e-5**, mean MAE
+**1.640e-3**, max delta **1.4533e-2** (`r22`). This baseline is not an acceptance gate:
+the vLLM-era result itself differs from CPU AWQ golden by max **0.01377** / mean MAE
+**0.00156**. The CPU golden is the correct reference.
+
+### Live endpoint verification
 
 - `/v1/decide` noul/score/choice: 200 with normalized probabilities.
 - `/v1/decisions`: predicate + choice + score, 200.
 - `/v1/systemone`: noul + choice, 200.
-- 256-option choice: 200 in 4.56 s.
+- 256-option choice: 200 in 3.48 s.
 - Image state: 400 `native vision not implemented`.
 - Generation routes: 501 `not_implemented_error`.
 - HMAC signing: `x-jev-signature` matches the exact body; `/health` unsigned.
 - `/metrics`: HTTP and backend counters/histograms exposed.
-- Preload: 5.94 s, 10.86 GiB device free after loading 64 layers.
+- Preload: 5.88 s, 10.86 GiB device free after loading 64 layers.
+- Short benchmark (16 unique requests/level, hybrid default): c=1 **8.440 req/s**, p50
+  **123.7 ms**; c=4 **8.484 req/s**, p50 **459.3 ms**, ~**587 tok/s**. Throughput does
+  not scale with concurrency because the native engine serializes forwards; c=4 latency
+  is queueing, not batching.
 
 ## Performance
 
 Resident native engine on GPU 1 (`--preload`, 12.66 GiB used / 10.86 GiB free), measured
 in `native/README.md`:
 
-| prompt | reference path (dequant + cuBLAS) | fused `--fused-w4a16` |
+| prompt | reference path (dequant + cuBLAS) | hybrid fused (`--fused-w4a16`) |
 |---|---|---|
-| 36 tokens | 176.6 ms (first 267 ms) | 405 ms |
-| 76 tokens | 202.9 ms | 460 ms |
-| 1024 tokens | 1277.6 ms | 2689 ms |
+| 36 tokens | 174.7 ms (first 259 ms) | **84.8 ms** (2.06x) |
+| 76 tokens | 202.2 ms | **126.4 ms** (1.60x) |
+| 1024 tokens | 1261.2 ms | **1261.2 ms** (falls back, 1.00x) |
 
-Preload 5.8 s, init 0.2 s. GPU sample during the 36-token reference run: 100%
-utilization, ~231 W peak; the fused kernel is latency-bound at ~156 W. Resident outputs are
-bit-identical to the streaming (`--no-cache`) run.
+Preload 5.8 s, init 0.2 s. GPU sample during the 36-token hybrid run: 100% utilization,
+~184 W mean / 213 W peak. Resident outputs are bit-identical to the streaming
+(`--no-cache`) run. Golden after residency (hybrid): final norm rel_rms 1.07% (reference
+1.25%), full logits rel_rms 0.24%, top-1 identical.
 
-The fused W4A16 kernel is numerically correct but slower than the reference path on this
-workload (kernel-only averages: gate_proj 0.67 vs 0.63 ms, in_proj_qkv 1.20 vs 0.80 ms,
-out_proj 0.55 vs 0.19 ms, down_proj 1.54 vs 0.63 ms, in_proj_a/b 0.40 vs 0.014 ms). It
-stays off by default.
+The fused policy is `N >= 5120 && M <= 256`; otherwise the engine falls back to
+dequant + cuBLAS. This is why hybrid gives 2.06x at 36 tokens and 1.60x at 76 tokens but
+**no benefit at 1K tokens** (1261.2 ms both paths). Small-N projections (`k/v/a/b`) and
+large prefills are faster on the reference path. The server defaults to the hybrid policy
+(`JEV_NATIVE_FUSED_W4A16=true`); set it to `false` to force the reference path.
 
-API-level throughput and latency under concurrency are **not yet measured**. Do not reuse
-the previous vLLM-front numbers; the backend and scheduling model changed. Record real
-numbers with:
+API-level behavior: short benchmark on the live server (16 unique requests per level,
+hybrid default) measured c=1 **8.440 req/s**, p50 **123.7 ms**; c=4 **8.484 req/s**,
+p50 **459.3 ms**, ~**587 tok/s**. Throughput is flat because the engine serializes
+forwards; c=4 latency is queueing, not batching. Do not claim concurrency scaling. Do not
+reuse the previous vLLM-front numbers. Record fresh numbers with:
 
 ```bash
 ./scripts/run-eval.sh

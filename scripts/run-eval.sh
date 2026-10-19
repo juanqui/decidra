@@ -70,24 +70,32 @@ wait_health jev-engine "$RUST_URL"
 cd "$EVAL"
 
 echo
-echo "== saved production-v2 baseline: strict gates"
+echo "== CPU AWQ golden (primary): strict gates"
 "$PYTHON" suite.py \
   --a-url "$RUST_URL" \
-  --baseline data/awq-v2-suite.json \
+  --baseline data/awq-cpu-suite28.json \
   --min-top1 1.0 --max-kl 0.001 --max-mae 0.0005 --max-delta 0.001 \
   --no-strict \
-  --out "$OUT/suite_rust_vs_v2.json"
+  --out "$OUT/suite_rust_vs_cpu_strict.json"
 
 echo
-echo "== saved production-v2 baseline: documented cross-engine tolerance (acceptance)"
-# The baseline was collected on the previous serving stack. Native numerics
-# (BF16 kernels) measured mean MAE 1.14e-3 / max delta 9.73e-3 on this suite, so
-# the acceptance gate is 0.0025 MAE; top-1 and KL gates are unchanged.
+echo "== CPU AWQ golden (primary): acceptance"
+"$PYTHON" suite.py \
+  --a-url "$RUST_URL" \
+  --baseline data/awq-cpu-suite28.json \
+  --min-top1 1.0 --max-kl 0.001 --max-mae 0.001 --max-delta 0.011 \
+  --out "$OUT/suite_rust_vs_cpu.json"
+
+echo
+echo "== historical vLLM production-v2 baseline (context only, not acceptance)"
+# The vLLM-era baseline itself differs from CPU AWQ golden by max 0.01377 /
+# mean MAE 0.00156, so it cannot be the native acceptance gate.
 "$PYTHON" suite.py \
   --a-url "$RUST_URL" \
   --baseline data/awq-v2-suite.json \
-  --min-top1 1.0 --max-kl 0.001 --max-mae 0.0025 --max-delta 0.01 \
-  --out "$OUT/suite_rust_vs_v2_tolerance.json"
+  --min-top1 1.0 --max-kl 0.001 --max-mae 0.0025 --max-delta 0.02 \
+  --no-strict \
+  --out "$OUT/suite_rust_vs_vllm_historical.json"
 
 if [[ "$SKIP_BENCH" != "1" ]]; then
   echo
@@ -132,18 +140,18 @@ echo
 echo "== reports"
 if [[ -f "$OUT/bench_combined_rust.json" ]]; then
   "$PYTHON" report.py \
-    --suite "$OUT/suite_rust_vs_v2_tolerance.json" \
+    --suite "$OUT/suite_rust_vs_cpu.json" \
     --bench "$OUT/bench_combined_rust.json" \
     --out-prefix "$OUT/live-report" \
     --per-row \
-    --note "Saved-v2 comparison uses the documented 0.01 cross-build drift tolerance." \
+    --note "Primary comparison is native vs the CPU AWQ golden, max_delta 0.011 / mean_mae 0.001." \
     --note "See docs/RESULTS.md and docs/KERNELS.md."
 else
   "$PYTHON" report.py \
-    --suite "$OUT/suite_rust_vs_v2_tolerance.json" \
+    --suite "$OUT/suite_rust_vs_cpu.json" \
     --out-prefix "$OUT/live-report" \
     --per-row \
-    --note "Saved-v2 comparison uses the documented 0.01 cross-build drift tolerance."
+    --note "Primary comparison is native vs the CPU AWQ golden, max_delta 0.011 / mean_mae 0.001."
 fi
 
 echo

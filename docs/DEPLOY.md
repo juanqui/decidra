@@ -89,7 +89,7 @@ steps to succeed; there is no partial serving.
 | `JEV_CHECKPOINT` | `/srv/models/jev-awq/awq-w4a16-v2` | Tokenizer/head/calibration artifact. |
 | `JEV_NATIVE_MODEL` | `$JEV_CHECKPOINT` | Checkpoint opened by the native engine. |
 | `JEV_NATIVE_CACHE` | `true` | Keep packed decoder weights resident. |
-| `JEV_NATIVE_FUSED_W4A16` | `false` | Fused kernel when supported; default correctness path. |
+| `JEV_NATIVE_FUSED_W4A16` | `true` | Hybrid fused policy; falls back to dequant + cuBLAS for small N or M > 256. |
 | `JEV_MAX_CONCURRENCY` | `8` | Outstanding decision passes. Forwards are serialized. |
 | `JEV_SIGNING_KEY` | unset | HMAC-SHA256 response signing. |
 | `JEV_METRICS_ENABLED` | `true` | Prometheus recorder. |

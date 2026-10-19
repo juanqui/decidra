@@ -8,14 +8,15 @@ results: id/truth/kind/choice/probabilities.  It has **no prompts**.  The
 prompts are reconstructed from the canonical suite the saved results were
 produced with: ``/opt/decider-stack/deploy/suite.jsonl`` (the default of the
 repo's ``run_suite.py``).  A copy lives at ``data/suite.jsonl`` so this harness
-is self-contained.  ``data/awq-v2-suite.json`` is the saved production-v2
-result used as the default reference backend; ``data/awq-v4-suite.json`` is
-kept for historical cross-quantization comparisons.
+is self-contained.  ``data/awq-cpu-suite28.json`` is the CPU AWQ golden result
+and the default reference backend.  ``data/awq-v2-suite.json`` is the historical
+production-v2 (vLLM-era) result, kept for drift context only;
+``data/awq-v4-suite.json`` is kept for historical cross-quantization comparisons.
 
 Two modes
 ---------
 * ``--a-url URL --b-url URL``: live A vs live B on identical request bodies.
-* ``--a-url URL``: live A vs the saved v2 result file (``--baseline``).
+* ``--a-url URL``: live A vs the saved reference result file (``--baseline``).
 
 Each row sends exactly the body ``run_suite.py`` sends, except that ``score``
 requests omit ``options`` (the server ignores them and always uses 0..5; the
@@ -45,7 +46,7 @@ from client import (
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_SUITE = ROOT / "data" / "suite.jsonl"
-DEFAULT_BASELINE = ROOT / "data" / "awq-v2-suite.json"
+DEFAULT_BASELINE = ROOT / "data" / "awq-cpu-suite28.json"
 DEFAULT_OUT = ROOT / "out" / "suite.json"
 
 

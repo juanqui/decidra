@@ -43,11 +43,11 @@ tensors. There is no `weight_g_idx`, so weights are in column order.
 Default correctness path: dequantize one module into a reusable BF16 workspace
 (largest module 17408×5120) and run cuBLAS BF16 GEMM.
 
-The optional fused W4A16 kernel (`JEV_NATIVE_FUSED_W4A16=true`) dequantizes into shared
-memory and runs BF16 WMMA (BM=BN=64, BK=64). It is numerically correct but **slower** than
-dequant + cuBLAS on this workload (405 vs 176.6 ms for a 36-token prompt), so it is off by
-default. A Marlin-style pipeline with double-buffered copies and weight-tile reuse is
-required to beat the reference path.
+The fused W4A16 kernel (`JEV_NATIVE_FUSED_W4A16=true`, now the default) dequantizes into
+padded shared memory and runs BF16 WMMA (BM=BN=64, BK=64) with double-buffered staging.
+The hybrid policy uses it when `N >= 5120 && M <= 256` and falls back to dequant + cuBLAS
+otherwise. On a 36-token prompt this is 84.8 ms vs 174.7 ms (2.06x); at 1K tokens it falls
+back and provides no benefit. Small-N projections and large prefills stay on cuBLAS.
 
 ## Residency
 

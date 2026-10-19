@@ -182,7 +182,7 @@ GPU 0 is not used by this stack. Inside a container, reserve GPU 1
 | `JEV_CHECKPOINT` | `/srv/models/jev-awq/awq-w4a16-v2` | Artifact with tokenizer/head/calibration. |
 | `JEV_NATIVE_MODEL` | `$JEV_CHECKPOINT` | Checkpoint opened by the native engine. |
 | `JEV_NATIVE_CACHE` | `true` | Keep packed decoder weights resident on the GPU. |
-| `JEV_NATIVE_FUSED_W4A16` | `false` | Use the fused W4A16 kernel when available; the default correctness path dequantizes + cuBLAS BF16 GEMM. |
+| `JEV_NATIVE_FUSED_W4A16` | `true` | Hybrid fused W4A16 policy: fused when `N >= 5120 && M <= 256`, otherwise dequant + cuBLAS BF16 GEMM. |
 | `JEV_TOKENIZER` | checkpoint `tokenizer.json` | Tokenizer file or directory override. |
 | `JEV_CALIBRATION` | discovered | `calibration.json` override. |
 | `JEV_CALIBRATION_FITTED` | unset | Optional `fit_bias.py` output. Unset/absent disables it. |
@@ -327,31 +327,33 @@ Correctness (native engine, from `native/README.md`, validated against CPU golde
   **0.8568** vs golden **0.8559**.
 - Merged-BF16 tiny model: every stage at the bf16 rounding floor.
 
-Server throughput and latency under concurrent API load are **not yet benchmarked**.
 Single-forward native measurements on GPU 1 with resident packed weights
-(`native/README.md`) are:
+(`native/README.md`):
 
-| prompt | reference path (dequant + cuBLAS) | fused `JEV_NATIVE_FUSED_W4A16=true` |
+| prompt | reference path (dequant + cuBLAS) | hybrid fused (`JEV_NATIVE_FUSED_W4A16=true`, default) |
 |---|---|---|
-| 36 tokens | 176.6 ms (first request 267 ms) | 405 ms |
-| 76 tokens | 202.9 ms | 460 ms |
-| 1024 tokens | 1277.6 ms | 2689 ms |
+| 36 tokens | 174.7 ms (first request 259 ms) | **84.8 ms** (2.06x) |
+| 76 tokens | 202.2 ms | **126.4 ms** (1.60x) |
+| 1024 tokens | 1261.2 ms | **1261.2 ms** (falls back, 1.00x) |
 
 Preload is **5.8 s** (12.4 GiB packed weights resident); init is 0.2 s. During the
-36-token reference run the GPU was at 100% utilization and ~231 W peak. Outputs are
+36-token hybrid run the GPU was at 100% utilization, ~184 W mean / 213 W peak. Outputs are
 bit-identical to the streaming path, and the golden checks are unchanged.
 
-The fused W4A16 kernel is numerically correct but slower than dequantize-to-BF16 +
-cuBLAS on this workload, so it stays off by default. The server adds tokenization, head
-math, and JSON on top of these forward times.
+The hybrid policy uses fused only for `N >= 5120 && M <= 256` and falls back to
+dequant + cuBLAS otherwise; that is why 1K prefill sees no fused benefit. The server adds
+tokenization, head math, and JSON on top of these forward times. Short live benchmark
+(16 unique requests/level, hybrid default): c=1 **8.44 req/s**, p50 **123.7 ms**; c=4
+**8.48 req/s**, p50 **459.3 ms**, ~**587 tok/s**. Throughput is flat because forwards are
+serialized; c=4 is queueing, not batching.
 
-Live API comparison against the saved AWQ v2 baseline (28 rows, release binary on GPU 1):
-top-1 **28/28**, mean KL **4.50e-5**, mean MAE **1.143e-3**, max delta **9.734e-3**.
-These deltas are cross-engine BF16 numerical drift, not API differences. The acceptance
-run uses `max_mae 0.0025` / `max_delta 0.01`; the strict `max_mae 0.0005` run is recorded
-and expected to fail. See `docs/RESULTS.md` for per-kind tables. Run
-`scripts/run-eval.sh` against a deployed server to reproduce the comparison and benchmark;
-do not reuse the old vLLM-front throughput claims.
+Live API comparison against the **CPU AWQ golden** (`eval/data/awq-cpu-suite28.json`,
+28 rows): top-1 **28/28**, mean KL **3.06e-5**, mean MAE **8.45e-4**, max delta
+**1.0345e-2** (`r20`). Acceptance uses `top1 1.0`, `max_kl 0.001`, `mean_mae 0.001`,
+`max_delta 0.011` and passes. The historical vLLM baseline gives top-1 28/28, mean KL
+8.07e-5, mean MAE 1.64e-3, max delta 1.45e-2; the vLLM result itself differs from CPU
+golden by max 0.01377 / mean MAE 0.00156, so it is context only. See `docs/RESULTS.md`
+for per-kind tables. Run `scripts/run-eval.sh` to reproduce.
 
 ## One-GPU deployment example (GPU 1 only)
 
@@ -415,10 +417,11 @@ WantedBy=multi-user.target
   final pass; a permute makes 4 passes. The engine serializes them, so `permute` and
   `tournament` scale roughly linearly with pass count.
 - The `single` strategy is the lowest-latency option for ≤16 choices.
-- `JEV_NATIVE_FUSED_W4A16=true` selects the fused kernel. It is numerically correct but
-  slower than the default dequant + cuBLAS path on this GPU/workload (405 vs 176.6 ms at
-  36 tokens), so keep it off unless a new kernel changes that.
-- The default path dequantizes each module into a BF16 workspace and uses cuBLAS BF16
+- `JEV_NATIVE_FUSED_W4A16=true` is the default hybrid policy: fused for
+  `N >= 5120 && M <= 256`, dequant + cuBLAS otherwise. It gives 84.8 ms vs 174.7 ms at
+  36 tokens (2.06x) and 126.4 ms at 76 tokens, but **no benefit at 1K tokens** (falls
+  back). Small-N projections and large prefills remain on the reference path.
+- The fallback path dequantizes each module into a BF16 workspace and uses cuBLAS BF16
   GEMM.
 
 Prometheus metrics exposed:

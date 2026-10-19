@@ -26,8 +26,9 @@ pub struct Config {
     pub native_model: PathBuf,
     /// Keep packed decoder weights resident on the GPU (`JEV_NATIVE_CACHE`).
     pub native_cache: bool,
-    /// Use the fused W4A16 kernel when available (`JEV_NATIVE_FUSED_W4A16`).
-    /// Off by default: the correctness path dequantizes + cuBLAS BF16 GEMM.
+    /// Use the fused W4A16 kernel/hybrid policy (`JEV_NATIVE_FUSED_W4A16`).
+    /// On by default: the native policy uses fused for `N >= 5120 && M <= 256`
+    /// and falls back to dequant + cuBLAS otherwise.
     pub native_fused_w4a16: bool,
     pub max_concurrency: usize,
     pub signing_key: Option<Vec<u8>>,
@@ -60,7 +61,7 @@ impl Config {
             env_string("JEV_NATIVE_MODEL").unwrap_or_else(|| checkpoint.display().to_string()),
         );
         let native_cache = env_bool("JEV_NATIVE_CACHE")?.unwrap_or(true);
-        let native_fused_w4a16 = env_bool("JEV_NATIVE_FUSED_W4A16")?.unwrap_or(false);
+        let native_fused_w4a16 = env_bool("JEV_NATIVE_FUSED_W4A16")?.unwrap_or(true);
 
         let max_concurrency = env_usize("JEV_MAX_CONCURRENCY")?.unwrap_or(DEFAULT_MAX_CONCURRENCY);
         if max_concurrency == 0 {

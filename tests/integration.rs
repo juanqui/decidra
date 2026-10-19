@@ -66,7 +66,7 @@ fn test_config() -> Config {
         hf_snapshot: PathBuf::from("/nonexistent/hf-snapshot"),
         native_model: PathBuf::from("/nonexistent/native-model"),
         native_cache: true,
-        native_fused_w4a16: false,
+        native_fused_w4a16: true,
         max_concurrency: 4,
         signing_key: None,
         metrics_enabled: false,
