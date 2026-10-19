@@ -5,3 +5,5 @@ target/
 .DS_Store
 .idea/
 .vscode/
+__pycache__/
+*.py[cod]

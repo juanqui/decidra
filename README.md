@@ -82,7 +82,12 @@ src/
 tests/
   integration.rs          mock-vLLM end-to-end tests (noul/choice/score/image/signing/proxy)
   fixtures/               tiny tokenizer + real decision-head metadata (no weights)
+eval/                     independent Python harness, baselines, offline mock
+scripts/                  GPU 1 vLLM launch, server run, smoke, full eval
 docs/SPEC.md              API contract, math, and edge cases
+docs/RESULTS.md           measured exactness, drift, benchmarks, GPU saturation
+docs/KERNELS.md           SM89 kernel selection and alternatives
+docs/DEPLOY.md            one-GPU deployment, ports, health, restart
 ```
 
 ## Build and run
@@ -124,9 +129,13 @@ to serve on a tokenizer/head mismatch.
 - `scripts/run-vllm.sh` — disposable GPU 1 test backend on port 8002, with health wait.
 - `scripts/run-server.sh` — build and run the Rust server (default `0.0.0.0:8501`).
 - `scripts/smoke.sh` — health/models/info plus one real decision.
+- `scripts/run-eval.sh` — exactness, saved-baseline suite, bench, and functional checks.
 - `Dockerfile` — multi-stage server image; no weights.
 - `docker-compose.yml` — server only, model mounted read-only, host vLLM via `host.docker.internal`.
+- `eval/` — independent Python evaluation harness and saved baselines.
 - `docs/DEPLOY.md` — GPU selection, ports, health checks, restart, and troubleshooting.
+- `docs/RESULTS.md` — measured exactness, baseline drift, benchmarks, and GPU saturation.
+- `docs/KERNELS.md` — selected SM89 kernels and why they are the best available.
 
 The Rust server uses no GPU. The test backend uses GPU 1 only; GPU 0 is not used by this
 stack.
@@ -258,29 +267,47 @@ Integration tests spin up a mock vLLM (axum) and exercise noul/choice/score, tou
 permute request counts, image chat-completions requests, OpenAI decisions mapping, model
 rewriting, streaming passthrough, signing, 400/502/504 semantics, and malformed JSON.
 
-To evaluate against the Python reference on the same backend:
-
-1. Point both front ends at the same vLLM URL (for example `http://127.0.0.1:8002`).
-2. Send the same JSON bodies to `/v1/decide`, `/v1/decisions`, and image requests.
-3. Compare `probabilities`, `choice`, `adaptation`, and usage. Floating-point values should
-   agree to serialization precision; prompt bytes and label ids should agree exactly.
-4. For `permute`, the four option orders are intentionally identical to Python's, so
-   differences indicate a real regression, not RNG drift.
-
-A minimal comparison loop:
+To evaluate against the Python reference or a saved baseline, use the independent harness
+in `eval/` (no model import, no GPU control):
 
 ```bash
-for body in corpus/*.json; do
-  curl -s localhost:8500/v1/decide -H 'content-type: application/json' -d @"$body" > /tmp/py.json
-  curl -s localhost:8080/v1/decide -H 'content-type: application/json' -d @"$body" > /tmp/rs.json
-  python3 - "$body" <<'PY'
-import json, sys
-a, b = json.load(open('/tmp/py.json')), json.load(open('/tmp/rs.json'))
-assert a['choice'] == b['choice'], (sys.argv[1], a['choice'], b['choice'])
-assert max(abs(x-y) for x, y in zip(a['probabilities'], b['probabilities'])) < 1e-12
-PY
-done
+cd eval
+python3 -m pip install -r requirements.txt
+python3 smoke_test.py -v          # offline mock; no server required
 ```
+
+With vLLM on `127.0.0.1:8002` and the Rust server on `127.0.0.1:8501` already running:
+
+```bash
+./scripts/run-eval.sh
+```
+
+It runs the direct-vLLM exactness check, the saved-v2 baseline comparison (strict and
+documented-tolerance variants), the combined benchmark, functional checks (256 choices,
+`/v1/decisions`, image), optional signing (set `JEV_EVAL_SIGNING_KEY`), and writes reports
+to `eval/out/`. It never starts or stops GPU services.
+
+Measured live results (2026-10-19):
+
+- Rust `/v1/decide` vs a direct vLLM logprob read-out: **28/28**, max delta **4.44e-16**,
+  mean KL **3.53e-18**, 0 errors.
+- Vs the saved production-v2 baseline: top-1 **28/28**, mean KL **1.505e-5**, mean MAE
+  **6.83e-4**, max delta **4.933e-3** (`r22`), 0 errors. The gap is deterministic serving
+  drift; the documented cross-build tolerance is **0.01**, while the strict `1e-3` gate
+  fails by design.
+- Benchmarks: 512 short + 32 long requests, **0 errors**; short throughput plateaus at
+  **34.2 req/s** (c8); long prefill sustains **3,077-3,188 tok/s**.
+- Functional: 256-option choice (17 requests, 1.08 s), `/v1/decisions`, 512x512 image,
+  and HMAC signing all pass.
+
+See [`docs/RESULTS.md`](docs/RESULTS.md) for tables and [`eval/README.md`](eval/README.md)
+for exact commands and tolerance rationale. Kernel selection is documented in
+[`docs/KERNELS.md`](docs/KERNELS.md).
+
+Manual comparison remains possible by sending identical bodies to the shim and the Rust
+front and comparing `probabilities`, `choice`, `adaptation`, and usage. Prompt bytes and
+label ids should match exactly; `permute` uses the same four option orders as Python, so a
+difference there is a real regression rather than RNG drift.
 
 (`localhost:8500` is the existing Python shim; do not expose it to the internet in place of
 the signed Rust front.)

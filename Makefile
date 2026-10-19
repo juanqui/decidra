@@ -1,7 +1,7 @@
 CARGO ?= cargo
 SHELL := /bin/bash
 
-.PHONY: build test fmt clippy smoke run check-config
+.PHONY: build test fmt clippy smoke run check-config eval
 
 build:
 	$(CARGO) build --release --locked
@@ -23,3 +23,6 @@ run:
 
 check-config:
 	$(CARGO) run --release --locked -- --check-config
+
+eval:
+	./scripts/run-eval.sh
