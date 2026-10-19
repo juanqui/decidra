@@ -2241,6 +2241,106 @@ impl Engine {
         self.forward(tokens, last, Stage::Logits, true)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn marlin_fp8_gemm(
+        &self,
+        w: &LinearWeight,
+        xq: &CudaSlice<u8>,
+        a_scales: &CudaSlice<f32>,
+        c: &mut CudaSlice<bf16>,
+        rows: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<()> {
+        {
+            let mut g = self.marlin_locks.lock().unwrap();
+            if g.is_none() {
+                *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
+            }
+        }
+        let locks_guard = self.marlin_locks.lock().unwrap();
+        let locks = locks_guard.as_ref().expect("locks initialized");
+        let (qweight, scales, zeros) = match w {
+            LinearWeight::Marlin {
+                qweight,
+                scales,
+                zeros,
+                ..
+            } => (qweight, scales, zeros),
+            _ => bail!("FP8 path requires a Marlin-repacked module"),
+        };
+        let mut off = 0usize;
+        let mut rest = rows;
+        while rest > 0 {
+            let par = (rest / 64).min(16);
+            let pm = if par > 0 { par * 64 } else { rest };
+            let tmb = pm.div_ceil(16).min(4);
+            let idx = if pm <= 8 { 0 } else { tmb - 1 };
+            let f = &self.kernels.marlin_fp8_cfgs[idx];
+            kernels::marlin_gemm_fp8(
+                &self.gpu, f, xq, qweight, c, scales, zeros, a_scales, locks, off, pm, n, k,
+            )?;
+            off += pm;
+            rest -= pm;
+        }
+        Ok(())
+    }
+
+    /// Benchmark W4A16 vs W4A8 on one already-loaded module (no repack in the
+    /// timed loop). Returns (w4a16_ms, w4a8_ms) per repeat.
+    pub fn bench_matmul_fp8(
+        &self,
+        module: &str,
+        input: &[f32],
+        rows: usize,
+        repeat: usize,
+    ) -> Result<(Vec<f64>, Vec<f64>)> {
+        let was = self.marlin_fp8.swap(false, Ordering::Relaxed);
+        let prov16 = self.provider()?;
+        let w16 = prov16.linear(module)?;
+        self.marlin_fp8.store(true, Ordering::Relaxed);
+        let prov8 = self.provider()?;
+        let w8 = prov8.linear(module)?;
+        self.marlin_fp8.store(was, Ordering::Relaxed);
+        let (n, k) = (w16.out(), w16.in_());
+        let host: Vec<bf16> = input.iter().map(|v| bf16::from_f32(*v)).collect();
+        let x16 = self.gpu.stream.clone_htod(&host)?;
+        let xf = self.gpu.stream.clone_htod(input)?;
+        let mut xq = self.gpu.stream.alloc_zeros::<u8>(rows * k)?;
+        let mut as_ = self.gpu.stream.alloc_zeros::<f32>(rows)?;
+        kernels::quant_fp8(
+            &self.gpu,
+            &self.kernels.quant_fp8,
+            &xf,
+            &mut xq,
+            &mut as_,
+            rows,
+            k,
+        )?;
+        let mut c16 = self.alloc_bf16(rows * n)?;
+        let mut c8 = self.alloc_bf16(rows * n)?;
+        // Warm-up (fills the allocator/Marlin locks).
+        let _ = self.gemm(&x16, rows, &w16)?;
+        self.marlin_fp8_gemm(&w8, &xq, &as_, &mut c8, rows, n, k)?;
+        self.gpu.synchronize()?;
+        let mut t16 = Vec::with_capacity(repeat);
+        let mut t8 = Vec::with_capacity(repeat);
+        for _ in 0..repeat {
+            self.gpu.synchronize()?;
+            let t = std::time::Instant::now();
+            let _ = self.gemm(&x16, rows, &w16)?;
+            self.gpu.synchronize()?;
+            t16.push(t.elapsed().as_secs_f64() * 1e3);
+            self.gpu.synchronize()?;
+            let t = std::time::Instant::now();
+            self.marlin_fp8_gemm(&w8, &xq, &as_, &mut c8, rows, n, k)?;
+            self.gpu.synchronize()?;
+            t8.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        let _ = (&mut c16, &mut c8);
+        Ok((t16, t8))
+    }
+
     /// Experimental W4A8-FP8 path for one module: per-token FP8 activation
     /// quantization + a8-repacked Marlin, compared against W4A16. The caller
     /// must enable `set_marlin(true)` and `set_marlin_fp8(true)`.
@@ -2269,40 +2369,8 @@ impl Engine {
             k,
         )?;
         let mut c = self.alloc_bf16(rows * n)?;
-        {
-            let mut g = self.marlin_locks.lock().unwrap();
-            if g.is_none() {
-                *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
-            }
-        }
-        let got = {
-            let locks_guard = self.marlin_locks.lock().unwrap();
-            let locks = locks_guard.as_ref().expect("locks initialized");
-            let (qweight, scales, zeros) = match &w {
-                LinearWeight::Marlin {
-                    qweight,
-                    scales,
-                    zeros,
-                    ..
-                } => (qweight, scales, zeros),
-                _ => bail!("FP8 path requires a Marlin-repacked module"),
-            };
-            let mut off = 0usize;
-            let mut rest = rows;
-            while rest > 0 {
-                let par = (rest / 64).min(16);
-                let pm = if par > 0 { par * 64 } else { rest };
-                let tmb = pm.div_ceil(16).min(4);
-                let idx = if pm <= 8 { 0 } else { tmb - 1 };
-                let f = &self.kernels.marlin_fp8_cfgs[idx];
-                kernels::marlin_gemm_fp8(
-                    &self.gpu, f, &xq, qweight, &mut c, scales, zeros, &as_, locks, off, pm, n, k,
-                )?;
-                off += pm;
-                rest -= pm;
-            }
-            self.to_f32(&c, rows * n)?
-        };
+        self.marlin_fp8_gemm(&w, &xq, &as_, &mut c, rows, n, k)?;
+        let got = self.to_f32(&c, rows * n)?;
         let was = self.marlin_fp8.swap(false, Ordering::Relaxed);
         let reference = self.matmul_module(module, input, rows, false);
         self.marlin_fp8.store(was, Ordering::Relaxed);
