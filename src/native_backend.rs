@@ -14,6 +14,7 @@ use tokenizers::Tokenizer;
 use crate::{
     backend::{Backend, LogitsFuture},
     batch::{BatchExecutor, BatchHandle, BatchOptions, ExecResult},
+    cache::DecisionCache,
     config::Config,
     error::EngineError,
     prompt,
@@ -86,6 +87,8 @@ impl BatchExecutor for EngineExecutor {
 pub struct NativeBackend {
     tokenizer: Tokenizer,
     queue: BatchHandle,
+    /// Exact `(tokens, head ids)` logits cache. Capacity 0 disables it.
+    cache: DecisionCache,
 }
 
 impl NativeBackend {
@@ -138,6 +141,7 @@ impl NativeBackend {
             batch_window_us = config.native_batch_window_us,
             max_batch_tokens = config.native_max_batch_tokens,
             gdn_chunked = config.native_gdn_chunked,
+            decision_cache_entries = config.decision_cache_size,
             elapsed_secs = started.elapsed().as_secs_f64(),
             "native engine ready"
         );
@@ -157,6 +161,7 @@ impl NativeBackend {
         Ok(Self {
             tokenizer,
             queue: BatchHandle::spawn(executor, options),
+            cache: DecisionCache::new(config.decision_cache_size),
         })
     }
 
@@ -175,6 +180,18 @@ impl Backend for NativeBackend {
             let tokens = self.encode(prompt)?;
             let ids = ids.to_vec();
             let expected = ids.len();
+            // Look up before enqueueing so a hit never waits on the batch worker.
+            // The key is the exact token/head-id pair; no prefix matching.
+            let cache_key = if self.cache.enabled() {
+                if let Some(logits) = self.cache.get(&tokens, &ids) {
+                    metrics::counter!("jev_decision_cache_hits_total").increment(1);
+                    return Ok(logits);
+                }
+                metrics::counter!("jev_decision_cache_misses_total").increment(1);
+                Some((tokens.clone(), ids.clone()))
+            } else {
+                None
+            };
             let receiver = self.queue.submit(tokens, ids)?;
             let result = receiver.await.map_err(|_| {
                 EngineError::Internal("native batch worker dropped the request".to_owned())
@@ -195,6 +212,11 @@ impl Backend for NativeBackend {
                     logits.len(),
                     expected
                 )));
+            }
+            // Only successful, length-checked logits are cached.
+            if let Some((key_tokens, key_ids)) = cache_key {
+                self.cache.insert(&key_tokens, &key_ids, logits.clone());
+                metrics::gauge!("jev_decision_cache_entries").set(self.cache.len() as f64);
             }
             Ok(logits)
         })

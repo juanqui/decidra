@@ -139,6 +139,29 @@ measurement files are kept only for drift context.
   c=1 **1.0**, c=2 **2.0**, c=4 **4.0**, c=8 **5.33**, c=16 **5.33-8.0**;
   `jev_native_batch_queue_depth` peaked at **8** at c=16.
 
+## Exact-decision cache
+
+`JEV_DECISION_CACHE_SIZE` (default **256**, `0` disables) adds a thread-safe LRU in
+`src/cache.rs` keyed by the exact `(token ids, head ids)` pair and holding raw head
+logits. `NativeBackend::logits` checks it after tokenization and before enqueueing;
+successful, length-checked forwards insert, errors are never cached, and hits return a
+clone without touching the engine.
+
+- **Unique prompts unchanged**: suite28 PASS 28/28, KL 3.281e-5, MAE 7.365e-4, max
+  delta 1.010e-2; unique c=1/c=4/c=8 measured **16.04 req/s / 61.1 ms**,
+  **30.78 / 131.4 ms**, **30.26 / 225.8 ms**.
+- **Repeated exact prompt, c=1, 16 requests**: **0.083 s wall, 193 req/s, p50 0.37 ms**
+  (first miss 76.9 ms) versus 16.04 req/s / 61.1 ms uncached.
+- **Repeated exact prompt, c=8, 16 concurrent**: cold round **72.4 req/s, p50 70.9 ms,
+  p95 216.5 ms** (the first concurrent wave misses); warm rounds **1,560-2,000 req/s,
+  p50 2.5-3.1 ms** versus 30.26 req/s / 225.8 ms uncached.
+- Cache metrics: `jev_decision_cache_hits_total`, `jev_decision_cache_misses_total`,
+  `jev_decision_cache_entries` (81 entries after the validation run). Memory is
+  negligible next to the 13.8 GiB process RSS: a 70-token entry is a few hundred bytes,
+  and the absolute worst case (256 x 35K-token prompts) is ~36 MB.
+- **Limitation**: exact prompt+ids only. Shared-prefix reuse (KV cache plus GDN state
+  and conv tail) remains future work and is not provided by this cache.
+
 ## Chunked GDN prefill
 
 `JEV_NATIVE_GDN_CHUNKED=true` (default) selects the TF32 WMMA chunked delta-rule
@@ -176,7 +199,9 @@ concurrency only queues. Throughput saturates at batch 4; `MAX_BATCH=8` allows a
 to drain in one pass, while 12/16 measured no gain and worse p50.
 
 Metrics: `jev_native_batch_size`, `jev_native_batch_queue_depth`,
-`jev_native_batch_wait_seconds`, plus the existing `jev_backend_*` counters.
+`jev_native_batch_wait_seconds`, `jev_decision_cache_hits_total`,
+`jev_decision_cache_misses_total`, `jev_decision_cache_entries`, plus the existing
+`jev_backend_*` counters.
 
 ## Performance
 

@@ -105,6 +105,7 @@ those steps to succeed; there is no partial serving.
 | `JEV_NATIVE_BATCH_WINDOW_US` | `2000` | Batch window in microseconds (max `50000`). The 2 ms default keeps a lone request at ~62 ms p50; 5/10 ms fill wider batches but did not raise throughput. |
 | `JEV_NATIVE_MAX_BATCH_TOKENS` | `16384` | Max total prompt tokens per batch (min `512`); a larger single request runs alone. |
 | `JEV_NATIVE_GDN_CHUNKED` | `true` | Chunked TF32 WMMA GDN prefill for sequences `>= 512` tokens; shorter prompts keep the shared/split recurrence. `false` uses the legacy path. |
+| `JEV_DECISION_CACHE_SIZE` | `256` | Exact-decision logits cache entries (LRU, exact token/head-id key); `0` disables. Successful forwards only; exact prompts only, no prefix caching. |
 | `JEV_SIGNING_KEY` | unset | HMAC-SHA256 response signing. |
 | `JEV_METRICS_ENABLED` | `true` | Prometheus recorder. |
 | `JEV_CUDA_LIBS` | unset | Directory with `libcublas.so.13`/`libcublasLt.so.13`. |

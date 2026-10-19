@@ -191,6 +191,7 @@ GPU 0 is not used by this stack. Inside a container, reserve GPU 1
 | `JEV_NATIVE_BATCH_WINDOW_US` | `2000` | Microseconds the worker waits after a batch's first request for more work (max `50000`); effective value is `0` when batching is disabled. 2 ms keeps a lone request near 62 ms p50. |
 | `JEV_NATIVE_MAX_BATCH_TOKENS` | `16384` | Maximum total prompt tokens per batch (`>= 512`). A single larger request runs alone. |
 | `JEV_NATIVE_GDN_CHUNKED` | `true` | Chunked TF32 WMMA GDN prefill for sequences `>= 512` tokens; shorter prompts keep the shared/split recurrence. Set `false` for the legacy path. |
+| `JEV_DECISION_CACHE_SIZE` | `256` | Exact-decision logits cache entries (LRU, keyed by exact token ids + head ids). `0` disables. Only successful forwards are cached; shared-prefix/KV caching is future work. |
 | `JEV_TOKENIZER` | checkpoint `tokenizer.json` | Tokenizer file or directory override. |
 | `JEV_CALIBRATION` | discovered | `calibration.json` override. |
 | `JEV_CALIBRATION_FITTED` | unset | Optional `fit_bias.py` output. Unset/absent disables it. |
@@ -396,6 +397,13 @@ the 24 GB GPU). The legacy path measured 2.12-2.18 s / 4.23-4.32 s / 8.62-8.97 s
 20.15 s at those lengths. The 10-row long-context suite is **10/10 top-1**, and repeated
 16K/35K runs returned 200 with no timeout/OOM.
 
+Exact-decision cache (256 entries, default): unique prompts are unchanged (suite28
+28/28 and c1/c4/c8 identical within noise). Repeating one exact prompt 16x at c=1
+ran in **0.083 s** (193 req/s, p50 **0.37 ms**, first miss 76.9 ms) versus 16.04 req/s
+and 61.1 ms uncached; a warm c=8 repeat measured **1,560-2,000 req/s**, p50
+**2.5-3.1 ms**, versus 30.26 req/s / 225.8 ms uncached. The cache key is the exact
+token/head-id pair, so a shared prefix or a different option set misses.
+
 A controlled same-GPU comparison against vLLM 0.31.0 (throughput, latency, long
 prefill, startup, memory, and kernel stacks) is in
 [`docs/VLLM-COMPARISON.md`](docs/VLLM-COMPARISON.md). The follow-on ranked
@@ -498,6 +506,12 @@ WantedBy=multi-user.target
 - With Marlin off, `JEV_NATIVE_FUSED_W4A16=true` selects the hybrid fused policy (fused for
   `N >= 5120 && M <= 256`), and the remaining path dequantizes into a BF16 workspace for
   cuBLAS BF16 GEMM.
+- Exact-decision cache: `JEV_DECISION_CACHE_SIZE` (default 256, `0` disables) stores raw
+  head logits keyed by the exact `(token ids, head ids)` pair before the batch queue.
+  Hits return cloned logits without touching the engine; successful forwards insert, and
+  errors are never cached. LRU-evicted, bounded by entries. Typical 70-token entries cost
+  a few hundred bytes; the worst case (256 x 35K-token prompts) is ~36 MB. This is exact
+  prompt matching only — shared-prefix KV/GDN caching is not implemented.
 
 Prometheus metrics exposed:
 
@@ -510,6 +524,8 @@ Prometheus metrics exposed:
 - `jev_native_batch_size` (requests per executed batch)
 - `jev_native_batch_queue_depth` (queued, not executing)
 - `jev_native_batch_wait_seconds` (enqueue to batch start)
+- `jev_decision_cache_hits_total`, `jev_decision_cache_misses_total`
+- `jev_decision_cache_entries` (current LRU occupancy)
 - `jev_decide_total{kind,strategy}`
 - `jev_decide_options`, `jev_decide_pass_options`
 - `jev_decisions_total{kind}`

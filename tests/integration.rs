@@ -73,6 +73,7 @@ fn test_config() -> Config {
         native_batch_window_us: 2_000,
         native_max_batch_tokens: 16_384,
         native_gdn_chunked: true,
+        decision_cache_size: 256,
         signing_key: None,
         metrics_enabled: false,
         max_body_bytes: 8 * 1024 * 1024,

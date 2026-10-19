@@ -9,6 +9,8 @@ pub const DEFAULT_MODEL: &str = "jev-awq";
 pub const DEFAULT_CHECKPOINT: &str = "/srv/models/jev-awq/awq-w4a16-v2";
 pub const DEFAULT_HF_SNAPSHOT: &str = "/srv/models/hf/hub/models--autotrust--JEV-27B-VL/snapshots/ba3f0d584994b37998f235c0a3f6f1beff32ba1e";
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Exact-decision cache entries (`JEV_DECISION_CACHE_SIZE`); 0 disables.
+pub const DEFAULT_DECISION_CACHE_SIZE: usize = 256;
 /// Measured throughput saturates at batch 4 (~2,130-2,180 tok/s on ~71-token
 /// requests); 8 is kept so a burst drains in one pass without costing steady
 /// throughput. Batches of 12/16 only raised p50 in the sweep.
@@ -57,6 +59,9 @@ pub struct Config {
     /// (`JEV_NATIVE_GDN_CHUNKED`). Shorter sequences keep the existing
     /// shared/split recurrence.
     pub native_gdn_chunked: bool,
+    /// Exact-decision logits cache entries (`JEV_DECISION_CACHE_SIZE`).
+    /// Zero disables the cache.
+    pub decision_cache_size: usize,
     pub signing_key: Option<Vec<u8>>,
     pub metrics_enabled: bool,
     pub max_body_bytes: usize,
@@ -114,6 +119,8 @@ impl Config {
             native_batch_window_us = 0;
         }
         let native_gdn_chunked = env_bool("JEV_NATIVE_GDN_CHUNKED")?.unwrap_or(true);
+        let decision_cache_size =
+            env_usize("JEV_DECISION_CACHE_SIZE")?.unwrap_or(DEFAULT_DECISION_CACHE_SIZE);
 
         let signing_key = match std::env::var("JEV_SIGNING_KEY") {
             Ok(key) if !key.is_empty() => Some(key.into_bytes()),
@@ -145,6 +152,7 @@ impl Config {
             native_batch_window_us,
             native_max_batch_tokens,
             native_gdn_chunked,
+            decision_cache_size,
             signing_key,
             metrics_enabled,
             max_body_bytes,
