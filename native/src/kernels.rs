@@ -27,6 +27,10 @@ pub struct Kernels {
     pub gdn_recurrent: CudaFunction,
     pub gdn_recurrent_shared: CudaFunction,
     pub gdn_recurrent_split: CudaFunction,
+    pub gdn_recurrent_shared_batched: CudaFunction,
+    pub gdn_recurrent_split_batched: CudaFunction,
+    pub conv1d_silu_batched: CudaFunction,
+    pub gather_rows: CudaFunction,
     pub dequant_w4a16: CudaFunction,
     pub gemm_w4a16: CudaFunction,
     pub gemm_w4a16_m128: CudaFunction,
@@ -84,6 +88,24 @@ impl Kernels {
                 )?;
                 f
             },
+            gdn_recurrent_shared_batched: {
+                let f = gpu.func("gdn_recurrent_shared_batched")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    65536,
+                )?;
+                f
+            },
+            gdn_recurrent_split_batched: {
+                let f = gpu.func("gdn_recurrent_split_batched")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    32768,
+                )?;
+                f
+            },
+            conv1d_silu_batched: gpu.func("conv1d_silu_batched_bf16")?,
+            gather_rows: gpu.func("gather_rows_bf16")?,
             dequant_w4a16: gpu.func("dequant_w4a16_bf16")?,
             marlin_cfgs: {
                 const NAMES: [&str; 5] = [
@@ -574,30 +596,41 @@ pub fn marlin_gemm(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn attention_warp(
+pub fn attention_warp<Q, K, V, O>(
     gpu: &Gpu,
-    k: &CudaFunction,
-    q: &CudaSlice<bf16>,
-    kk: &CudaSlice<bf16>,
-    v: &CudaSlice<bf16>,
-    out: &mut CudaSlice<bf16>,
+    f: &CudaFunction,
+    q: &Q,
+    kk: &K,
+    v: &V,
+    out: &mut O,
     seq: usize,
     n_heads: usize,
     n_kv: usize,
     hd: usize,
     scale: f32,
-) -> Result<()> {
+) -> Result<()>
+where
+    Q: DevicePtr<bf16>,
+    K: DevicePtr<bf16>,
+    V: DevicePtr<bf16>,
+    O: DevicePtrMut<bf16>,
+{
     let cfg = LaunchConfig {
         grid_dim: (n_heads as u32, seq.div_ceil(4) as u32, 1),
         block_dim: (128, 1, 1),
         shared_mem_bytes: 0,
     };
     let (seq_i, nh, nkv, hd_i) = (seq as i32, n_heads as i32, n_kv as i32, hd as i32);
-    let mut l = gpu.stream.launch_builder(k);
-    l.arg(q);
-    l.arg(kk);
-    l.arg(v);
-    l.arg(out);
+    let (qp, _r0) = q.device_ptr(&gpu.stream);
+    let (kp, _r1) = kk.device_ptr(&gpu.stream);
+    let (vp, _r2) = v.device_ptr(&gpu.stream);
+    let (op, _r3) = out.device_ptr_mut(&gpu.stream);
+    let (qp, kp, vp, op) = (qp, kp, vp, op);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(&qp);
+    l.arg(&kp);
+    l.arg(&vp);
+    l.arg(&op);
     l.arg(&seq_i);
     l.arg(&nh);
     l.arg(&nkv);
@@ -608,19 +641,25 @@ pub fn attention_warp(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn attention_tc(
+pub fn attention_tc<Q, K, V, O>(
     gpu: &Gpu,
-    k: &CudaFunction,
-    q: &CudaSlice<bf16>,
-    kk: &CudaSlice<bf16>,
-    v: &CudaSlice<bf16>,
-    out: &mut CudaSlice<bf16>,
+    f: &CudaFunction,
+    q: &Q,
+    kk: &K,
+    v: &V,
+    out: &mut O,
     seq: usize,
     n_heads: usize,
     n_kv: usize,
     hd: usize,
     scale: f32,
-) -> Result<()> {
+) -> Result<()>
+where
+    Q: DevicePtr<bf16>,
+    K: DevicePtr<bf16>,
+    V: DevicePtr<bf16>,
+    O: DevicePtrMut<bf16>,
+{
     // hd is one of 64/128/256 (validated by the caller / loaded cubin).
     let smem = match hd {
         64 => 27648usize,
@@ -634,11 +673,16 @@ pub fn attention_tc(
         shared_mem_bytes: smem as u32,
     };
     let (seq_i, nh, nkv) = (seq as i32, n_heads as i32, n_kv as i32);
-    let mut l = gpu.stream.launch_builder(k);
-    l.arg(q);
-    l.arg(kk);
-    l.arg(v);
-    l.arg(out);
+    let (qp, _r0) = q.device_ptr(&gpu.stream);
+    let (kp, _r1) = kk.device_ptr(&gpu.stream);
+    let (vp, _r2) = v.device_ptr(&gpu.stream);
+    let (op, _r3) = out.device_ptr_mut(&gpu.stream);
+    let (qp, kp, vp, op) = (qp, kp, vp, op);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(&qp);
+    l.arg(&kp);
+    l.arg(&vp);
+    l.arg(&op);
     l.arg(&seq_i);
     l.arg(&nh);
     l.arg(&nkv);
@@ -648,22 +692,31 @@ pub fn attention_tc(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn gdn_recurrent_shared(
+pub fn gdn_recurrent_shared<QF, KF, VF, G, B, ST, O>(
     gpu: &Gpu,
-    k: &CudaFunction,
-    qf: &CudaSlice<f32>,
-    kf: &CudaSlice<f32>,
-    vf: &CudaSlice<f32>,
-    g: &CudaSlice<f32>,
-    beta: &CudaSlice<f32>,
-    state: &mut CudaSlice<f32>,
-    out: &mut CudaSlice<bf16>,
+    f: &CudaFunction,
+    qf: &QF,
+    kf: &KF,
+    vf: &VF,
+    g: &G,
+    beta: &B,
+    state: &mut ST,
+    out: &mut O,
     seq: usize,
     heads: usize,
     dk: usize,
     dv: usize,
     vchunks: usize,
-) -> Result<()> {
+) -> Result<()>
+where
+    QF: DevicePtr<f32>,
+    KF: DevicePtr<f32>,
+    VF: DevicePtr<f32>,
+    G: DevicePtr<f32>,
+    B: DevicePtr<f32>,
+    ST: DevicePtrMut<f32>,
+    O: DevicePtrMut<bf16>,
+{
     if dv % vchunks != 0 {
         anyhow::bail!("dv={dv} not divisible by gdn chunks={vchunks}");
     }
@@ -682,14 +735,22 @@ pub fn gdn_recurrent_shared(
         vc as i32,
         vchunks as i32,
     );
-    let mut l = gpu.stream.launch_builder(k);
-    l.arg(qf);
-    l.arg(kf);
-    l.arg(vf);
-    l.arg(g);
-    l.arg(beta);
-    l.arg(state);
-    l.arg(out);
+    let (qfp, _r0) = qf.device_ptr(&gpu.stream);
+    let (kfp, _r1) = kf.device_ptr(&gpu.stream);
+    let (vfp, _r2) = vf.device_ptr(&gpu.stream);
+    let (gp, _r3) = g.device_ptr(&gpu.stream);
+    let (bp, _r4) = beta.device_ptr(&gpu.stream);
+    let (sp, _r5) = state.device_ptr_mut(&gpu.stream);
+    let (op, _r6) = out.device_ptr_mut(&gpu.stream);
+    let (qfp, kfp, vfp, gp, bp, sp, op) = (qfp, kfp, vfp, gp, bp, sp, op);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(&qfp);
+    l.arg(&kfp);
+    l.arg(&vfp);
+    l.arg(&gp);
+    l.arg(&bp);
+    l.arg(&sp);
+    l.arg(&op);
     l.arg(&seq_i);
     l.arg(&heads_i);
     l.arg(&dk_i);
@@ -701,21 +762,30 @@ pub fn gdn_recurrent_shared(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn gdn_recurrent_split(
+pub fn gdn_recurrent_split<QF, KF, VF, G, B, ST, O>(
     gpu: &Gpu,
-    k: &CudaFunction,
-    qf: &CudaSlice<f32>,
-    kf: &CudaSlice<f32>,
-    vf: &CudaSlice<f32>,
-    g: &CudaSlice<f32>,
-    beta: &CudaSlice<f32>,
-    state: &mut CudaSlice<f32>,
-    out: &mut CudaSlice<bf16>,
+    f: &CudaFunction,
+    qf: &QF,
+    kf: &KF,
+    vf: &VF,
+    g: &G,
+    beta: &B,
+    state: &mut ST,
+    out: &mut O,
     seq: usize,
     heads: usize,
     dk: usize,
     dv: usize,
-) -> Result<()> {
+) -> Result<()>
+where
+    QF: DevicePtr<f32>,
+    KF: DevicePtr<f32>,
+    VF: DevicePtr<f32>,
+    G: DevicePtr<f32>,
+    B: DevicePtr<f32>,
+    ST: DevicePtrMut<f32>,
+    O: DevicePtrMut<bf16>,
+{
     let vc = dv.min(32);
     if dv % vc != 0 {
         anyhow::bail!("dv={dv} not divisible by vc={vc}");
@@ -736,20 +806,86 @@ pub fn gdn_recurrent_split(
         vc as i32,
         chunks as i32,
     );
-    let mut l = gpu.stream.launch_builder(k);
-    l.arg(qf);
-    l.arg(kf);
-    l.arg(vf);
-    l.arg(g);
-    l.arg(beta);
-    l.arg(state);
-    l.arg(out);
+    let (qfp, _r0) = qf.device_ptr(&gpu.stream);
+    let (kfp, _r1) = kf.device_ptr(&gpu.stream);
+    let (vfp, _r2) = vf.device_ptr(&gpu.stream);
+    let (gp, _r3) = g.device_ptr(&gpu.stream);
+    let (bp, _r4) = beta.device_ptr(&gpu.stream);
+    let (sp, _r5) = state.device_ptr_mut(&gpu.stream);
+    let (op, _r6) = out.device_ptr_mut(&gpu.stream);
+    let (qfp, kfp, vfp, gp, bp, sp, op) = (qfp, kfp, vfp, gp, bp, sp, op);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(&qfp);
+    l.arg(&kfp);
+    l.arg(&vfp);
+    l.arg(&gp);
+    l.arg(&bp);
+    l.arg(&sp);
+    l.arg(&op);
     l.arg(&seq_i);
     l.arg(&heads_i);
     l.arg(&dk_i);
     l.arg(&dv_i);
     l.arg(&vc_i);
     l.arg(&ch_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent<QF, KF, VF, G, B, ST, O>(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    qf: &QF,
+    kf: &KF,
+    vf: &VF,
+    g: &G,
+    beta: &B,
+    state: &mut ST,
+    out: &mut O,
+    seq: usize,
+    heads: usize,
+    dk: usize,
+    dv: usize,
+) -> Result<()>
+where
+    QF: DevicePtr<f32>,
+    KF: DevicePtr<f32>,
+    VF: DevicePtr<f32>,
+    G: DevicePtr<f32>,
+    B: DevicePtr<f32>,
+    ST: DevicePtrMut<f32>,
+    O: DevicePtrMut<bf16>,
+{
+    if dv > 128 {
+        anyhow::bail!("gdn_recurrent supports dv <= 128, got {dv}");
+    }
+    let cfg = LaunchConfig {
+        grid_dim: (heads as u32, 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (seq_i, heads_i, dk_i, dv_i) = (seq as i32, heads as i32, dk as i32, dv as i32);
+    let (qfp, _r0) = qf.device_ptr(&gpu.stream);
+    let (kfp, _r1) = kf.device_ptr(&gpu.stream);
+    let (vfp, _r2) = vf.device_ptr(&gpu.stream);
+    let (gp, _r3) = g.device_ptr(&gpu.stream);
+    let (bp, _r4) = beta.device_ptr(&gpu.stream);
+    let (sp, _r5) = state.device_ptr_mut(&gpu.stream);
+    let (op, _r6) = out.device_ptr_mut(&gpu.stream);
+    let (qfp, kfp, vfp, gp, bp, sp, op) = (qfp, kfp, vfp, gp, bp, sp, op);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(&qfp);
+    l.arg(&kfp);
+    l.arg(&vfp);
+    l.arg(&gp);
+    l.arg(&bp);
+    l.arg(&sp);
+    l.arg(&op);
+    l.arg(&seq_i);
+    l.arg(&heads_i);
+    l.arg(&dk_i);
+    l.arg(&dv_i);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }
@@ -826,9 +962,35 @@ pub fn gdn_prepare(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn gdn_recurrent(
+pub fn conv1d_silu_batched(
     gpu: &Gpu,
-    k: &CudaFunction,
+    f: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    w: &CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+    offsets: &CudaSlice<i32>,
+    lens: &CudaSlice<i32>,
+    batch: usize,
+    ch: usize,
+) -> Result<()> {
+    let cfg = cfg_1d(ch, 128);
+    let (b_i, ch_i) = (batch as i32, ch as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(w);
+    l.arg(out);
+    l.arg(offsets);
+    l.arg(lens);
+    l.arg(&b_i);
+    l.arg(&ch_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_split_batched(
+    gpu: &Gpu,
+    f: &CudaFunction,
     qf: &CudaSlice<f32>,
     kf: &CudaSlice<f32>,
     vf: &CudaSlice<f32>,
@@ -836,24 +998,27 @@ pub fn gdn_recurrent(
     beta: &CudaSlice<f32>,
     state: &mut CudaSlice<f32>,
     out: &mut CudaSlice<bf16>,
-    seq: usize,
+    offsets: &CudaSlice<i32>,
+    lens: &CudaSlice<i32>,
+    batch: usize,
     heads: usize,
     dk: usize,
     dv: usize,
 ) -> Result<()> {
-    if dv > 128 {
-        anyhow::bail!("gdn_recurrent supports dv <= 128, got {dv}");
+    let vc = dv.min(32);
+    if dv % vc != 0 {
+        anyhow::bail!("dv={dv} not divisible by vc={vc}");
     }
+    let chunks = dv / vc;
+    let smem = dk * (vc + 1) * 4;
     let cfg = LaunchConfig {
-        grid_dim: (heads as u32, 1, 1),
-        block_dim: (128, 1, 1),
-        shared_mem_bytes: 0,
+        grid_dim: ((heads * chunks) as u32, batch as u32, 1),
+        block_dim: ((vc * 4) as u32, 1, 1),
+        shared_mem_bytes: smem as u32,
     };
-    let seq_i = seq as i32;
-    let heads_i = heads as i32;
-    let dk_i = dk as i32;
-    let dv_i = dv as i32;
-    let mut l = gpu.stream.launch_builder(k);
+    let (heads_i, dk_i, dv_i, vc_i, ch_i) =
+        (heads as i32, dk as i32, dv as i32, vc as i32, chunks as i32);
+    let mut l = gpu.stream.launch_builder(f);
     l.arg(qf);
     l.arg(kf);
     l.arg(vf);
@@ -861,10 +1026,93 @@ pub fn gdn_recurrent(
     l.arg(beta);
     l.arg(state);
     l.arg(out);
-    l.arg(&seq_i);
+    l.arg(offsets);
+    l.arg(lens);
     l.arg(&heads_i);
     l.arg(&dk_i);
     l.arg(&dv_i);
+    l.arg(&vc_i);
+    l.arg(&ch_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_shared_batched(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    qf: &CudaSlice<f32>,
+    kf: &CudaSlice<f32>,
+    vf: &CudaSlice<f32>,
+    g: &CudaSlice<f32>,
+    beta: &CudaSlice<f32>,
+    state: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+    offsets: &CudaSlice<i32>,
+    lens: &CudaSlice<i32>,
+    batch: usize,
+    heads: usize,
+    dk: usize,
+    dv: usize,
+    vchunks: usize,
+) -> Result<()> {
+    if dv % vchunks != 0 {
+        anyhow::bail!("dv={dv} not divisible by gdn chunks={vchunks}");
+    }
+    let vc = dv / vchunks;
+    let smem = dk * vc * 4;
+    let cfg = LaunchConfig {
+        grid_dim: ((heads * vchunks) as u32, batch as u32, 1),
+        block_dim: (vc as u32, 1, 1),
+        shared_mem_bytes: smem as u32,
+    };
+    let (heads_i, dk_i, dv_i, vc_i, vch_i) = (
+        heads as i32,
+        dk as i32,
+        dv as i32,
+        vc as i32,
+        vchunks as i32,
+    );
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(qf);
+    l.arg(kf);
+    l.arg(vf);
+    l.arg(g);
+    l.arg(beta);
+    l.arg(state);
+    l.arg(out);
+    l.arg(offsets);
+    l.arg(lens);
+    l.arg(&heads_i);
+    l.arg(&dk_i);
+    l.arg(&dv_i);
+    l.arg(&vc_i);
+    l.arg(&vch_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+pub fn gather_rows(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    src: &CudaSlice<bf16>,
+    rows: &CudaSlice<i32>,
+    out: &mut CudaSlice<bf16>,
+    n_rows: usize,
+    cols: usize,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (n_rows as u32, 16, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (nr, c) = (n_rows as i32, cols as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(src);
+    l.arg(rows);
+    l.arg(out);
+    l.arg(&nr);
+    l.arg(&c);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }

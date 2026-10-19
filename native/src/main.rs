@@ -18,6 +18,7 @@ fn main() -> Result<()> {
         "info" => cmd_info(&args[1..]),
         "dequant" => cmd_dequant(&args[1..]),
         "matmul" => cmd_matmul(&args[1..]),
+        "batch" => cmd_batch(&args[1..]),
         "marlin-dump" => cmd_marlin_dump(&args[1..]),
         "alloctest" => cmd_alloctest(),
         other => bail!(
@@ -135,6 +136,143 @@ fn cmd_marlin_dump(args: &[String]) -> Result<()> {
         s.len(),
         z.len()
     );
+    Ok(())
+}
+
+fn read_json_path_or_inline(s: &str) -> Result<serde_json::Value> {
+    let text = if s.trim_start().starts_with('[') || s.trim_start().starts_with('{') {
+        s.to_string()
+    } else {
+        std::fs::read_to_string(s)
+            .with_context(|| format!("cannot read JSON from {s} (not inline JSON)"))?
+    };
+    serde_json::from_str(&text).with_context(|| format!("invalid JSON: {s}"))
+}
+
+fn parse_token_batches(v: &serde_json::Value) -> Result<Vec<Vec<u32>>> {
+    let arr = v
+        .as_array()
+        .context("expected a JSON array of token-id arrays")?;
+    let mut out = Vec::with_capacity(arr.len());
+    for (i, item) in arr.iter().enumerate() {
+        let ids = item
+            .as_array()
+            .with_context(|| format!("batch item {i} is not an array"))?;
+        let mut row = Vec::with_capacity(ids.len());
+        for x in ids {
+            let n = x
+                .as_u64()
+                .with_context(|| format!("batch item {i} has a non-integer token id"))?;
+            row.push(n as u32);
+        }
+        out.push(row);
+    }
+    Ok(out)
+}
+
+fn cmd_batch(args: &[String]) -> Result<()> {
+    let model = PathBuf::from(req(args, "--model")?);
+    let tokens_v = read_json_path_or_inline(req(args, "--tokens")?)?;
+    let token_sets = parse_token_batches(&tokens_v)?;
+    if token_sets.is_empty() {
+        bail!("empty batch");
+    }
+    let shared_ids = match opt(args, "--head-ids") {
+        Some(s) => Some(parse_ids(s)?),
+        None => None,
+    };
+    let per_item_ids = match opt(args, "--head-ids-json") {
+        Some(path) => {
+            let v = read_json_path_or_inline(path)?;
+            Some(parse_token_batches(&v)?)
+        }
+        None => None,
+    };
+    let repeat: usize = opt(args, "--repeat").unwrap_or("1").parse()?;
+    let rows: Vec<&[u32]> = token_sets.iter().map(Vec::as_slice).collect();
+
+    let eng = Engine::new(&model)?;
+    if args.iter().any(|a| a == "--marlin") {
+        eng.set_marlin(true);
+    }
+    if args.iter().any(|a| a == "--legacy-gdn") {
+        eng.set_gdn_shared(false);
+        eng.set_gdn_split(false);
+    }
+    if args.iter().any(|a| a == "--gdn-shared") {
+        eng.set_gdn_split(false);
+    }
+    if args.iter().any(|a| a == "--legacy-attention") {
+        eng.set_warp_attention(false);
+    }
+    if args.iter().any(|a| a == "--no-cache") {
+        eng.set_cache_weights(false);
+    }
+    if args.iter().any(|a| a == "--preload") {
+        let t = std::time::Instant::now();
+        eng.preload_all()?;
+        eprintln!("preload: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+    let total_tokens: usize = token_sets.iter().map(Vec::len).sum();
+    let mut times = Vec::new();
+    let mut result: Vec<Vec<f32>> = Vec::new();
+    for it in 0..repeat.max(1) {
+        let t = std::time::Instant::now();
+        match (&shared_ids, &per_item_ids) {
+            (Some(ids), _) => {
+                let per: Vec<&[u32]> = (0..rows.len()).map(|_| ids.as_slice()).collect();
+                result = eng.decision_logits_batch(&rows, &per)?;
+            }
+            (None, Some(per)) => {
+                if per.len() != rows.len() {
+                    bail!(
+                        "--head-ids-json has {} items but the batch has {}",
+                        per.len(),
+                        rows.len()
+                    );
+                }
+                let per: Vec<&[u32]> = per.iter().map(Vec::as_slice).collect();
+                result = eng.decision_logits_batch(&rows, &per)?;
+            }
+            (None, None) => {
+                result = eng.forward_last_hidden_batch(&rows)?;
+            }
+        }
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        times.push(ms);
+        eprintln!("batch[{it}]: {ms:.2} ms");
+        if it + 1 == repeat.max(1) {
+            break;
+        }
+    }
+    if repeat > 1 {
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = times.iter().cloned().fold(0.0_f64, f64::max);
+        eprintln!(
+            "batch mean {mean:.2} ms | min {min:.2} | max {max:.2} | {:.2} ms/request | {:.1} tok/s",
+            mean / rows.len() as f64,
+            total_tokens as f64 / (mean / 1e3)
+        );
+    }
+    if let Some(path) = opt(args, "--out") {
+        std::fs::write(path, serde_json::to_vec_pretty(&result)?)?;
+        eprintln!("wrote {path}");
+    }
+    let is_logits = shared_ids.is_some() || per_item_ids.is_some();
+    for (i, vals) in result.iter().enumerate() {
+        if is_logits {
+            let (max_abs, _) = stats(vals);
+            println!("{i}: logits {:?} (max_abs {max_abs:.4})", vals);
+        } else {
+            let (max_abs, rms) = stats(vals);
+            println!(
+                "{i}: hidden[{}] max_abs {max_abs:.4} rms {rms:.4} first3 {:?}",
+                vals.len(),
+                &vals[..vals.len().min(3)]
+            );
+        }
+    }
     Ok(())
 }
 

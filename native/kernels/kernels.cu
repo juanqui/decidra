@@ -884,6 +884,153 @@ extern "C" __global__ void gdn_recurrent_split(
 }
 
 // ---------------------------------------------------------------------------
+// Batched variants: every sequence is a contiguous row range
+// [offsets[s], offsets[s] + lens[s]) in the flattened [total, ...] buffers.
+// ---------------------------------------------------------------------------
+
+// Depthwise causal conv + SiLU with a causal restart per sequence.
+extern "C" __global__ void conv1d_silu_batched_bf16(
+    const bf16* __restrict__ x, const bf16* __restrict__ w,
+    bf16* __restrict__ out, const int* __restrict__ offsets,
+    const int* __restrict__ lens, int batch, int ch) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= ch) return;
+  for (int s = 0; s < batch; ++s) {
+    int o = offsets[s];
+    int l = lens[s];
+    for (int t = 0; t < l; ++t) {
+      float acc = 0.f;
+      for (int j = 0; j < 4; ++j) {
+        int src = t - 3 + j;
+        if (src >= 0)
+          acc += bf2f(x[(size_t)(o + src) * ch + c]) * bf2f(w[c * 4 + j]);
+      }
+      float v = rb(acc);
+      out[(size_t)(o + t) * ch + c] = f2bf(v / (1.0f + expf(-v)));
+    }
+  }
+}
+
+// 4-lane split GDN recurrence, one CTA per (head slice, sequence).
+// grid: (heads*chunks, batch); block: vc*4; smem: dk*(vc+1)*4.
+extern "C" __global__ void gdn_recurrent_split_batched(
+    const float* __restrict__ qf, const float* __restrict__ kf,
+    const float* __restrict__ vf, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    bf16* __restrict__ out, const int* __restrict__ offsets,
+    const int* __restrict__ lens, int heads, int dk, int dv, int vc,
+    int chunks) {
+  extern __shared__ float S[];
+  int sidx = blockIdx.y;
+  int h = blockIdx.x / chunks;
+  int chunk = blockIdx.x % chunks;
+  int tid = threadIdx.x;
+  int j = tid / GDN_L;
+  int l = tid % GDN_L;
+  if (j >= vc) return;
+  int base = offsets[sidx];
+  int seq = lens[sidx];
+  int v0 = chunk * vc;
+  int gj = v0 + j;
+  int pad = vc + 1;
+  float* col = state + ((size_t)sidx * heads + h) * dk * dv + v0;
+  int per = dk / GDN_L;
+  int i0 = l * per;
+  int i1 = (l == GDN_L - 1) ? dk : (l + 1) * per;
+
+  for (int i = i0; i < i1; ++i) S[i * pad + j] = col[(size_t)i * dv + j];
+
+  for (int t = 0; t < seq; ++t) {
+    int row = base + t;
+    float dec = expf(g[row * heads + h]);
+    float bt = beta[row * heads + h];
+    const float* kt = kf + ((size_t)row * heads + h) * dk;
+    float kv = 0.f;
+    for (int i = i0; i < i1; ++i) {
+      float sv = S[i * pad + j] * dec;
+      S[i * pad + j] = sv;
+      kv += sv * kt[i];
+    }
+    kv += __shfl_xor_sync(0xffffffffu, kv, 1);
+    kv += __shfl_xor_sync(0xffffffffu, kv, 2);
+    float del = (vf[((size_t)row * heads + h) * dv + gj] - kv) * bt;
+    float o = 0.f;
+    const float* qt = qf + ((size_t)row * heads + h) * dk;
+    for (int i = i0; i < i1; ++i) {
+      float sv = S[i * pad + j] + kt[i] * del;
+      S[i * pad + j] = sv;
+      o += sv * qt[i];
+    }
+    o += __shfl_xor_sync(0xffffffffu, o, 1);
+    o += __shfl_xor_sync(0xffffffffu, o, 2);
+    if (l == 0) out[((size_t)row * heads + h) * dv + gj] = f2bf(o);
+  }
+
+  for (int i = i0; i < i1; ++i) col[(size_t)i * dv + j] = S[i * pad + j];
+}
+
+// Single-column shared-state GDN recurrence, one CTA per (head slice, seq).
+// grid: (heads*chunks, batch); block: vc; smem: dk*vc*4.
+extern "C" __global__ void gdn_recurrent_shared_batched(
+    const float* __restrict__ qf, const float* __restrict__ kf,
+    const float* __restrict__ vf, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    bf16* __restrict__ out, const int* __restrict__ offsets,
+    const int* __restrict__ lens, int heads, int dk, int dv, int vc,
+    int vchunks) {
+  extern __shared__ float S[];
+  int sidx = blockIdx.y;
+  int h = blockIdx.x / vchunks;
+  int chunk = blockIdx.x % vchunks;
+  int j = threadIdx.x;
+  if (j >= vc) return;
+  int base = offsets[sidx];
+  int seq = lens[sidx];
+  int v0 = chunk * vc;
+  int gj = v0 + j;
+  float* col = state + ((size_t)sidx * heads + h) * dk * dv + v0;
+
+  for (int i = 0; i < dk; ++i) S[i * vc + j] = col[(size_t)i * dv + j];
+
+  for (int t = 0; t < seq; ++t) {
+    int row = base + t;
+    float dec = expf(g[row * heads + h]);
+    float bt = beta[row * heads + h];
+    const float* kt = kf + ((size_t)row * heads + h) * dk;
+    float kv = 0.f;
+    for (int i = 0; i < dk; ++i) {
+      float sv = S[i * vc + j] * dec;
+      S[i * vc + j] = sv;
+      kv += sv * kt[i];
+    }
+    float del = (vf[((size_t)row * heads + h) * dv + gj] - kv) * bt;
+    float o = 0.f;
+    const float* qt = qf + ((size_t)row * heads + h) * dk;
+    for (int i = 0; i < dk; ++i) {
+      float s = S[i * vc + j] + kt[i] * del;
+      S[i * vc + j] = s;
+      o += s * qt[i];
+    }
+    out[((size_t)row * heads + h) * dv + gj] = f2bf(o);
+  }
+
+  for (int i = 0; i < dk; ++i) col[(size_t)i * dv + j] = S[i * vc + j];
+}
+
+// Gather selected rows: out[r, :] = src[rows[r], :].
+extern "C" __global__ void gather_rows_bf16(const bf16* __restrict__ src,
+                                            const int* __restrict__ rows,
+                                            bf16* __restrict__ out, int n_rows,
+                                            int cols) {
+  int r = blockIdx.x;
+  if (r >= n_rows) return;
+  int row = rows[r];
+  for (int j = blockIdx.y * blockDim.x + threadIdx.x; j < cols;
+       j += blockDim.x * gridDim.y)
+    out[(size_t)r * cols + j] = src[(size_t)row * cols + j];
+}
+
+// ---------------------------------------------------------------------------
 // Embedding gather (device-side variant, not used by the CPU-gather path).
 // ---------------------------------------------------------------------------
 extern "C" __global__ void embed_gather_bf16(const bf16* __restrict__ table,

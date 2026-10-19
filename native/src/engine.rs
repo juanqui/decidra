@@ -189,6 +189,59 @@ const _: fn() = || {
     assert_send::<Engine>();
 };
 
+/// Flattened multi-sequence batch: sequences are row ranges
+/// `[offsets[s], offsets[s] + lens[s])` of one `[total, ...]` buffer.
+struct BatchInfo {
+    offsets: Vec<usize>,
+    lens: Vec<usize>,
+    total: usize,
+    offsets_dev: CudaSlice<i32>,
+    lens_dev: CudaSlice<i32>,
+}
+
+impl BatchInfo {
+    fn new(gpu: &Gpu, tokens: &[&[u32]]) -> Result<Self> {
+        if tokens.is_empty() {
+            bail!("empty batch");
+        }
+        let mut offsets = Vec::with_capacity(tokens.len());
+        let mut lens = Vec::with_capacity(tokens.len());
+        let mut total = 0usize;
+        for (i, t) in tokens.iter().enumerate() {
+            if t.is_empty() {
+                bail!("batch item {i} has no tokens");
+            }
+            offsets.push(total);
+            lens.push(t.len());
+            total += t.len();
+        }
+        let off_i: Vec<i32> = offsets.iter().map(|&v| v as i32).collect();
+        let len_i: Vec<i32> = lens.iter().map(|&v| v as i32).collect();
+        Ok(Self {
+            offsets,
+            lens,
+            total,
+            offsets_dev: gpu.stream.clone_htod(&off_i)?,
+            lens_dev: gpu.stream.clone_htod(&len_i)?,
+        })
+    }
+
+    fn batch(&self) -> usize {
+        self.lens.len()
+    }
+
+    /// Per-row position inside its own sequence (RoPE resets per sequence).
+    fn positions(&self) -> Vec<usize> {
+        let mut pos = Vec::with_capacity(self.total);
+        for s in 0..self.batch() {
+            for t in 0..self.lens[s] {
+                pos.push(t);
+            }
+        }
+        pos
+    }
+}
+
 impl Engine {
     pub fn new(model_dir: &std::path::Path) -> Result<Self> {
         let cfg = Config::from_dir(model_dir)?;
@@ -564,6 +617,663 @@ impl Engine {
         result
     }
 
+    // -----------------------------------------------------------------
+    // Batched inference
+    // -----------------------------------------------------------------
+
+    /// Validate a batch request and flatten token ids.
+    fn batch_tokens(&self, tokens: &[&[u32]]) -> Result<Vec<u32>> {
+        if tokens.is_empty() {
+            bail!("empty batch");
+        }
+        let mut flat = Vec::new();
+        for (i, t) in tokens.iter().enumerate() {
+            if t.is_empty() {
+                bail!("batch item {i} has no tokens");
+            }
+            flat.extend_from_slice(t);
+        }
+        Ok(flat)
+    }
+
+    fn rope_tables_positions(
+        &self,
+        positions: &[usize],
+    ) -> Result<(CudaSlice<bf16>, CudaSlice<bf16>)> {
+        let dim = self.cfg.rotary_dim();
+        let half = dim / 2;
+        let theta = self.cfg.rope_theta;
+        let mut inv = vec![0f32; half];
+        for (i, v) in inv.iter_mut().enumerate() {
+            *v = 1.0 / theta.powf((2 * i) as f32 / dim as f32);
+        }
+        let mut cos = vec![bf16::ZERO; positions.len() * half];
+        let mut sin = vec![bf16::ZERO; positions.len() * half];
+        for (row, &pos) in positions.iter().enumerate() {
+            for i in 0..half {
+                let ang = pos as f32 * inv[i];
+                cos[row * half + i] = bf16::from_f32(ang.cos());
+                sin[row * half + i] = bf16::from_f32(ang.sin());
+            }
+        }
+        Ok((
+            self.gpu.stream.clone_htod(&cos)?,
+            self.gpu.stream.clone_htod(&sin)?,
+        ))
+    }
+
+    /// Final RMSNorm over `rows` flattened rows.
+    fn final_norm_rows(&self, x: &CudaSlice<bf16>, rows: usize) -> Result<Buf> {
+        let hidden = self.cfg.hidden_size;
+        let norm = self.provider()?.final_norm()?;
+        let mut h = self.alloc_bf16(rows * hidden)?;
+        timed!(
+            self,
+            "norm.final",
+            kernels::rmsnorm(
+                &self.gpu,
+                &self.kernels.rmsnorm,
+                x,
+                &norm,
+                &mut h,
+                rows,
+                hidden,
+                self.cfg.rms_norm_eps,
+                true,
+            )?
+        );
+        Ok(h)
+    }
+
+    /// Device-side indices of each sequence's last row.
+    fn last_row_indices(&self, b: &BatchInfo) -> Result<CudaSlice<i32>> {
+        let idx: Vec<i32> = (0..b.batch())
+            .map(|s| (b.offsets[s] + b.lens[s] - 1) as i32)
+            .collect();
+        Ok(self.gpu.stream.clone_htod(&idx)?)
+    }
+
+    fn gather_last_rows(&self, h: &CudaSlice<bf16>, b: &BatchInfo, cols: usize) -> Result<Buf> {
+        let idx = self.last_row_indices(b)?;
+        let mut out = self.alloc_bf16(b.batch() * cols)?;
+        kernels::gather_rows(
+            &self.gpu,
+            &self.kernels.gather_rows,
+            h,
+            &idx,
+            &mut out,
+            b.batch(),
+            cols,
+        )?;
+        Ok(out)
+    }
+
+    fn vecs_from_flat(flat: Vec<f32>, n: usize, cols: usize) -> Vec<Vec<f32>> {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            out.push(flat[i * cols..(i + 1) * cols].to_vec());
+        }
+        out
+    }
+
+    /// Full batched text forward, returning post-final-norm hidden states over
+    /// all flattened rows plus the batch layout.
+    fn batch_forward(&self, tokens: &[&[u32]]) -> Result<(Buf, BatchInfo)> {
+        let flat = self.batch_tokens(tokens)?;
+        let b = BatchInfo::new(&self.gpu, tokens)?;
+        self.prof.entries.lock().unwrap().clear();
+        let total = b.total;
+        let low_mem = total >= 24_576;
+        let was_low = self.pool.low_mem.swap(low_mem, Ordering::Relaxed);
+        if low_mem && !was_low {
+            self.pool.free.lock().unwrap().clear();
+        }
+        let mut x = timed!(self, "embed", self.embed(&flat)?);
+        for i in 0..self.cfg.num_hidden_layers {
+            let w = self.layer_weights(i)?;
+            x = self.run_layer_batch(&x, &b, &w)?;
+        }
+        let h = self.final_norm_rows(&x, total)?;
+        Ok((h, b))
+    }
+
+    fn run_layer_batch(&self, x: &CudaSlice<bf16>, b: &BatchInfo, w: &LayerWeights) -> Result<Buf> {
+        let hidden = self.cfg.hidden_size;
+        let total = b.total;
+        let mut h = self.alloc_bf16(total * hidden)?;
+        timed!(
+            self,
+            "norm.input",
+            kernels::rmsnorm(
+                &self.gpu,
+                &self.kernels.rmsnorm,
+                x,
+                &w.input_norm,
+                &mut h,
+                total,
+                hidden,
+                self.cfg.rms_norm_eps,
+                true,
+            )?
+        );
+        let mix = match &w.mixer {
+            MixerWeights::Full(a) => self.full_attention_batch(&h, b, a)?,
+            MixerWeights::Gdn(a) => self.gdn_batch(&h, b, a)?,
+        };
+        let mut x1 = self.alloc_bf16(total * hidden)?;
+        timed!(
+            self,
+            "add.residual",
+            kernels::add(
+                &self.gpu,
+                &self.kernels.add,
+                x,
+                &mix,
+                &mut x1,
+                total * hidden
+            )?
+        );
+        let mut h2 = self.alloc_bf16(total * hidden)?;
+        timed!(
+            self,
+            "norm.post",
+            kernels::rmsnorm(
+                &self.gpu,
+                &self.kernels.rmsnorm,
+                &x1,
+                &w.post_norm,
+                &mut h2,
+                total,
+                hidden,
+                self.cfg.rms_norm_eps,
+                true,
+            )?
+        );
+        let mlp = self.mlp(&h2, total, w)?;
+        let mut out = self.alloc_bf16(total * hidden)?;
+        timed!(
+            self,
+            "add.residual",
+            kernels::add(
+                &self.gpu,
+                &self.kernels.add,
+                &x1,
+                &mlp,
+                &mut out,
+                total * hidden
+            )?
+        );
+        Ok(out)
+    }
+
+    fn full_attention_batch(
+        &self,
+        h: &CudaSlice<bf16>,
+        b: &BatchInfo,
+        w: &FullAttentionWeights,
+    ) -> Result<Buf> {
+        let cfg = &self.cfg;
+        let (heads, kv, hd) = (
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        );
+        let total = b.total;
+        let qg = timed!(self, "gemm.q", self.gemm(h, total, &w.q_proj)?);
+        let kk = timed!(self, "gemm.k", self.gemm(h, total, &w.k_proj)?);
+        let vv = timed!(self, "gemm.v", self.gemm(h, total, &w.v_proj)?);
+
+        let (q, gate) = if cfg.attn_output_gate {
+            let mut q = self.alloc_bf16(total * heads * hd)?;
+            let mut gate = self.alloc_bf16(total * heads * hd)?;
+            timed!(
+                self,
+                "attn.split",
+                kernels::split_q_gate(
+                    &self.gpu,
+                    &self.kernels.split_q_gate,
+                    &qg,
+                    &mut q,
+                    &mut gate,
+                    total,
+                    heads,
+                    hd,
+                )?
+            );
+            drop(qg);
+            (q, Some(gate))
+        } else {
+            (qg, None)
+        };
+
+        let mut qn = self.alloc_bf16(total * heads * hd)?;
+        timed!(
+            self,
+            "norm.q",
+            kernels::rmsnorm(
+                &self.gpu,
+                &self.kernels.rmsnorm,
+                &q,
+                &w.q_norm,
+                &mut qn,
+                total * heads,
+                hd,
+                cfg.rms_norm_eps,
+                true,
+            )?
+        );
+        let mut kn = self.alloc_bf16(total * kv * hd)?;
+        timed!(
+            self,
+            "norm.k",
+            kernels::rmsnorm(
+                &self.gpu,
+                &self.kernels.rmsnorm,
+                &kk,
+                &w.k_norm,
+                &mut kn,
+                total * kv,
+                hd,
+                cfg.rms_norm_eps,
+                true,
+            )?
+        );
+
+        let rd = cfg.rotary_dim();
+        let positions = b.positions();
+        let (cos, sin) = self.rope_tables_positions(&positions)?;
+        timed!(
+            self,
+            "rope",
+            kernels::rope(
+                &self.gpu,
+                &self.kernels.rope,
+                &mut qn,
+                &mut kn,
+                &cos,
+                &sin,
+                total,
+                heads,
+                kv,
+                hd,
+                rd / 2,
+            )?
+        );
+        drop(cos);
+        drop(sin);
+
+        // Attention resets at every sequence boundary; one launch per sequence
+        // (attention is a small fraction of the forward).
+        let mut attn = self.alloc_bf16(total * heads * hd)?;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let tc = match hd {
+            64 => Some(&self.kernels.attention_tc_64),
+            128 => Some(&self.kernels.attention_tc_128),
+            256 => Some(&self.kernels.attention_tc_256),
+            _ => None,
+        };
+        let hv = heads * hd;
+        let kvv = kv * hd;
+        let use_warp = self.warp_attention.load(Ordering::Relaxed);
+        let __attn_t = self.prof_begin("attn");
+        for s in 0..b.batch() {
+            let o = b.offsets[s];
+            let l = b.lens[s];
+            let qv = qn
+                .try_slice(o * hv..(o + l) * hv)
+                .context("attention q view")?;
+            let kvw = kn
+                .try_slice(o * kvv..(o + l) * kvv)
+                .context("attention k view")?;
+            let vvw = vv
+                .try_slice(o * kvv..(o + l) * kvv)
+                .context("attention v view")?;
+            let mut ov = attn
+                .try_slice_mut(o * hv..(o + l) * hv)
+                .context("attention out view")?;
+            match (use_warp, tc) {
+                (true, Some(tc)) => kernels::attention_tc(
+                    &self.gpu, tc, &qv, &kvw, &vvw, &mut ov, l, heads, kv, hd, scale,
+                )?,
+                _ => kernels::attention_warp(
+                    &self.gpu,
+                    &self.kernels.attention_warp,
+                    &qv,
+                    &kvw,
+                    &vvw,
+                    &mut ov,
+                    l,
+                    heads,
+                    kv,
+                    hd,
+                    scale,
+                )?,
+            }
+        }
+        self.prof_end("attn", __attn_t);
+        drop(qn);
+        drop(kn);
+        drop(vv);
+
+        let gated = match gate {
+            Some(g) => {
+                let mut o = self.alloc_bf16(total * heads * hd)?;
+                timed!(
+                    self,
+                    "attn.gate",
+                    kernels::sigmoid_gate(
+                        &self.gpu,
+                        &self.kernels.sigmoid_gate,
+                        &attn,
+                        &g,
+                        &mut o,
+                        total * heads * hd,
+                    )?
+                );
+                drop(attn);
+                drop(g);
+                o
+            }
+            None => attn,
+        };
+        Ok(timed!(self, "gemm.o", self.gemm(&gated, total, &w.o_proj)?))
+    }
+
+    fn gdn_batch(&self, h: &CudaSlice<bf16>, b: &BatchInfo, w: &GdnWeights) -> Result<Buf> {
+        let cfg = &self.cfg;
+        let (nk, nv) = (cfg.linear_num_key_heads, cfg.linear_num_value_heads);
+        let (dk, dv) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
+        let conv_dim = 2 * cfg.gdn_key_dim() + cfg.gdn_value_dim();
+        let total = b.total;
+
+        let qkv = timed!(self, "gemm.in_qkv", self.gemm(h, total, &w.in_proj_qkv)?);
+        let mut conv = self.alloc_bf16(total * conv_dim)?;
+        timed!(
+            self,
+            "gdn.conv",
+            kernels::conv1d_silu_batched(
+                &self.gpu,
+                &self.kernels.conv1d_silu_batched,
+                &qkv,
+                &w.conv1d,
+                &mut conv,
+                &b.offsets_dev,
+                &b.lens_dev,
+                b.batch(),
+                conv_dim,
+            )?
+        );
+        let z = timed!(self, "gemm.z", self.gemm(h, total, &w.in_proj_z)?);
+        let bb = timed!(self, "gemm.b", self.gemm(h, total, &w.in_proj_b)?);
+        let aa = timed!(self, "gemm.a", self.gemm(h, total, &w.in_proj_a)?);
+
+        let mut qf = self.gpu.stream.alloc_zeros::<f32>(total * nv * dk)?;
+        let mut kf = self.gpu.stream.alloc_zeros::<f32>(total * nv * dk)?;
+        let mut vf = self.gpu.stream.alloc_zeros::<f32>(total * nv * dv)?;
+        let mut gg = self.gpu.stream.alloc_zeros::<f32>(total * nv)?;
+        let mut beta = self.gpu.stream.alloc_zeros::<f32>(total * nv)?;
+        timed!(
+            self,
+            "gdn.prepare",
+            kernels::gdn_prepare(
+                &self.gpu,
+                &self.kernels.gdn_prepare,
+                &conv,
+                &bb,
+                &aa,
+                &w.a_log,
+                &w.dt_bias,
+                &mut qf,
+                &mut kf,
+                &mut vf,
+                &mut gg,
+                &mut beta,
+                total,
+                nk,
+                nv,
+                dk,
+                dv,
+            )?
+        );
+        drop(qkv);
+        drop(conv);
+        drop(bb);
+        drop(aa);
+
+        let mut state = self
+            .gpu
+            .stream
+            .alloc_zeros::<f32>(b.batch() * nv * dk * dv)?;
+        let mut core = self.alloc_bf16(total * nv * dv)?;
+        let min_seq = self.gdn_split_min_seq.load(Ordering::Relaxed);
+        let all_long = b.lens.iter().all(|&l| l >= min_seq);
+        let all_short = b.lens.iter().all(|&l| l < min_seq);
+        let split = self.gdn_split.load(Ordering::Relaxed);
+        let shared = self.gdn_shared.load(Ordering::Relaxed);
+        let dv_chunks = if dv >= 64 {
+            self.gdn_chunks.load(Ordering::Relaxed).max(1).min(dv / 16)
+        } else {
+            1
+        };
+        timed!(
+            self,
+            "gdn.recurrent",
+            if split && all_long {
+                kernels::gdn_recurrent_split_batched(
+                    &self.gpu,
+                    &self.kernels.gdn_recurrent_split_batched,
+                    &qf,
+                    &kf,
+                    &vf,
+                    &gg,
+                    &beta,
+                    &mut state,
+                    &mut core,
+                    &b.offsets_dev,
+                    &b.lens_dev,
+                    b.batch(),
+                    nv,
+                    dk,
+                    dv,
+                )?
+            } else if shared && all_short {
+                kernels::gdn_recurrent_shared_batched(
+                    &self.gpu,
+                    &self.kernels.gdn_recurrent_shared_batched,
+                    &qf,
+                    &kf,
+                    &vf,
+                    &gg,
+                    &beta,
+                    &mut state,
+                    &mut core,
+                    &b.offsets_dev,
+                    &b.lens_dev,
+                    b.batch(),
+                    nv,
+                    dk,
+                    dv,
+                    dv_chunks,
+                )?
+            } else {
+                // Mixed lengths: one launch per sequence so each uses the same
+                // kernel the single-sequence path selects.
+                for s in 0..b.batch() {
+                    let o = b.offsets[s];
+                    let l = b.lens[s];
+                    let qv = qf
+                        .try_slice(o * nv * dk..(o + l) * nv * dk)
+                        .context("gdn q view")?;
+                    let kvw = kf
+                        .try_slice(o * nv * dk..(o + l) * nv * dk)
+                        .context("gdn k view")?;
+                    let vvw = vf
+                        .try_slice(o * nv * dv..(o + l) * nv * dv)
+                        .context("gdn v view")?;
+                    let gw = gg.try_slice(o * nv..(o + l) * nv).context("gdn g view")?;
+                    let bw = beta
+                        .try_slice(o * nv..(o + l) * nv)
+                        .context("gdn beta view")?;
+                    let mut sv = state
+                        .try_slice_mut(s * nv * dk * dv..(s + 1) * nv * dk * dv)
+                        .context("gdn state view")?;
+                    let mut ov = core
+                        .try_slice_mut(o * nv * dv..(o + l) * nv * dv)
+                        .context("gdn out view")?;
+                    if split && l >= min_seq {
+                        kernels::gdn_recurrent_split(
+                            &self.gpu,
+                            &self.kernels.gdn_recurrent_split,
+                            &qv,
+                            &kvw,
+                            &vvw,
+                            &gw,
+                            &bw,
+                            &mut sv,
+                            &mut ov,
+                            l,
+                            nv,
+                            dk,
+                            dv,
+                        )?;
+                    } else if shared {
+                        kernels::gdn_recurrent_shared(
+                            &self.gpu,
+                            &self.kernels.gdn_recurrent_shared,
+                            &qv,
+                            &kvw,
+                            &vvw,
+                            &gw,
+                            &bw,
+                            &mut sv,
+                            &mut ov,
+                            l,
+                            nv,
+                            dk,
+                            dv,
+                            dv_chunks,
+                        )?;
+                    } else {
+                        kernels::gdn_recurrent(
+                            &self.gpu,
+                            &self.kernels.gdn_recurrent,
+                            &qv,
+                            &kvw,
+                            &vvw,
+                            &gw,
+                            &bw,
+                            &mut sv,
+                            &mut ov,
+                            l,
+                            nv,
+                            dk,
+                            dv,
+                        )?;
+                    }
+                }
+                Ok::<(), anyhow::Error>(())?
+            }
+        );
+        drop(qf);
+        drop(kf);
+        drop(vf);
+        drop(gg);
+        drop(beta);
+
+        let mut normed = self.alloc_bf16(total * nv * dv)?;
+        timed!(
+            self,
+            "gdn.norm",
+            kernels::rmsnorm_gated(
+                &self.gpu,
+                &self.kernels.rmsnorm_gated,
+                &core,
+                &z,
+                &w.norm,
+                &mut normed,
+                total * nv,
+                dv,
+                cfg.rms_norm_eps,
+            )?
+        );
+        drop(core);
+        drop(z);
+        Ok(timed!(
+            self,
+            "gemm.out",
+            self.gemm(&normed, total, &w.out_proj)?
+        ))
+    }
+
+    /// Batched last-token hidden state (`[hidden]` per item, post final norm).
+    pub fn forward_last_hidden_batch(&self, tokens: &[&[u32]]) -> Result<Vec<Vec<f32>>> {
+        let (h, b) = self.batch_forward(tokens)?;
+        let hidden = self.cfg.hidden_size;
+        let rows = self.gather_last_rows(&h, &b, hidden)?;
+        let flat = self.to_f32(&rows, b.batch() * hidden)?;
+        Ok(Self::vecs_from_flat(flat, b.batch(), hidden))
+    }
+
+    /// Batched decision logits at each sequence's last position.
+    pub fn decision_logits_batch(
+        &self,
+        tokens: &[&[u32]],
+        head_ids: &[&[u32]],
+    ) -> Result<Vec<Vec<f32>>> {
+        if head_ids.len() != tokens.len() {
+            bail!(
+                "head_ids length {} does not match batch size {}",
+                head_ids.len(),
+                tokens.len()
+            );
+        }
+        for (i, ids) in head_ids.iter().enumerate() {
+            if ids.is_empty() {
+                bail!("batch item {i} has no head ids");
+            }
+            for &id in ids.iter() {
+                if id as usize >= self.cfg.vocab_size {
+                    bail!("head id {id} out of range (vocab {})", self.cfg.vocab_size);
+                }
+            }
+        }
+        let (h, b) = self.batch_forward(tokens)?;
+        let hidden = self.cfg.hidden_size;
+        let total = b.total;
+        let mut out: Vec<Vec<f32>> = vec![Vec::new(); tokens.len()];
+        // One head GEMM per distinct id set, always over all flattened rows so
+        // a batch of one is bit-identical to the single-item path.
+        let mut groups: HashMap<Vec<u32>, Vec<usize>> = HashMap::new();
+        for (i, ids) in head_ids.iter().enumerate() {
+            groups.entry(ids.to_vec()).or_default().push(i);
+        }
+        for (ids, items) in groups {
+            let mut w_host = vec![bf16::ZERO; ids.len() * hidden];
+            for (r, &id) in ids.iter().enumerate() {
+                self.store.bf16_row(
+                    "lm_head.weight",
+                    id as usize,
+                    &mut w_host[r * hidden..(r + 1) * hidden],
+                )?;
+            }
+            let wd = self.gpu.stream.clone_htod(&w_host)?;
+            let lw = LinearWeight::Bf16 {
+                out: ids.len(),
+                in_: hidden,
+                w: wd,
+            };
+            let logits = timed!(self, "head", self.gemm(&h, total, &lw)?);
+            let vals = self.to_f32(&logits, total * ids.len())?;
+            drop(logits);
+            for &i in &items {
+                let row = b.offsets[i] + b.lens[i] - 1;
+                out[i] = vals[row * ids.len()..(row + 1) * ids.len()].to_vec();
+            }
+        }
+        self.prof_report();
+        Ok(out)
+    }
+
     fn slice_out(
         &self,
         x: &CudaSlice<bf16>,
@@ -827,10 +1537,10 @@ impl Engine {
                 kernels::attention_tc(
                     &self.gpu,
                     tc,
-                    &qn,
-                    &kn,
-                    &vv,
-                    &mut attn,
+                    &*qn,
+                    &*kn,
+                    &*vv,
+                    &mut *attn,
                     seq,
                     heads,
                     kv,
@@ -841,10 +1551,10 @@ impl Engine {
                 kernels::attention_warp(
                     &self.gpu,
                     &self.kernels.attention_warp,
-                    &qn,
-                    &kn,
-                    &vv,
-                    &mut attn,
+                    &*qn,
+                    &*kn,
+                    &*vv,
+                    &mut *attn,
                     seq,
                     heads,
                     kv,
@@ -857,10 +1567,10 @@ impl Engine {
             kernels::attention_warp(
                 &self.gpu,
                 &self.kernels.attention_warp,
-                &qn,
-                &kn,
-                &vv,
-                &mut attn,
+                &*qn,
+                &*kn,
+                &*vv,
+                &mut *attn,
                 seq,
                 heads,
                 kv,
@@ -1013,7 +1723,7 @@ impl Engine {
                     &g,
                     &beta,
                     &mut state,
-                    &mut core,
+                    &mut *core,
                     seq,
                     nv,
                     dk,
@@ -1038,7 +1748,7 @@ impl Engine {
                     &g,
                     &beta,
                     &mut state,
-                    &mut core,
+                    &mut *core,
                     seq,
                     nv,
                     dk,
@@ -1059,7 +1769,7 @@ impl Engine {
                     &g,
                     &beta,
                     &mut state,
-                    &mut core,
+                    &mut *core,
                     seq,
                     nv,
                     dk,
