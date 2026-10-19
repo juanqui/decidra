@@ -10,7 +10,12 @@ pub const DEFAULT_CHECKPOINT: &str = "/srv/models/jev-awq/awq-w4a16-v2";
 pub const DEFAULT_HF_SNAPSHOT: &str = "/srv/models/hf/hub/models--autotrust--JEV-27B-VL/snapshots/ba3f0d584994b37998f235c0a3f6f1beff32ba1e";
 pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+/// Measured throughput saturates at batch 4 (~2,130-2,180 tok/s on ~71-token
+/// requests); 8 is kept so a burst drains in one pass without costing steady
+/// throughput. Batches of 12/16 only raised p50 in the sweep.
 pub const DEFAULT_NATIVE_MAX_BATCH: usize = 8;
+/// The smallest window that keeps a lone request near 62 ms p50. Windows of
+/// 5/10 ms fill 8-wide batches under load but did not improve throughput.
 pub const DEFAULT_NATIVE_BATCH_WINDOW_US: u64 = 2_000;
 pub const MAX_NATIVE_BATCH_WINDOW_US: u64 = 50_000;
 pub const DEFAULT_NATIVE_MAX_BATCH_TOKENS: usize = 16_384;

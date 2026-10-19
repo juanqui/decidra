@@ -101,10 +101,10 @@ those steps to succeed; there is no partial serving.
 | `JEV_NATIVE_MARLIN` | `true` | Repack to the Marlin W4A16 layout during preload and use Marlin. |
 | `JEV_NATIVE_FUSED_W4A16` | `true` | Fallback-only hybrid fused policy; ignored when Marlin is on. |
 | `JEV_NATIVE_BATCH` | `true` | Native request batcher. `false` means one request per forward and window 0. |
-| `JEV_NATIVE_MAX_BATCH` | `8` | Max requests per batch. |
-| `JEV_NATIVE_BATCH_WINDOW_US` | `2000` | Batch window in microseconds (max `50000`). |
+| `JEV_NATIVE_MAX_BATCH` | `8` | Max requests per batch. Throughput saturates at batch 4; 8 lets a burst drain in one pass, while 12/16 add p50 without throughput. |
+| `JEV_NATIVE_BATCH_WINDOW_US` | `2000` | Batch window in microseconds (max `50000`). The 2 ms default keeps a lone request at ~62 ms p50; 5/10 ms fill wider batches but did not raise throughput. |
 | `JEV_NATIVE_MAX_BATCH_TOKENS` | `16384` | Max total prompt tokens per batch (min `512`); a larger single request runs alone. |
-| `JEV_MAX_CONCURRENCY` | `8` | Outstanding decision passes. Batches execute one at a time. |
+| `JEV_MAX_CONCURRENCY` | `8` | Accepted and logged, but not enforced as a semaphore in this build. The batch worker executes one batch at a time. |
 | `JEV_SIGNING_KEY` | unset | HMAC-SHA256 response signing. |
 | `JEV_METRICS_ENABLED` | `true` | Prometheus recorder. |
 | `JEV_CUDA_LIBS` | unset | Directory with `libcublas.so.13`/`libcublasLt.so.13`. |

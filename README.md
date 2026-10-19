@@ -187,14 +187,14 @@ GPU 0 is not used by this stack. Inside a container, reserve GPU 1
 | `JEV_NATIVE_MARLIN` | `true` | Repack weights into the Marlin W4A16 layout during preload and use the Marlin kernel. Set `false` for the dequant/fused fallback. |
 | `JEV_NATIVE_FUSED_W4A16` | `true` | Fallback-only hybrid fused policy (ignored when Marlin is on): fused when `N >= 5120 && M <= 256`, otherwise dequant + cuBLAS. |
 | `JEV_NATIVE_BATCH` | `true` | Enable the native request batcher. Disabled sets one request per forward and window 0. |
-| `JEV_NATIVE_MAX_BATCH` | `8` | Maximum requests per batch (`>= 1`). Effective value is `1` when batching is disabled. |
-| `JEV_NATIVE_BATCH_WINDOW_US` | `2000` | Microseconds the worker waits after a batch's first request for more work (max `50000`). Effective value is `0` when batching is disabled. |
+| `JEV_NATIVE_MAX_BATCH` | `8` | Maximum requests per batch (`>= 1`); effective value is `1` when batching is disabled. Throughput saturates at batch 4, so 8 is a burst-draining cap, not a throughput knob. |
+| `JEV_NATIVE_BATCH_WINDOW_US` | `2000` | Microseconds the worker waits after a batch's first request for more work (max `50000`); effective value is `0` when batching is disabled. 2 ms keeps a lone request near 62 ms p50. |
 | `JEV_NATIVE_MAX_BATCH_TOKENS` | `16384` | Maximum total prompt tokens per batch (`>= 512`). A single larger request runs alone. |
 | `JEV_TOKENIZER` | checkpoint `tokenizer.json` | Tokenizer file or directory override. |
 | `JEV_CALIBRATION` | discovered | `calibration.json` override. |
 | `JEV_CALIBRATION_FITTED` | unset | Optional `fit_bias.py` output. Unset/absent disables it. |
 | `JEV_HF_SNAPSHOT` | `.../snapshots/ba3f0d58...` | Fallback for artifacts missing from the AWQ dir. |
-| `JEV_MAX_CONCURRENCY` | `8` | Max concurrent decision passes (forwards are serialized by the engine). |
+| `JEV_MAX_CONCURRENCY` | `8` | Accepted and logged but not enforced as a semaphore in this build; forwards are serialized by the engine. |
 | `JEV_SIGNING_KEY` | unset | Enables `x-jev-signature`; empty string disables. |
 | `JEV_METRICS_ENABLED` | `true` | Install the Prometheus recorder. |
 | `JEV_MAX_BODY_BYTES` | `67108864` | Axum request body limit. |
@@ -373,16 +373,25 @@ MAE: choice 2.35e-4 / noul 1.237e-3 / score 1.441e-3. The historical production-
 baseline is context only: it itself differs from CPU golden by max 0.01377 / mean MAE
 0.00156. See `docs/RESULTS.md` for per-kind tables.
 
-Short live benchmark, batched build (16 unique ~69-token requests/level; `scripts/bench-batch.sh`):
-c=1 **15.83 req/s**, p50 **61.9 ms**; c=2 **23.41 req/s**, p50 **83.1 ms**; c=4
-**30.12 req/s**, p50 **133.8 ms**, p95 **139.1 ms**, ~**2,133 tok/s**; c=8 **29.69 req/s**,
-p50 **218.7 ms**; c=16 **30.64 req/s**, p50 **378.9 ms**, ~**2,204 tok/s**. Versus the
-serialized build, c=4 throughput is **1.79x** and p50 drops from **225.7 ms to 133.8 ms**;
-c=1 is unchanged within noise. Above c=4 throughput plateaus near 30 req/s because the
-worker runs one batch at a time.
+Short live benchmark, batched build (16 unique requests of ~71 prompt tokens/level;
+`scripts/bench-batch.sh`, median of 3 runs): c=1 **15.84 req/s**, p50 **61.9 ms**,
+p95 **75.8 ms**; c=2 **23.38 req/s**, p50 **83.2 ms**; c=4 **30.13 req/s**, p50
+**133.7 ms**, p95 **139.1 ms**, ~**2,133 tok/s**; c=8 **29.25-30.26 req/s**, p50
+**233-256 ms**; c=16 **29.28-30.47 req/s**, p50 **388-442 ms**, ~**2,107-2,192 tok/s**.
+Versus c=1, c=4 is **1.90x** throughput; c=1 is unchanged within noise. Throughput
+saturates near **30 req/s and ~2,100-2,150 tok/s at batch 4**: batches of 8 do not
+raise per-token throughput, and `MAX_BATCH` 12/16 only raise p50 (504-554 ms at c=16),
+so the default stays 8. A 5/10 ms window fills 8-wide batches at c=8 but did not beat
+2 ms on throughput and added ~3/8 ms to a lone request.
 
-A 16,444-token `/v1/decide` completed in **8.60 s**, and the 32,763-token CPU-AWQ probe
-completed in **18.53 s**, choice `true` (0.98378), with no timeout/OOM.
+Batch correctness: a batch of one is bit-identical to the single-call path. Batches of
+2+ carry deterministic BF16/M-tiling noise; two concurrent 4K requests differed from
+their single-request probabilities by at most **4.2e-5** with identical top-1, and the
+28-row suite max delta is **1.010e-2**, inside the 0.011 gate.
+
+Long context runs alone (it exceeds the 16,384-token batch cap): **18,653 tokens ->
+200 in 9.84 s**, choice `true` (0.988); **35,310 tokens -> 200 in 20.15 s**, choice
+`true` (0.9884); no timeout/OOM.
 
 ## One-GPU deployment example (GPU 1 only)
 
@@ -455,7 +464,11 @@ WantedBy=multi-user.target
   the first request and drains more until the **2 ms** window expires, `MAX_BATCH`
   (8) is reached, or the next request would exceed `MAX_BATCH_TOKENS` (16,384).
   Order is strict FIFO and a request is never split. A request larger than the token
-  cap (e.g. 32K) runs alone, so long context is unaffected by the 2 ms window.
+  cap (e.g. 16K/32K) runs alone, so long context is unaffected by the window.
+- Measured saturation is at **batch 4** (~2,130-2,180 tok/s); batch 8 does not improve
+  per-token throughput. `MAX_BATCH=8` is kept so a burst drains in one pass; 12/16
+  measured no throughput gain and worse p50. The 2 ms window is the smallest that
+  keeps a lone request around 62 ms p50; 5/10 ms fill wider batches but add latency.
 - Dropped clients are skipped when the batch is formed; executor errors are returned
   per request. A panicking executor fails only its batch.
 - Wide choices multiply passes: a 256-option tournament makes 16 group passes plus one
@@ -471,8 +484,9 @@ WantedBy=multi-user.target
 - With Marlin off, `JEV_NATIVE_FUSED_W4A16=true` selects the hybrid fused policy (fused for
   `N >= 5120 && M <= 256`), and the remaining path dequantizes into a BF16 workspace for
   cuBLAS BF16 GEMM.
-- `JEV_MAX_CONCURRENCY` bounds outstanding decision passes; the batch worker still
-  executes one batch at a time.
+- `JEV_MAX_CONCURRENCY` is accepted and logged but not enforced as a semaphore in this
+  build; the batch worker executes one batch at a time, so extra concurrency only
+  queues.
 
 Prometheus metrics exposed:
 

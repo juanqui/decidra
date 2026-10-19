@@ -93,27 +93,45 @@ measurement files are kept only for drift context.
 - `/metrics`: HTTP and backend counters/histograms exposed.
 - Preload with Marlin: 10.1 s clean, 13.1 GiB resident (10.06 s observed in the gated
   run); 13,358 MiB in-process.
-- 16,444-token `/v1/decide`: **200 in 8.60 s** (batched build), choice `true`; no
-  timeout/OOM. Long requests exceed the token cap and run alone.
-- 32,763-token CPU-AWQ probe `/v1/decide`: **200 in 18.53 s**, choice `true`
-  (0.98378); no timeout/OOM. This is the verified 24 GB maximum.
+- Long context, single request (exceeds the 16,384-token batch cap, so it runs alone):
+  **18,653 tokens -> 200 in 9.84 s**, choice `true` (0.988); **35,310 tokens -> 200 in
+  20.15 s**, choice `true` (0.9884); no timeout/OOM. Three repeat runs per size were
+  identical in status/choice and within 0.05 s. One early 17.7K probe returned a single
+  502 (`jev_backend_requests_total{status="error"} 1`); it did not reproduce in six
+  subsequent 16K/32K runs, all 200.
 - Short benchmark, serialized build (16 unique requests/level, gated): c=1
   **16.444 req/s**, p50 **60.9 ms**; c=4 **16.826 req/s**, p50 **225.7 ms**. Throughput
   was flat because forwards were serialized; c=4 latency was queueing.
-- Short benchmark, batched build (16 unique ~69-token requests/level; `scripts/bench-batch.sh`):
-  c=1 **15.828 req/s**, p50 **61.9 ms**, p95 **75.7 ms**, ~**1,121 tok/s**;
-  c=2 **23.409 req/s**, p50 **83.1 ms**, p95 **99.0 ms**, ~**1,658 tok/s**;
-  c=4 **30.117 req/s**, p50 **133.8 ms**, p95 **139.1 ms**, ~**2,133 tok/s**;
-  c=8 **29.693 req/s**, p50 **218.7 ms**, p95 **356.7 ms**, ~**2,101 tok/s**;
-  c=16 **30.642 req/s**, p50 **378.9 ms**, p95 **516.3 ms**, ~**2,204 tok/s**.
-  Versus the serialized build: c=4 **1.79x throughput** and p50 **225.7 -> 133.8 ms**
-  (1.69x lower); c=1 is unchanged within run-to-run noise. c=8/16 throughput plateaus at
-  ~30 req/s because the worker executes one batch at a time; extra concurrency only
-  queues.
-- Batch metrics observed during the sweep: `jev_native_batch_size` p50 1 / p90 4 /
-  p95 5, `jev_native_batch_wait_seconds` p50 2.06 ms (the window), p90 124 ms at high
-  concurrency (queueing behind earlier batches), and `jev_native_batch_queue_depth`
-  peaked at 4.
+- Short benchmark, batched build (16 unique requests of ~71 prompt tokens/level;
+  `scripts/bench-batch.sh`, median of 3 runs): c=1 **15.84 req/s**, p50 **61.9 ms**,
+  p95 **75.8 ms**, ~**1,122 tok/s**; c=2 **23.38 req/s**, p50 **83.2 ms**, p95
+  **98.7 ms**, ~**1,656 tok/s**; c=4 **30.13 req/s**, p50 **133.7 ms**, p95
+  **139.1 ms**, ~**2,133 tok/s**; c=8 **29.25-30.26 req/s**, p50 **233-256 ms**,
+  ~**2,051-2,141 tok/s**; c=16 **29.28-30.47 req/s**, p50 **388-442 ms**, p95
+  **520-539 ms**, ~**2,107-2,192 tok/s**. Versus the serialized build: c=4
+  **1.79x throughput** and p50 **225.7 -> 133.7 ms**; versus c=1 on this build, c=4 is
+  **1.90x**. c=1 is unchanged within run-to-run noise. Throughput saturates near
+  **30 req/s and 2,100-2,150 tok/s at batch 4**; extra concurrency only queues.
+- Tuning matrix (same 16x71-token sweep): `WINDOW_US` 2000/5000/10000 with `MAX_BATCH`
+  8 gave c=8 **29.25-30.26 / 30.41-30.59 / 30.47-30.56 req/s** and c=1 p50
+  **61.9 / 64.9 / 69.9 ms**. The 5/10 ms windows fill 8-wide batches at c=8 but do not
+  raise throughput, and they add the window to a lone request; 2 ms is kept because it
+  keeps c=1 p50 <=65 ms. `MAX_BATCH` 12/16 at the 2 ms window gave c=16 p50 **502-554 ms**
+  with **27.4-29.6 req/s**, no gain over 8.
+- Batch-of-4 vs batch-of-8: at c=8, `MAX_BATCH=4` did **30.83 req/s / 2,182 tok/s**
+  (p50 255 ms) versus **29.25-30.26 req/s / 2,051-2,141 tok/s** for 8; at c=16 it did
+  **30.16 req/s / 2,169 tok/s** (p50 324 ms) versus 29.3-30.5 req/s (p50 388-442 ms).
+  A batch of 8 is therefore **not** more efficient per token than 4 in this sweep;
+  `MAX_BATCH=8` is retained for burst draining, and the saturation point is batch 4.
+- Batch correctness: batch-of-one is bit-identical to `decision_logits`. Batch>1 has
+  deterministic BF16/M-tiling logit noise (top-1 stable); two concurrent 4K requests
+  differed from their single-run probabilities by at most **4.15e-5** (A) and
+  **8.1e-6** (B) with identical top-1. The 28-row suite after the final native commit
+  passes top-1 **28/28**, mean KL **3.281e-5**, mean MAE **7.365e-4**, max delta
+  **1.010e-2**.
+- Batch metrics observed during the sweep (`jev_native_batch_size` mean per level):
+  c=1 **1.0**, c=2 **2.0**, c=4 **4.0**, c=8 **5.33**, c=16 **5.33-8.0**;
+  `jev_native_batch_queue_depth` peaked at **8** at c=16.
 
 ## Request batching
 
@@ -131,9 +149,12 @@ CUDA context. Batch formation:
 - closed client receivers are skipped; executor errors are returned per request;
 - `JEV_NATIVE_BATCH=false` sets max batch 1 and window 0.
 
-Lone requests pay the window; `JEV_NATIVE_BATCH_WINDOW_US=0` removes it. The worker
-executes one batch at a time, so `JEV_MAX_CONCURRENCY` bounds queued passes but does
-not create parallel forwards.
+Lone requests pay the window; `JEV_NATIVE_BATCH_WINDOW_US=0` removes it. The default
+2 ms window is the smallest that keeps a lone request near 62 ms p50. The worker
+executes one batch at a time, and `JEV_MAX_CONCURRENCY` is accepted/logged but not
+enforced as a semaphore in this build, so it neither bounds queued passes nor creates
+parallel forwards. Throughput saturates at batch 4; `MAX_BATCH=8` allows a burst to
+drain in one pass, while 12/16 measured no gain and worse p50.
 
 Metrics: `jev_native_batch_size`, `jev_native_batch_queue_depth`,
 `jev_native_batch_wait_seconds`, plus the existing `jev_backend_*` counters.
