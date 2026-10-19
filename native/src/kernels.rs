@@ -18,6 +18,7 @@ pub struct Kernels {
     pub gdn_prepare: CudaFunction,
     pub gdn_recurrent: CudaFunction,
     pub dequant_w4a16: CudaFunction,
+    pub gemm_w4a16: CudaFunction,
 }
 
 impl Kernels {
@@ -35,6 +36,7 @@ impl Kernels {
             gdn_prepare: gpu.func("gdn_prepare")?,
             gdn_recurrent: gpu.func("gdn_recurrent")?,
             dequant_w4a16: gpu.func("dequant_w4a16_bf16")?,
+            gemm_w4a16: gpu.func("gemm_w4a16_bf16")?,
         })
     }
 }
@@ -294,6 +296,38 @@ pub fn dequant_w4a16(
     l.arg(&out_i);
     l.arg(&in_i);
     l.arg(&gs);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_w4a16(
+    gpu: &Gpu,
+    k: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    packed: &CudaSlice<i32>,
+    scale: &CudaSlice<bf16>,
+    zp: &CudaSlice<i32>,
+    out: &mut CudaSlice<bf16>,
+    m: usize,
+    n: usize,
+    kk: usize,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (m_i, n_i, k_i) = (m as i32, n as i32, kk as i32);
+    let mut l = gpu.stream.launch_builder(k);
+    l.arg(x);
+    l.arg(packed);
+    l.arg(scale);
+    l.arg(zp);
+    l.arg(out);
+    l.arg(&m_i);
+    l.arg(&n_i);
+    l.arg(&k_i);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }

@@ -1,16 +1,9 @@
-mod config;
-mod cuda;
-mod engine;
-mod kernels;
-mod tensor;
-mod weights;
+use jev_native::{Engine, Stage, config, cuda, tensor};
 
 use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
-
-use engine::{Engine, Stage};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -24,7 +17,8 @@ fn main() -> Result<()> {
         "compare" => cmd_compare(&args[1..]),
         "info" => cmd_info(&args[1..]),
         "dequant" => cmd_dequant(&args[1..]),
-        other => bail!("unknown command {other:?} (self-test|layer|compare|info|dequant)"),
+        "matmul" => cmd_matmul(&args[1..]),
+        other => bail!("unknown command {other:?} (self-test|layer|compare|info|dequant|matmul)"),
     }
 }
 
@@ -94,6 +88,32 @@ fn cmd_info(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+fn cmd_matmul(args: &[String]) -> Result<()> {
+    let model = PathBuf::from(req(args, "--model")?);
+    let tensor = req(args, "--tensor")?;
+    let input = read_f32(Path::new(req(args, "--input")?))?;
+    let rows: usize = req(args, "--rows")?.parse()?;
+    let out = PathBuf::from(req(args, "--out")?);
+    let fused = args.iter().any(|a| a == "--fused-w4a16");
+    let eng = Engine::new(&model)?;
+    let repeat: usize = opt(args, "--repeat").unwrap_or("1").parse()?;
+    let mut vals = Vec::new();
+    if args.iter().any(|a| a == "--bench") {
+        let (r, f) = eng.bench_matmul(tensor, &input, rows, repeat.max(3))?;
+        eprintln!("reference ms: {r:?}");
+        eprintln!("fused     ms: {f:?}");
+    }
+    for _ in 0..repeat.max(1) {
+        let t = std::time::Instant::now();
+        vals = eng.matmul_module(tensor, &input, rows, fused)?;
+        eng.gpu.synchronize()?;
+        eprintln!("matmul: {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
+    }
+    write_f32(&out, &vals)?;
+    eprintln!("wrote {} ({} values)", out.display(), vals.len());
+    Ok(())
+}
+
 fn cmd_dequant(args: &[String]) -> Result<()> {
     let model = PathBuf::from(req(args, "--model")?);
     let tensor = req(args, "--tensor")?;
@@ -127,14 +147,32 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     let head_ids = opt(args, "--head-ids").map(parse_ids).transpose()?;
     let full_logits = args.iter().any(|a| a == "--full-logits");
 
+    let t0 = std::time::Instant::now();
     let eng = Engine::new(&model)?;
+    let init_ms = t0.elapsed().as_secs_f64() * 1e3;
     eng.set_logits_opts(head_ids.clone(), full_logits);
+    if args.iter().any(|a| a == "--fused-w4a16") {
+        eng.set_fused_w4a16(true);
+    }
+    if let Some(n) = opt(args, "--fused-min-n") {
+        eng.set_fused_min_n(n.parse().context("--fused-min-n must be an integer")?);
+    }
     if args.iter().any(|a| a == "--no-cache") {
         eng.set_cache_weights(false);
     }
+    let mut preload_ms = 0.0;
     if args.iter().any(|a| a == "--preload") {
+        let t = std::time::Instant::now();
         eng.preload_all()?;
-        eprintln!("preloaded {} layers", eng.cfg.num_hidden_layers);
+        preload_ms = t.elapsed().as_secs_f64() * 1e3;
+        let (free, total) = eng.gpu.mem_info()?;
+        eprintln!(
+            "preload: {:.1} ms, {} layers, device {:.2}/{:.2} GiB free",
+            preload_ms,
+            eng.cfg.num_hidden_layers,
+            free as f64 / (1u64 << 30) as f64,
+            total as f64 / (1u64 << 30) as f64
+        );
     }
     if let Some(dir) = opt(args, "--dump") {
         eng.set_dump(Path::new(dir));
@@ -158,13 +196,32 @@ fn cmd_layer(args: &[String]) -> Result<()> {
         _ => hidden,
     };
     let out_rows = if last_only { 1 } else { tokens.len() };
-    let vals = match input {
-        Some(path) => {
-            let h = read_f32(&path)?;
-            eng.forward_hidden(&h, tokens.len(), layer, stage, last_only)?
-        }
-        None => eng.forward(&tokens, layer, stage, last_only)?,
-    };
+    let repeat: usize = opt(args, "--repeat")
+        .unwrap_or("1")
+        .parse()
+        .context("--repeat must be an integer")?;
+    let mut times = Vec::with_capacity(repeat);
+    let mut vals = Vec::new();
+    for it in 0..repeat.max(1) {
+        let t = std::time::Instant::now();
+        vals = match &input {
+            Some(path) => {
+                let h = read_f32(path)?;
+                eng.forward_hidden(&h, tokens.len(), layer, stage, last_only)?
+            }
+            None => eng.forward(&tokens, layer, stage, last_only)?,
+        };
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        times.push(ms);
+        eprintln!("forward[{it}]: {ms:.2} ms");
+    }
+    if repeat > 1 {
+        let mean = times.iter().sum::<f64>() / times.len() as f64;
+        let min = times.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = times.iter().cloned().fold(0.0, f64::max);
+        eprintln!("forward mean {mean:.2} ms | min {min:.2} | max {max:.2}");
+    }
+    eprintln!("init {init_ms:.1} ms, preload {preload_ms:.1} ms");
     write_f32(&out, &vals)?;
     let side = serde_json::json!({
         "model": model.display().to_string(),

@@ -7,6 +7,10 @@ license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 publish = false
 
+[lib]
+name = "jev_native"
+path = "src/lib.rs"
+
 [[bin]]
 name = "jev-native"
 path = "src/main.rs"

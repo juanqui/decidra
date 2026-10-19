@@ -46,6 +46,10 @@ impl Stage {
     }
 }
 
+/// `Engine` is `Send`: cuBLAS/cuBLASLt handles and slices are tied to one
+/// context/stream, so it may be moved to a blocking worker thread (as the
+/// server does with `spawn_blocking`) but it is **not** intended for concurrent
+/// forwards. `decision_logits` stores per-call head ids; serialize calls.
 pub struct Engine {
     pub gpu: Gpu,
     pub cfg: Config,
@@ -64,7 +68,17 @@ pub struct Engine {
     /// BF16 checkpoint (51 GiB) on a 24 GiB card; the shipped AWQ path keeps
     /// every packed layer resident instead.
     cache_weights: AtomicBool,
+    /// Use the fused in-shared-memory dequant + tensor-core GEMM. The
+    /// dequant-to-BF16 + cuBLAS path remains available as the reference.
+    fused_w4a16: AtomicBool,
+    /// Minimum N for the fused kernel; smaller modules use dequant+cuBLAS.
+    fused_min_n: std::sync::atomic::AtomicUsize,
 }
+
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Engine>();
+};
 
 impl Engine {
     pub fn new(model_dir: &std::path::Path) -> Result<Self> {
@@ -83,6 +97,8 @@ impl Engine {
             dequant_ws: Mutex::new(None),
             logits_opts: Mutex::new(LogitsOpts::default()),
             cache_weights: AtomicBool::new(true),
+            fused_w4a16: AtomicBool::new(false),
+            fused_min_n: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
@@ -92,6 +108,14 @@ impl Engine {
     /// Write f32 copies of selected intermediates for golden comparison.
     pub fn set_logits_opts(&self, head_ids: Option<Vec<u32>>, full: bool) {
         *self.logits_opts.lock().unwrap() = LogitsOpts { head_ids, full };
+    }
+
+    pub fn set_fused_w4a16(&self, enabled: bool) {
+        self.fused_w4a16.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_fused_min_n(&self, n: usize) {
+        self.fused_min_n.store(n, Ordering::Relaxed);
     }
 
     pub fn set_cache_weights(&self, enabled: bool) {
@@ -731,7 +755,25 @@ impl Engine {
                 zp,
                 ..
             } => {
-                // Correctness first: dequantize into a reusable BF16 workspace,
+                if self.fused_w4a16.load(Ordering::Relaxed)
+                    && n >= self.fused_min_n.load(Ordering::Relaxed)
+                {
+                    let mut c = self.alloc_bf16(rows * n)?;
+                    kernels::gemm_w4a16(
+                        &self.gpu,
+                        &self.kernels.gemm_w4a16,
+                        x,
+                        packed,
+                        scale,
+                        zp,
+                        &mut c,
+                        rows,
+                        n,
+                        k,
+                    )?;
+                    return Ok(c);
+                }
+                // Reference path: dequantize into a reusable BF16 workspace,
                 // then run the same cuBLAS GEMM as the merged-BF16 path.
                 let need = n * k;
                 let mut guard = self.dequant_ws.lock().unwrap();
@@ -773,6 +815,84 @@ impl Engine {
                 Ok(c)
             }
         }
+    }
+
+    /// End-to-end text path for the decision server: full forward, final norm,
+    /// last-token hidden state (`[hidden]`). The engine keeps all decoder
+    /// weights resident after `preload_all`, so this performs no weight I/O.
+    pub fn forward_last_hidden(&self, tokens: &[u32]) -> Result<Vec<f32>> {
+        let last = self.cfg.num_hidden_layers.saturating_sub(1) as isize;
+        self.forward(tokens, last, Stage::FinalNorm, true)
+    }
+
+    /// Full forward + final norm + lm_head rows for `head_ids`, at the last
+    /// position. `head_ids` are the decision head's verbalizer token ids.
+    pub fn decision_logits(&self, tokens: &[u32], head_ids: &[u32]) -> Result<Vec<f32>> {
+        self.set_logits_opts(Some(head_ids.to_vec()), false);
+        let last = self.cfg.num_hidden_layers.saturating_sub(1) as isize;
+        self.forward(tokens, last, Stage::Logits, true)
+    }
+
+    /// Diagnostic: run one packed linear on host f32 input, via the reference
+    /// dequant+cuBLAS path or the fused kernel.
+    pub fn matmul_module(
+        &self,
+        module: &str,
+        input: &[f32],
+        rows: usize,
+        fused: bool,
+    ) -> Result<Vec<f32>> {
+        let prov = WeightProvider::new(&self.store, &self.gpu.stream)?;
+        let w = prov.linear(module)?;
+        if input.len() != rows * w.in_() {
+            bail!(
+                "input has {} values, expected {}",
+                input.len(),
+                rows * w.in_()
+            );
+        }
+        let host: Vec<bf16> = input.iter().map(|v| bf16::from_f32(*v)).collect();
+        let x = self.gpu.stream.clone_htod(&host)?;
+        self.set_fused_w4a16(fused);
+        let y = self.gemm(&x, rows, &w)?;
+        self.set_fused_w4a16(false);
+        self.to_f32(&y, rows * w.out())
+    }
+
+    /// Benchmark one module with preloaded device weights (no upload inside the
+    /// timed section). Returns (reference_ms, fused_ms).
+    pub fn bench_matmul(
+        &self,
+        module: &str,
+        input: &[f32],
+        rows: usize,
+        repeat: usize,
+    ) -> Result<(Vec<f64>, Vec<f64>)> {
+        let prov = WeightProvider::new(&self.store, &self.gpu.stream)?;
+        let w = prov.linear(module)?;
+        let host: Vec<bf16> = input.iter().map(|v| bf16::from_f32(*v)).collect();
+        let x = self.gpu.stream.clone_htod(&host)?;
+        let mut refs = Vec::new();
+        let mut fused = Vec::new();
+        for _ in 0..repeat {
+            self.set_fused_w4a16(false);
+            self.gpu.synchronize()?;
+            let t = std::time::Instant::now();
+            let _ = self.gemm(&x, rows, &w)?;
+            self.gpu.synchronize()?;
+            refs.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        for _ in 0..repeat {
+            self.set_fused_w4a16(true);
+            self.set_fused_min_n(0);
+            self.gpu.synchronize()?;
+            let t = std::time::Instant::now();
+            let _ = self.gemm(&x, rows, &w)?;
+            self.gpu.synchronize()?;
+            fused.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        self.set_fused_w4a16(false);
+        Ok((refs, fused))
     }
 
     /// Dequantize one packed module to f32 (validation hook for AWQ).

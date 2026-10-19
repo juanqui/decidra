@@ -65,6 +65,23 @@ every intermediate as raw f32 for golden comparison. `--preload` keeps all
 decoder layers resident; `--no-cache` streams one layer at a time (needed for the
 51 GiB merged-BF16 checkpoint on a 24 GiB card).
 
+## Library API
+
+```rust
+use jev_native::Engine;
+
+let engine = Engine::new(model_dir)?;   // validates config, opens shards, CUDA ctx
+engine.preload_all()?;                  // 12.4 GiB packed weights resident, ~5.8 s
+let hidden = engine.forward_last_hidden(&tokens)?;            // [hidden]
+let logits = engine.decision_logits(&tokens, &[3721, 1802])?; // [2], last position
+```
+
+`Engine` is `Send` (compile-time asserted) but not intended for concurrent
+forwards: move it to one blocking worker (`spawn_blocking`) and serialize calls.
+`decision_logits` stores the per-call head ids, so do not call it concurrently.
+CLI commands remain available for validation (`self-test`, `layer`, `compare`,
+`info`, `dequant`, `matmul`).
+
 ## Numerics conventions
 
 - Qwen3.5 `Qwen3_5RMSNorm` is zero-centered: stored weight `w` is applied as
@@ -134,6 +151,30 @@ Top-1 token/last logit are identical (`867`, `3.578125`); two-way softmax is
 0.8568 vs the golden 0.8559 (abs diff 9.6e-4); full-vocab log-sum-exp differs by
 9.4e-4. `max_abs` at large activations is exactly one BF16 ulp.
 
-Running all 64 layers with `--no-cache` takes ~6 s (disk-bound, 12 GiB of packed
-weights re-read per invocation). A resident `--preload` run needs ~12.3 GiB and
-is blocked while the vLLM oracle occupies GPU 1.
+Resident (`--preload`, GPU 1 freed, 12.66 GiB used / 10.86 GiB free):
+
+| prompt | reference path (dequant+cuBLAS) | fused `--fused-w4a16` |
+|---|---|---|
+| 36 tokens | 176.6 ms (first 267 ms) | 405 ms |
+| 76 tokens | 202.9 ms | 460 ms |
+| 1024 tokens | 1277.6 ms | 2689 ms |
+
+Preload 5.8 s, init 0.2 s. GPU sample during the 36-token reference run: 100%
+utilization, ~231 W peak; the fused kernel is latency-bound at ~156 W. Resident
+outputs are bit-identical to the streaming (`--no-cache`) run, and the golden
+checks are unchanged (final norm rel_rms 1.25%, full logits rel_rms 0.26%,
+top-1 identical, two-way softmax delta 9.6e-4).
+
+### Fused W4A16 status
+
+`gemm_w4a16_bf16` dequantizes packed weights directly into shared memory and
+runs bf16 tensor-core WMMA (BM=BN=64, BK=64). It is numerically correct (layer 0
+mean_abs 1.0e-4 vs golden; full logits rel_rms 0.22%, top-1 identical) but **not
+faster** than dequantize-to-BF16 + cuBLAS on this workload: kernel-only averages
+are gate_proj 0.67 vs 0.63 ms, in_proj_qkv 1.20 vs 0.80 ms, out_proj 0.55 vs
+0.19 ms, down_proj 1.54 vs 0.63 ms, in_proj_a/b 0.40 vs 0.014 ms. The reference
+path is bandwidth-efficient and cuBLAS is already good at these small M; the
+naive fused schedule serializes dequant with MMA and re-dequantizes W per M
+tile. It stays selectable (`--fused-w4a16`, `--fused-min-n`) but is off by
+default. A Marlin-style pipeline (double-buffered cp.async, W tile reused across
+M tiles) is required to beat the reference path.

@@ -2,6 +2,7 @@
 // Compiled as a single cubin for sm_89 by native/build.rs.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 using bf16 = __nv_bfloat16;
 
@@ -373,6 +374,110 @@ extern "C" __global__ void dequant_w4a16_bf16(const int* __restrict__ packed,
   int z = (zword >> (4 * (o & 7))) & 0xF;
   float s = bf2f(scale[(long)o * groups + (i / group_size)]);
   out[idx] = f2bf((float)(q - z) * s);
+}
+
+// ---------------------------------------------------------------------------
+// Fused W4A16 GEMM: C[M,N] = X[M,K] @ W[N,K]^T with W dequantized in shared
+// memory. BM=BN=64, BK=64 (one quantization group), 8 warps, bf16 tensor cores.
+// No intermediate BF16 weight ever reaches global memory.
+// ---------------------------------------------------------------------------
+#define FBM 64
+#define FBN 64
+#define FBK 64
+#define FWARPS 8
+
+extern "C" __global__ void gemm_w4a16_bf16(
+    const bf16* __restrict__ x, const int* __restrict__ packed,
+    const bf16* __restrict__ scale, const int* __restrict__ zp,
+    bf16* __restrict__ out, int M, int N, int K) {
+  __shared__ bf16 sx[FBM][FBK];
+  __shared__ bf16 sw[FBN][FBK];
+  __shared__ float sacc[FWARPS][16 * 16];
+
+  const int n0 = blockIdx.x * FBN;
+  const int m0 = blockIdx.y * FBM;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int words_per_row = (K + 7) / 8;
+  const int groups = K / 64;
+
+  using namespace nvcuda;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1;
+  wmma::fill_fragment(acc0, 0.f);
+  wmma::fill_fragment(acc1, 0.f);
+
+  for (int k0 = 0; k0 < K; k0 += FBK) {
+    // Dequantize the 64x64 weight tile into shared memory.
+    for (int idx = tid; idx < FBN * FBK; idx += blockDim.x) {
+      int n = idx >> 6;
+      int kk = idx & 63;
+      int gn = n0 + n;
+      bf16 w = f2bf(0.f);
+      if (gn < N) {
+        int k = k0 + kk;
+        int g = k0 >> 6;
+        int word = packed[(long)gn * words_per_row + (k >> 3)];
+        int q = (word >> (4 * (k & 7))) & 0xF;
+        int zword = zp[(long)(gn >> 3) * groups + g];
+        int z = (zword >> (4 * (gn & 7))) & 0xF;
+        float sc = bf2f(scale[(long)gn * groups + g]);
+        w = f2bf((float)(q - z) * sc);
+      }
+      sw[n][kk] = w;
+    }
+    // Stage the X tile; rows past M are zero.
+    for (int idx = tid; idx < FBM * FBK; idx += blockDim.x) {
+      int m = idx >> 6;
+      int kk = idx & 63;
+      int gm = m0 + m;
+      sx[m][kk] = (gm < M) ? x[(long)gm * K + k0 + kk] : f2bf(0.f);
+    }
+    __syncthreads();
+
+    int t0 = warp;
+    int t1 = warp + FWARPS;
+#pragma unroll
+    for (int ti = 0; ti < 2; ++ti) {
+      int t = ti == 0 ? t0 : t1;
+      int tr = t >> 2;
+      int tc = t & 3;
+      // The staged K extent is 64 (one quantization group), but each MMA
+      // consumes 16 columns; accumulate all four sub-blocks.
+#pragma unroll
+      for (int ki = 0; ki < FBK; ki += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, bf16, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, bf16, wmma::col_major> b;
+        wmma::load_matrix_sync(a, &sx[tr * 16][ki], FBK);
+        wmma::load_matrix_sync(b, &sw[tc * 16][ki], FBK);
+        if (ti == 0)
+          wmma::mma_sync(acc0, a, b, acc0);
+        else
+          wmma::mma_sync(acc1, a, b, acc1);
+      }
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int ti = 0; ti < 2; ++ti) {
+    int t = ti == 0 ? warp : warp + FWARPS;
+    int tr = t >> 2;
+    int tc = t & 3;
+    if (ti == 0)
+      wmma::store_matrix_sync(&sacc[warp][0], acc0, 16, wmma::mem_row_major);
+    else
+      wmma::store_matrix_sync(&sacc[warp][0], acc1, 16, wmma::mem_row_major);
+    __syncwarp();
+    for (int idx = lane; idx < 256; idx += 32) {
+      int r = idx >> 4;
+      int cc = idx & 15;
+      int gm = m0 + tr * 16 + r;
+      int gn = n0 + tc * 16 + cc;
+      if (gm < M && gn < N) out[(long)gm * N + gn] = f2bf(sacc[warp][idx]);
+    }
+    __syncwarp();
+  }
 }
 
 // ---------------------------------------------------------------------------
