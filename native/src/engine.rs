@@ -1095,33 +1095,36 @@ impl Engine {
         let qkv = timed!(self, "gemm.in_qkv", self.gemm(h, total, &w.in_proj_qkv)?);
         let mut conv = self.alloc_bf16(total * conv_dim)?;
         let max_len = b.lens.iter().copied().max().unwrap_or(0);
-        let conv_out = if self.conv_tiled.load(Ordering::Relaxed) {
-            kernels::conv1d_silu_tiled_batched(
-                &self.gpu,
-                &self.kernels.conv1d_silu_tiled_batched,
-                &qkv,
-                &w.conv1d,
-                &mut conv,
-                &b.offsets_dev,
-                &b.lens_dev,
-                b.batch(),
-                conv_dim,
-                max_len,
-            )
-        } else {
-            kernels::conv1d_silu_batched(
-                &self.gpu,
-                &self.kernels.conv1d_silu_batched,
-                &qkv,
-                &w.conv1d,
-                &mut conv,
-                &b.offsets_dev,
-                &b.lens_dev,
-                b.batch(),
-                conv_dim,
-            )
-        };
-        timed!(self, "gdn.conv", conv_out?);
+        timed!(
+            self,
+            "gdn.conv",
+            if self.conv_tiled.load(Ordering::Relaxed) {
+                kernels::conv1d_silu_tiled_batched(
+                    &self.gpu,
+                    &self.kernels.conv1d_silu_tiled_batched,
+                    &qkv,
+                    &w.conv1d,
+                    &mut conv,
+                    &b.offsets_dev,
+                    &b.lens_dev,
+                    b.batch(),
+                    conv_dim,
+                    max_len,
+                )?
+            } else {
+                kernels::conv1d_silu_batched(
+                    &self.gpu,
+                    &self.kernels.conv1d_silu_batched,
+                    &qkv,
+                    &w.conv1d,
+                    &mut conv,
+                    &b.offsets_dev,
+                    &b.lens_dev,
+                    b.batch(),
+                    conv_dim,
+                )?
+            }
+        );
         let z = timed!(self, "gemm.z", self.gemm(h, total, &w.in_proj_z)?);
         let bb = timed!(self, "gemm.b", self.gemm(h, total, &w.in_proj_b)?);
         let aa = timed!(self, "gemm.a", self.gemm(h, total, &w.in_proj_a)?);
@@ -1747,28 +1750,31 @@ impl Engine {
             );
         }
         let mut conv = self.alloc_bf16(seq * conv_dim)?;
-        let conv_out = if self.conv_tiled.load(Ordering::Relaxed) {
-            kernels::conv1d_silu_tiled(
-                &self.gpu,
-                &self.kernels.conv1d_silu_tiled,
-                &qkv,
-                &w.conv1d,
-                &mut conv,
-                seq,
-                conv_dim,
-            )
-        } else {
-            kernels::conv1d_silu(
-                &self.gpu,
-                &self.kernels.conv1d_silu,
-                &qkv,
-                &w.conv1d,
-                &mut conv,
-                seq,
-                conv_dim,
-            )
-        };
-        timed!(self, "gdn.conv", conv_out?);
+        timed!(
+            self,
+            "gdn.conv",
+            if self.conv_tiled.load(Ordering::Relaxed) {
+                kernels::conv1d_silu_tiled(
+                    &self.gpu,
+                    &self.kernels.conv1d_silu_tiled,
+                    &qkv,
+                    &w.conv1d,
+                    &mut conv,
+                    seq,
+                    conv_dim,
+                )?
+            } else {
+                kernels::conv1d_silu(
+                    &self.gpu,
+                    &self.kernels.conv1d_silu,
+                    &qkv,
+                    &w.conv1d,
+                    &mut conv,
+                    seq,
+                    conv_dim,
+                )?
+            }
+        );
         if capture {
             self.dump_dev("gdn_mixed_qkv_conv", &conv, seq, conv_dim)?;
         }
