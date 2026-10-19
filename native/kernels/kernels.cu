@@ -1247,7 +1247,11 @@ __device__ __forceinline__ void tf32_tile_cr(const float* a, int lda,
 // Tensor-core version of gdn_chunked_f32. Same C/VC/layout and f32 state,
 // solve, gates and output; the five chunk GEMMs use TF32 WMMA with f32
 // accumulation. NCU note: one CTA per (value-column block, head).
-extern "C" __global__ void gdn_chunked_tc(
+//
+// The body is shared by the single-sequence entry point and the batched
+// variant: the batched launcher offsets q/k/v/g/beta/out to the sequence's
+// row range and points state at its slot, leaving blockIdx.x/.y unchanged.
+__device__ __forceinline__ void gdn_chunked_tc_impl(
     const float* __restrict__ q, const float* __restrict__ k,
     const float* __restrict__ v, const float* __restrict__ g,
     const float* __restrict__ beta, float* __restrict__ state,
@@ -1419,6 +1423,35 @@ extern "C" __global__ void gdn_chunked_tc(
     int d = idx / vc, j = idx - d * vc;
     state[((size_t)h * dk + d) * dv + j0 + j] = S[idx];
   }
+}
+
+extern "C" __global__ void gdn_chunked_tc(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc) {
+  gdn_chunked_tc_impl(q, k, v, g, beta, state, out, seq, heads, dk, dv, vc);
+}
+
+// One launch for a batch of sequences. Grid is (dv/VC, heads, batch); each
+// sequence uses its own [offset, offset+len) row range and state slot.
+extern "C" __global__ void gdn_chunked_tc_batched(
+    const float* __restrict__ q, const float* __restrict__ k,
+    const float* __restrict__ v, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    bf16* __restrict__ out, const int* __restrict__ offsets,
+    const int* __restrict__ lens, int batch, int heads, int dk, int dv,
+    int vc) {
+  const int z = blockIdx.z;
+  if (z >= batch) return;
+  const int o = offsets[z];
+  const int l = lens[z];
+  const size_t krow = (size_t)heads * dk;
+  const size_t vrow = (size_t)heads * dv;
+  gdn_chunked_tc_impl(q + o * krow, k + o * krow, v + o * vrow,
+                      g + (size_t)o * heads, beta + (size_t)o * heads,
+                      state + (size_t)z * krow * dv, out + o * vrow, l,
+                      heads, dk, dv, vc);
 }
 
 // ---------------------------------------------------------------------------

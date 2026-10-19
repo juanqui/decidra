@@ -191,3 +191,128 @@ fn tc_chunked_matches_f32_chunked() {
         );
     }
 }
+
+#[test]
+#[ignore = "requires a CUDA device (GPU1)"]
+fn tc_batched_matches_per_sequence() {
+    let lens = [73usize, 64, 89];
+    let batch = lens.len();
+    let heads = 48usize;
+    let dk = 128usize;
+    let dv = 128usize;
+    let total: usize = lens.iter().sum();
+    let mut offsets = Vec::with_capacity(batch);
+    let mut acc = 0;
+    for &l in &lens {
+        offsets.push(acc as i32);
+        acc += l;
+    }
+    let gpu = Gpu::new(0).expect("cuda context");
+    let kernels = Kernels::load(&gpu).expect("kernels");
+
+    let q = host_data(total * heads * dk, 0.12, 0.03);
+    let k = host_data(total * heads * dk, 0.10, -0.02);
+    let v = host_data(total * heads * dv, 0.5, 0.1);
+    let g: Vec<f32> = (0..total * heads)
+        .map(|i| -0.005 - 0.02 * (i as f32 * 0.11).sin().abs())
+        .collect();
+    let beta: Vec<f32> = (0..total * heads)
+        .map(|i| 0.1 + 0.8 * (i as f32 * 0.07).sin().abs())
+        .collect();
+
+    let dq = gpu.stream.clone_htod(&q).unwrap();
+    let dk_h = gpu.stream.clone_htod(&k).unwrap();
+    let dv_h = gpu.stream.clone_htod(&v).unwrap();
+    let dg = gpu.stream.clone_htod(&g).unwrap();
+    let db = gpu.stream.clone_htod(&beta).unwrap();
+    let doff = gpu.stream.clone_htod(&offsets).unwrap();
+    let dlen: CudaSlice<i32> = gpu
+        .stream
+        .clone_htod(&lens.iter().map(|&l| l as i32).collect::<Vec<_>>())
+        .unwrap();
+
+    let mut st_b = gpu
+        .stream
+        .alloc_zeros::<f32>(batch * heads * dk * dv)
+        .unwrap();
+    let mut out_b = gpu
+        .stream
+        .alloc_zeros::<bf16>(total * heads * dv)
+        .unwrap();
+    kernels::gdn_chunked_batched(
+        &gpu,
+        &kernels.gdn_chunked_tc_batched,
+        &dq,
+        &dk_h,
+        &dv_h,
+        &dg,
+        &db,
+        &mut st_b,
+        &mut out_b,
+        &doff,
+        &dlen,
+        batch,
+        heads,
+        dk,
+        dv,
+    )
+    .expect("batched launch");
+
+    let mut st_s = gpu
+        .stream
+        .alloc_zeros::<f32>(batch * heads * dk * dv)
+        .unwrap();
+    let mut out_s = gpu
+        .stream
+        .alloc_zeros::<bf16>(total * heads * dv)
+        .unwrap();
+    for (s, &l) in lens.iter().enumerate() {
+        let o = offsets[s] as usize;
+        let qv = dq.try_slice(o * heads * dk..(o + l) * heads * dk).unwrap();
+        let kv = dk_h.try_slice(o * heads * dk..(o + l) * heads * dk).unwrap();
+        let vv = dv_h.try_slice(o * heads * dv..(o + l) * heads * dv).unwrap();
+        let gv = dg.try_slice(o * heads..(o + l) * heads).unwrap();
+        let bv = db.try_slice(o * heads..(o + l) * heads).unwrap();
+        let mut sv = st_s
+            .try_slice_mut(s * heads * dk * dv..(s + 1) * heads * dk * dv)
+            .unwrap();
+        let mut ov = out_s
+            .try_slice_mut(o * heads * dv..(o + l) * heads * dv)
+            .unwrap();
+        kernels::gdn_chunked(
+            &gpu,
+            &kernels.gdn_chunked_tc,
+            &qv,
+            &kv,
+            &vv,
+            &gv,
+            &bv,
+            &mut sv,
+            &mut ov,
+            l,
+            heads,
+            dk,
+            dv,
+        )
+        .expect("single launch");
+    }
+    gpu.synchronize().unwrap();
+
+    let ob = gpu.stream.clone_dtoh(&out_b).unwrap();
+    let os = gpu.stream.clone_dtoh(&out_s).unwrap();
+    let sb = gpu.stream.clone_dtoh(&st_b).unwrap();
+    let ss = gpu.stream.clone_dtoh(&st_s).unwrap();
+    let omax = ob
+        .iter()
+        .zip(os.iter())
+        .map(|(a, b)| (a.to_f32() - b.to_f32()).abs())
+        .fold(0f32, f32::max);
+    let smax = sb
+        .iter()
+        .zip(ss.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    println!("batched vs per-seq: out max {omax:.3e}, state max {smax:.3e}");
+    assert_eq!(omax, 0.0, "batched output differs: {omax}");
+    assert_eq!(smax, 0.0, "batched state differs: {smax}");
+}

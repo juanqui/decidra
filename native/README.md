@@ -290,6 +290,16 @@ Full forward, warm, RTX 4090 / GPU1:
 shared), other GEMMs 90 ms (18%), GDN conv 1.0 ms, MLP activation 6.8 ms,
 attention 4.2 ms.
 
+The batched path launches one chunked CTA grid `(dv/VC, heads, batch)` over the
+flattened offsets/lens (`gdn_chunked_tc_batched`) whenever every sequence is
+>= the threshold; mixed batches keep the per-sequence loop. Outputs and state
+are bit-identical to one launch per sequence (covered by the `gdn_chunked`
+test). Batch of 8 x 73 tokens: GDN recurrence 70.3 -> 39.1 ms, warm forward
+256 -> 232 ms (34.5 req/s, 2.3k tok/s). The remaining 232 ms is MLP GEMMs
+119 ms (at ~165 TFLOP/s, i.e. tensor-core peak), non-MLP projections ~55 ms,
+attention 2.4 ms; `gemm.b` in the profile is host-side launch gap, not GPU
+work.
+
 Shared-path 1K breakdown (486 ms forward, historical): MLP GEMMs 204 ms (42%),
 GDN recurrence 164 ms (34%), other GEMMs 88 ms (18%), GDN conv 8.8 ms, MLP
 activation 6.7 ms, attention 4.0 ms, norms/residuals ~5 ms. (The profiler's

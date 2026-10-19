@@ -177,11 +177,18 @@ shared/split recurrence, and `false` restores the legacy path everywhere.
   top-1 36/36, max 0.125 (shared 0.109).
 - Native forward at 76 tokens **69.5 -> 52.0 ms** (GDN 27.6 -> 7.27 ms per
   prompt); 128 tokens **97.8 -> 64.9 ms**; 1K **478 -> 394 ms**.
-- Server uncached sweep, 16 unique ~71-token requests: c=1 **21.6-21.7 req/s,
-  p50 43.7 ms** (was 15.84 / 61.9); c=4 29.6 / 133 ms and c=8 29.9-30.0 /
-  243-258 ms are unchanged because the batched shared GDN already amortizes
-  across the batch, so the gain is single-request only. The c8 >=32 req/s
-  target is not reached; the remaining limit is not GDN.
+- Server uncached sweep, 16 unique ~71-token requests: c=1 **21.6-21.8 req/s,
+  p50 43.5-43.9 ms** (was 15.84 / 61.9); c=2 26.5 / 75 ms, c=4 30.4 / 130 ms.
+- Batched chunked GDN (`gdn_chunked_tc_batched`, grid `z=batch`, one launch
+  for all sequences >= the threshold) cuts the 8x73-token GDN recurrence
+  **70.3 -> 39.1 ms** and the warm forward **256 -> 232 ms** (34.5 req/s
+  native). Outputs are bit-identical to per-sequence launches.
+- Server c8 **29.9-31.3 req/s** (p50 231-263 ms) and c16
+  **31.2-31.5 req/s** (p50 334-389 ms, was 28.86). `MAX_BATCH=16` made c16
+  worse (29.9-30.1), so the default 8 stays. Targets c8 >=32 and c16 >=33 are
+  **not reached**: the 232 ms batch is 119 ms MLP GEMMs already at tensor-core
+  peak, ~55 ms projections and 39 ms GDN, leaving no 7% headroom without an
+  algorithmic GEMM change.
 - Server single-request `/v1/decide`: 4K **1.63 s** (legacy 2.12-2.18), 8K **3.27 s**
   (4.23-4.32), 16K **6.77 s** (8.62-8.97), 35.3K **16.67 s** (20.15).
 - long-context suite 10/10; the 4K/8K/16K probes keep their documented deltas.

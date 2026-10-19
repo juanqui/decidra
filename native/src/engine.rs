@@ -1211,6 +1211,10 @@ impl Engine {
         let chunked = self.gdn_chunked.load(Ordering::Relaxed);
         let chunk_min = self.gdn_chunked_min_seq.load(Ordering::Relaxed);
         let chunked_any = (chunked || chunked_tc) && b.lens.iter().any(|&l| l >= chunk_min);
+        // One batched TF32 launch when every sequence is long enough; mixed
+        // batches keep the per-sequence loop so short items stay on the
+        // accurate shared recurrence.
+        let all_chunked = chunked_tc && b.lens.iter().all(|&l| l >= chunk_min);
         let dv_chunks = if dv >= 64 {
             self.gdn_chunks.load(Ordering::Relaxed).max(1).min(dv / 16)
         } else {
@@ -1219,7 +1223,25 @@ impl Engine {
         timed!(
             self,
             "gdn.recurrent",
-            if !chunked_any && split && all_long {
+            if all_chunked {
+                kernels::gdn_chunked_batched(
+                    &self.gpu,
+                    &self.kernels.gdn_chunked_tc_batched,
+                    &*qf,
+                    &*kf,
+                    &*vf,
+                    &*gg,
+                    &*beta,
+                    &mut *state,
+                    &mut *core,
+                    &b.offsets_dev,
+                    &b.lens_dev,
+                    b.batch(),
+                    nv,
+                    dk,
+                    dv,
+                )?
+            } else if !chunked_any && split && all_long {
                 kernels::gdn_recurrent_split_batched(
                     &self.gpu,
                     &self.kernels.gdn_recurrent_split_batched,

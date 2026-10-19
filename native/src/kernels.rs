@@ -31,6 +31,7 @@ pub struct Kernels {
     pub gdn_recurrent_split_batched: CudaFunction,
     pub gdn_chunked: CudaFunction,
     pub gdn_chunked_tc: CudaFunction,
+    pub gdn_chunked_tc_batched: CudaFunction,
     pub conv1d_silu_batched: CudaFunction,
     pub conv1d_silu_tiled: CudaFunction,
     pub conv1d_silu_tiled_batched: CudaFunction,
@@ -125,6 +126,14 @@ impl Kernels {
             },
             gdn_chunked_tc: {
                 let f = gpu.func("gdn_chunked_tc")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    90112,
+                )?;
+                f
+            },
+            gdn_chunked_tc_batched: {
+                let f = gpu.func("gdn_chunked_tc_batched")?;
                 f.set_attribute(
                     CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
                     90112,
@@ -1423,6 +1432,89 @@ where
     l.arg(&sp);
     l.arg(&op);
     l.arg(&seq_i);
+    l.arg(&heads_i);
+    l.arg(&dk_i);
+    l.arg(&dv_i);
+    l.arg(&vc_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+/// Batched chunked GDN: one launch over `(dv/VC, heads, batch)`.
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_chunked_batched<Q, K, V, G, B, ST, O, OF, LN>(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    q: &Q,
+    k: &K,
+    v: &V,
+    g: &G,
+    beta: &B,
+    state: &mut ST,
+    out: &mut O,
+    offsets: &OF,
+    lens: &LN,
+    batch: usize,
+    heads: usize,
+    dk: usize,
+    dv: usize,
+) -> Result<()>
+where
+    Q: DevicePtr<f32>,
+    K: DevicePtr<f32>,
+    V: DevicePtr<f32>,
+    G: DevicePtr<f32>,
+    B: DevicePtr<f32>,
+    ST: DevicePtrMut<f32>,
+    O: DevicePtrMut<bf16>,
+    OF: DevicePtr<i32>,
+    LN: DevicePtr<i32>,
+{
+    if dv % GDN_CHUNK_VC != 0 {
+        anyhow::bail!("dv={dv} not divisible by chunked VC={GDN_CHUNK_VC}");
+    }
+    let smem = (dk * GDN_CHUNK_VC
+        + 2 * GDN_CHUNK_C * dk
+        + 2 * GDN_CHUNK_C * GDN_CHUNK_VC
+        + GDN_CHUNK_C * GDN_CHUNK_C
+        + 4 * GDN_CHUNK_C)
+        * std::mem::size_of::<f32>();
+    let cfg = LaunchConfig {
+        grid_dim: (
+            (dv / GDN_CHUNK_VC) as u32,
+            heads as u32,
+            batch as u32,
+        ),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: smem as u32,
+    };
+    let (batch_i, heads_i, dk_i, dv_i, vc_i) = (
+        batch as i32,
+        heads as i32,
+        dk as i32,
+        dv as i32,
+        GDN_CHUNK_VC as i32,
+    );
+    let (qp, _rq) = q.device_ptr(&gpu.stream);
+    let (kp, _rk) = k.device_ptr(&gpu.stream);
+    let (vp, _rv) = v.device_ptr(&gpu.stream);
+    let (gp, _rg) = g.device_ptr(&gpu.stream);
+    let (bp, _rb) = beta.device_ptr(&gpu.stream);
+    let (sp, _rs) = state.device_ptr_mut(&gpu.stream);
+    let (op, _ro) = out.device_ptr_mut(&gpu.stream);
+    let (ofp, _rof) = offsets.device_ptr(&gpu.stream);
+    let (lnp, _rln) = lens.device_ptr(&gpu.stream);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(&qp);
+    l.arg(&kp);
+    l.arg(&vp);
+    l.arg(&gp);
+    l.arg(&bp);
+    l.arg(&sp);
+    l.arg(&op);
+    l.arg(&ofp);
+    l.arg(&lnp);
+    l.arg(&batch_i);
     l.arg(&heads_i);
     l.arg(&dk_i);
     l.arg(&dv_i);
