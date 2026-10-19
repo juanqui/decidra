@@ -119,6 +119,18 @@ JEV_SIGNING_KEY="$(cat /run/secrets/jev-signing-key)" \
 256 choice label ids, then exits. Startup always performs the same validation and refuses
 to serve on a tokenizer/head mismatch.
 
+## Deployment assets
+
+- `scripts/run-vllm.sh` — disposable GPU 1 test backend on port 8002, with health wait.
+- `scripts/run-server.sh` — build and run the Rust server (default `0.0.0.0:8501`).
+- `scripts/smoke.sh` — health/models/info plus one real decision.
+- `Dockerfile` — multi-stage server image; no weights.
+- `docker-compose.yml` — server only, model mounted read-only, host vLLM via `host.docker.internal`.
+- `docs/DEPLOY.md` — GPU selection, ports, health checks, restart, and troubleshooting.
+
+The Rust server uses no GPU. The test backend uses GPU 1 only; GPU 0 is not used by this
+stack.
+
 ## Configuration
 
 | Variable | Default | Meaning |

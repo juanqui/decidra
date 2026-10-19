@@ -1,0 +1,40 @@
+# jev-engine only. The vLLM backend is launched separately on GPU 1 with
+# scripts/run-vllm.sh and exposed on the host at 127.0.0.1:8002.
+#
+#   docker compose up -d --build
+#   docker compose logs -f
+#   docker compose ps
+#
+# No GPU is reserved for the Rust server. GPU 0 is not used by this stack.
+
+services:
+  jev-engine:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jev-engine:0.1.0
+    container_name: jev-engine
+    restart: unless-stopped
+    ports:
+      - "${JEV_SERVER_PORT:-8501}:8080"
+    environment:
+      JEV_VLLM_URL: ${JEV_VLLM_URL:-http://host.docker.internal:8002}
+      JEV_VLLM_MODEL: ${JEV_VLLM_MODEL:-jev-awq}
+      JEV_CHECKPOINT: /models/awq-w4a16-v2
+      JEV_BIND_ADDR: 0.0.0.0:8080
+      JEV_MAX_CONCURRENCY: ${JEV_MAX_CONCURRENCY:-8}
+      JEV_REQUEST_TIMEOUT_SECS: ${JEV_REQUEST_TIMEOUT_SECS:-600}
+      JEV_METRICS_ENABLED: "true"
+      # Set in the host environment or a .env file (never commit it).
+      JEV_SIGNING_KEY: ${JEV_SIGNING_KEY:-}
+    volumes:
+      # Read-only: tokenizer, decision_head/, and calibration.json only.
+      - ${JEV_MODELS_DIR:-/srv/models/jev-awq}:/models:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
