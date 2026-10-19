@@ -18,6 +18,7 @@ fn main() -> Result<()> {
         "info" => cmd_info(&args[1..]),
         "dequant" => cmd_dequant(&args[1..]),
         "matmul" => cmd_matmul(&args[1..]),
+        "marlin-dump" => cmd_marlin_dump(&args[1..]),
         "alloctest" => cmd_alloctest(),
         other => bail!(
             "unknown command {other:?} (self-test|layer|compare|info|dequant|matmul|alloctest)"
@@ -110,6 +111,33 @@ fn cmd_alloctest() -> Result<()> {
     Ok(())
 }
 
+fn cmd_marlin_dump(args: &[String]) -> Result<()> {
+    let model = PathBuf::from(req(args, "--model")?);
+    let tensor = req(args, "--tensor")?;
+    let prefix = PathBuf::from(req(args, "--out-prefix")?);
+    let eng = Engine::new(&model)?;
+    eng.set_marlin(true);
+    let (q, s, z) = eng.dump_marlin(tensor)?;
+    let mut qb = Vec::with_capacity(q.len() * 4);
+    for v in &q {
+        qb.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(prefix.with_extension("q.i32"), qb)?;
+    write_f32(&prefix.with_extension("s.f32"), &s)?;
+    let mut zb = Vec::with_capacity(z.len() * 4);
+    for v in &z {
+        zb.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(prefix.with_extension("z.i32"), zb)?;
+    eprintln!(
+        "qweight {} ints, scales {} f32, zeros {} ints",
+        q.len(),
+        s.len(),
+        z.len()
+    );
+    Ok(())
+}
+
 fn cmd_matmul(args: &[String]) -> Result<()> {
     let model = PathBuf::from(req(args, "--model")?);
     let tensor = req(args, "--tensor")?;
@@ -118,6 +146,12 @@ fn cmd_matmul(args: &[String]) -> Result<()> {
     let out = PathBuf::from(req(args, "--out")?);
     let fused = args.iter().any(|a| a == "--fused-w4a16");
     let eng = Engine::new(&model)?;
+    if args.iter().any(|a| a == "--marlin") {
+        eng.set_marlin(true);
+    }
+    if args.iter().any(|a| a == "--legacy-attention") {
+        eng.set_warp_attention(false);
+    }
     let repeat: usize = opt(args, "--repeat").unwrap_or("1").parse()?;
     let mut vals = Vec::new();
     if args.iter().any(|a| a == "--bench") {
@@ -184,6 +218,9 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     }
     if args.iter().any(|a| a == "--fused-tile128") {
         eng.set_fused_tile128(true);
+    }
+    if args.iter().any(|a| a == "--marlin") {
+        eng.set_marlin(true);
     }
     if args.iter().any(|a| a == "--no-cache") {
         eng.set_cache_weights(false);

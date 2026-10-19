@@ -127,6 +127,13 @@ pub struct Engine {
     fused_max_m: std::sync::atomic::AtomicUsize,
     /// Experimental 128x128 tile (slower on this GPU at the tested shapes).
     fused_tile128: AtomicBool,
+    /// Use the vendored Marlin W4A16 kernel/layout instead of dequant+cuBLAS.
+    marlin: AtomicBool,
+    /// Marlin split-K barrier workspace (one int per SM), zeroed once.
+    marlin_locks: Mutex<Option<CudaSlice<i32>>>,
+    /// Warp-per-query attention (fast for long contexts); the original block
+    /// kernel remains selectable.
+    warp_attention: AtomicBool,
 }
 
 const _: fn() = || {
@@ -156,6 +163,9 @@ impl Engine {
             fused_min_n: std::sync::atomic::AtomicUsize::new(5120),
             fused_max_m: std::sync::atomic::AtomicUsize::new(128),
             fused_tile128: AtomicBool::new(false),
+            marlin: AtomicBool::new(false),
+            marlin_locks: Mutex::new(None),
+            warp_attention: AtomicBool::new(true),
         })
     }
 
@@ -181,6 +191,20 @@ impl Engine {
 
     pub fn set_fused_tile128(&self, enabled: bool) {
         self.fused_tile128.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_warp_attention(&self, enabled: bool) {
+        self.warp_attention.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_marlin(&self, enabled: bool) {
+        self.marlin.store(enabled, Ordering::Relaxed);
+    }
+
+    fn provider(&self) -> Result<WeightProvider<'_>> {
+        let mut p = WeightProvider::new(&self.store, &self.gpu, &self.kernels)?;
+        p.marlin = self.marlin.load(Ordering::Relaxed);
+        Ok(p)
     }
 
     pub fn set_cache_weights(&self, enabled: bool) {
@@ -242,7 +266,7 @@ impl Engine {
         if let Some(w) = &cache[idx] {
             return Ok(w.clone());
         }
-        let prov = WeightProvider::new(&self.store, &self.gpu.stream)?;
+        let prov = self.provider()?;
         let w = Arc::new(prov.layer(idx, self.cfg.layer_types[idx])?);
         if self.cache_weights.load(Ordering::Relaxed) {
             cache[idx] = Some(w.clone());
@@ -274,7 +298,7 @@ impl Engine {
 
     pub fn embed(&self, tokens: &[u32]) -> Result<Buf> {
         let h = self.cfg.hidden_size;
-        let name = WeightProvider::new(&self.store, &self.gpu.stream)?.embedding();
+        let name = self.provider()?.embedding();
         let mut host = vec![bf16::ZERO; tokens.len() * h];
         for (t, &tok) in tokens.iter().enumerate() {
             if tok as usize >= self.cfg.vocab_size {
@@ -367,7 +391,7 @@ impl Engine {
         }
         match stage {
             Stage::FinalNorm | Stage::Logits => {
-                let norm = WeightProvider::new(&self.store, &self.gpu.stream)?.final_norm()?;
+                let norm = self.provider()?.final_norm()?;
                 let mut h = self.alloc_bf16(seq * self.cfg.hidden_size)?;
                 kernels::rmsnorm(
                     &self.gpu,
@@ -606,19 +630,35 @@ impl Engine {
         }
 
         let mut attn = self.alloc_bf16(seq * heads * hd)?;
-        kernels::attention(
-            &self.gpu,
-            &self.kernels.attention,
-            &qn,
-            &kn,
-            &vv,
-            &mut attn,
-            seq,
-            heads,
-            kv,
-            hd,
-            1.0 / (hd as f32).sqrt(),
-        )?;
+        if self.warp_attention.load(Ordering::Relaxed) {
+            kernels::attention_warp(
+                &self.gpu,
+                &self.kernels.attention_warp,
+                &qn,
+                &kn,
+                &vv,
+                &mut attn,
+                seq,
+                heads,
+                kv,
+                hd,
+                1.0 / (hd as f32).sqrt(),
+            )?;
+        } else {
+            kernels::attention(
+                &self.gpu,
+                &self.kernels.attention,
+                &qn,
+                &kn,
+                &vv,
+                &mut attn,
+                seq,
+                heads,
+                kv,
+                hd,
+                1.0 / (hd as f32).sqrt(),
+            )?;
+        }
         if capture {
             self.dump_dev("attn_weights_out", &attn, seq, heads * hd)?;
         }
@@ -837,6 +877,47 @@ impl Engine {
                 mark("  cublas", t1);
                 Ok(c)
             }
+            LinearWeight::Marlin {
+                qweight,
+                scales,
+                zeros,
+                ..
+            } => {
+                let mut c = self.alloc_bf16(rows * n)?;
+                {
+                    let mut g = self.marlin_locks.lock().unwrap();
+                    if g.is_none() {
+                        *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
+                    }
+                }
+                let locks = self.marlin_locks.lock().unwrap();
+                let locks = locks.as_ref().expect("locks initialized");
+                let mut off = 0usize;
+                let mut rest = rows;
+                while rest > 0 {
+                    let par = (rest / 64).min(16);
+                    let pm = if par > 0 { par * 64 } else { rest };
+                    let tmb = pm.div_ceil(16).min(4);
+                    let idx = if pm <= 8 { 0 } else { tmb };
+                    kernels::marlin_gemm(
+                        &self.gpu,
+                        &self.kernels.marlin_cfgs[idx],
+                        x,
+                        qweight,
+                        &mut c,
+                        scales,
+                        zeros,
+                        locks,
+                        off,
+                        pm,
+                        n,
+                        k,
+                    )?;
+                    off += pm;
+                    rest -= pm;
+                }
+                Ok(c)
+            }
             LinearWeight::PackedW4A16 {
                 group_size,
                 packed,
@@ -953,7 +1034,7 @@ impl Engine {
         rows: usize,
         fused: bool,
     ) -> Result<Vec<f32>> {
-        let prov = WeightProvider::new(&self.store, &self.gpu.stream)?;
+        let prov = self.provider()?;
         let w = prov.linear(module)?;
         if input.len() != rows * w.in_() {
             bail!(
@@ -979,7 +1060,7 @@ impl Engine {
         rows: usize,
         repeat: usize,
     ) -> Result<(Vec<f64>, Vec<f64>)> {
-        let prov = WeightProvider::new(&self.store, &self.gpu.stream)?;
+        let prov = self.provider()?;
         let w = prov.linear(module)?;
         let host: Vec<bf16> = input.iter().map(|v| bf16::from_f32(*v)).collect();
         let x = self.gpu.stream.clone_htod(&host)?;
@@ -1006,12 +1087,35 @@ impl Engine {
         Ok((refs, fused))
     }
 
+    /// Dump a Marlin-repacked module: (qweight i32, scales f32, zeros i32).
+    pub fn dump_marlin(&self, module: &str) -> Result<(Vec<i32>, Vec<f32>, Vec<i32>)> {
+        let prov = self.provider()?;
+        let w = prov.linear(module)?;
+        match w {
+            LinearWeight::Marlin {
+                qweight,
+                scales,
+                zeros,
+                ..
+            } => {
+                let q = self.gpu.stream.clone_dtoh(&qweight)?;
+                let s: Vec<bf16> = self.gpu.stream.clone_dtoh(&scales)?;
+                let z = self.gpu.stream.clone_dtoh(&zeros)?;
+                Ok((q, s.iter().map(|v| v.to_f32()).collect(), z))
+            }
+            _ => bail!("{module} did not take the Marlin path"),
+        }
+    }
+
     /// Dequantize one packed module to f32 (validation hook for AWQ).
     pub fn dequant_module(&self, module: &str) -> Result<Vec<f32>> {
-        let prov = WeightProvider::new(&self.store, &self.gpu.stream)?;
+        let prov = self.provider()?;
         let w = prov.linear(module)?;
         match &w {
             LinearWeight::Bf16 { .. } => bail!("{module} is not packed"),
+            LinearWeight::Marlin { .. } => {
+                bail!("{module} is repacked to Marlin; rerun without --marlin")
+            }
             LinearWeight::PackedW4A16 {
                 out,
                 in_,

@@ -9,7 +9,8 @@ external inference runtime, PyTorch, or Python.
 ```text
 native/
   build.rs            compiles kernels/*.cu to a sm_89 cubin
-  kernels/kernels.cu  RMSNorm, RoPE, causal GQA attention, GDN conv/prepare/rule
+  kernels/kernels.cu  RMSNorm, RoPE, causal GQA attention (warp + legacy), GDN
+  kernels/marlin.cu   vendored Marlin W4A16 launcher + repack (third_party/marlin)
   src/cuda.rs         driver context, cubin module, cuBLAS handle
   src/tensor.rs       mmap'd multi-shard safetensors reader
   src/config.rs       Qwen3.5 text config
@@ -100,6 +101,31 @@ CLI commands remain available for validation (`self-test`, `layer`, `compare`,
 - Norm weights and linears must come from the same checkpoint: AWQ checkpoints
   store smoothing-adjusted norms, so they are never mixed with merged-bf16.
 
+## Attention
+
+Two causal GQA kernels share the same graph:
+
+- **warp-per-query** (default): one warp owns a query, lanes hold 8 head dims in
+  registers, the QK dot is a warp shuffle, and online softmax/PV stay in
+  registers. No block synchronization inside the key loop.
+- **block-per-query** (`--legacy-attention`): the original kernel, kept for A/B.
+
+Long-context latency (Marlin weights, resident, SM89 RTX 4090):
+
+| tokens | warp attention | legacy attention | peak GPU mem |
+|---|---|---|---|
+| 4K | 4.65 s | 6.81 s | 17.2 GiB |
+| 8K | 9.88 s | 19.17 s | 17.6 GiB |
+| 16K | 22.88 s | (not run; ~60 s by fit) | 18.9 GiB |
+
+There is no CPU AWQ golden at 4K/8K/16K. Quality is checked causally: the first
+36 positions of every long prompt are the golden 36-token prompt, and the head
+logits at positions 0..35 match the 36-token golden within max 0.051-0.125 /
+mean 0.014-0.016 (Marlin + warp attention: 4K max 0.082, 8K 0.051, 16K 0.051).
+K/V are transient per layer (bf16, no persistent KV cache, no FP8 KV); the GDN
+state is f32. 16K peaks at 18.9 GiB including the 13.1 GiB resident weights, so
+24 GiB fits with headroom.
+
 ## Weight sources
 
 `weight_packed` is detected per module, so the graph is identical for both
@@ -115,6 +141,14 @@ sources:
   `compressed_tensors.PackedQuantizationCompressor.decompress()` bit-exactly
   (max_abs 0.0 on four sampled tensors).
 - No `weight_g_idx` in this checkpoint, so the weights are in column order.
+- **Marlin W4A16** (`--marlin` / `Engine::set_marlin(true)` before
+  `preload_all`): the vendored vLLM/Marlin kernel (Apache-2.0, see
+  `third_party/marlin/NOTICE.md`). Weights are repacked from the CT layout to
+  Marlin's `[K/16, 2N]` layout on the GPU; the repacked qweight, scales, and
+  zero points match vLLM's `gptq_marlin_repack` / `marlin_permute_scales` /
+  `marlin_zero_points` **bit-exactly** (verified for a 17408x5120 module).
+  The kernel uses `kU4` with asymmetric zero points, `kBFloat16` activations,
+  group 64 (group_blocks=4), thread_m_blocks 1..4, 128 CTAs.
 
 Packed decoder weights are uploaded once by `--preload` / `preload_all()` and
 stay resident (12.22 GiB packed + 0.18 GiB dequant workspace). Correctness mode
@@ -160,14 +194,20 @@ Top-1 token/last logit are identical (`867`, `3.578125`); two-way softmax is
 
 Resident (`--preload`, GPU 1 freed, 12.66 GiB used / 10.86 GiB free):
 
-| prompt | reference path (dequant+cuBLAS) | hybrid fused (`--fused-w4a16`) |
-|---|---|---|
-| 36 tokens | 174.7 ms (first 259 ms) | **84.8 ms** (2.06x) |
-| 76 tokens | 202.2 ms | **126.4 ms** (1.60x) |
-| 1024 tokens | 1261.2 ms | **1261.2 ms** (falls back, 1.00x) |
+| prompt | reference (dequant+cuBLAS) | hybrid fused | Marlin |
+|---|---|---|---|
+| 36 tokens | 174.7 ms | 84.8 ms | **45.1 ms** (3.87x) |
+| 76 tokens | 202.2 ms | 126.4 ms | **73.0 ms** (2.77x) |
+| 1024 tokens | 1261.2 ms | 1261.2 ms | **1144.9 ms** (1.10x) |
 
-Preload 5.8 s, init 0.2 s. GPU sample during the 36-token hybrid run: 100%
-utilization, ~184 W mean / 213 W peak, 12.7 GiB used. Resident outputs are
+Marlin preload is 10.1 s (repack) and uses 13.1 GiB; the other paths preload in
+5.8 s / 12.7 GiB. Init 0.2 s. GPU samples: reference/fused ~184-231 W,
+Marlin ~45 ms at 36 tokens with 100% utilization. Marlin golden checks: layer 0
+mean 1.58e-4 / rel_rms 0.347%; final norm rel_rms 1.23%, cosine 0.999924.
+
+At 1K the gain is only 9%: that case is compute-bound and cuBLAS+dequant was
+already efficient; the fixed 64-row M tile and re-reading W per M tile limit
+Marlin's large-M benefit. A persistent M-loop / larger tile is the next step. Resident outputs are
 bit-identical to the streaming (`--no-cache`) run. Golden after residency
 (hybrid): final norm rel_rms 1.07% (reference 1.25%), full logits rel_rms 0.24%,
 top-1 identical, two-way softmax identical at f32 print precision.

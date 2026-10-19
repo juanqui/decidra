@@ -225,6 +225,67 @@ extern "C" __global__ void attention_bf16(const bf16* __restrict__ q,
 }
 
 // ---------------------------------------------------------------------------
+// Causal GQA attention, one warp per query position. Lanes hold 8 head dims in
+// registers; a warp shuffle reduces the dot product, so there is no block
+// synchronization inside the key loop. This replaces the block-per-query kernel
+// for long contexts.
+// grid: (n_heads, ceil(seq/4)), block: 128
+// ---------------------------------------------------------------------------
+extern "C" __global__ void attention_warp_bf16(
+    const bf16* __restrict__ q, const bf16* __restrict__ k,
+    const bf16* __restrict__ v, bf16* __restrict__ out, int seq, int n_heads,
+    int n_kv, int hd, float scale) {
+  int h = blockIdx.x;
+  int qpos = blockIdx.y * 4 + (threadIdx.x >> 5);
+  if (qpos >= seq) return;
+  int lane = threadIdx.x & 31;
+  int kvh = h / (n_heads / n_kv);
+  const int stride = 32;
+
+  float qreg[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    int d = lane + stride * i;
+    qreg[i] = (d < hd) ? bf2f(q[((size_t)qpos * n_heads + h) * hd + d]) : 0.f;
+  }
+  float acc[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) acc[i] = 0.f;
+  float m = -INFINITY, l = 0.f;
+
+  for (int sx = 0; sx <= qpos; ++sx) {
+    const bf16* kb = k + ((size_t)sx * n_kv + kvh) * hd;
+    float part = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      int d = lane + stride * i;
+      if (d < hd) part += qreg[i] * bf2f(kb[d]);
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      part += __shfl_xor_sync(0xffffffffu, part, off);
+    float score = part * scale;
+    float m_new = fmaxf(m, score);
+    float alpha = expf(m - m_new);
+    float p = expf(score - m_new);
+    m = m_new;
+    l = l * alpha + p;
+    const bf16* vb = v + ((size_t)sx * n_kv + kvh) * hd;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      int d = lane + stride * i;
+      if (d < hd) acc[i] = acc[i] * alpha + p * bf2f(vb[d]);
+    }
+  }
+  float inv = 1.f / l;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) {
+    int d = lane + stride * i;
+    if (d < hd) out[((size_t)qpos * n_heads + h) * hd + d] = f2bf(acc[i] * inv);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Depthwise causal conv (kernel 4, padding 3) + SiLU.
 // x: [seq, ch] (pre-conv), w: [ch, 4], out: [seq, ch]
 // ---------------------------------------------------------------------------

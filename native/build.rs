@@ -1,4 +1,8 @@
-//! Compiles `kernels/*.cu` to a cubin for sm_89.
+//! Compiles the CUDA kernels to sm_89 cubins.
+//!
+//! Two modules are produced:
+//!   - `kernels.cu`: the engine's own kernels
+//!   - `marlin.cu`: the vendored Marlin W4A16 kernel + repack (third_party/)
 //!
 //! The host may not have nvcc. Resolution order:
 //!   1. `JEV_NVCC` (path to nvcc)
@@ -6,58 +10,96 @@
 //!   3. `docker run` the CUDA image in `JEV_CUDA_IMAGE` (default
 //!      nvidia/cuda:13.1.1-devel-ubuntu24.04) purely as a build toolchain
 //!
-//! The resulting cubin is embedded by path through `JEV_KERNELS_CUBIN`.
+//! Cubin paths are passed to the crate through `JEV_KERNELS_CUBIN` and
+//! `JEV_MARLIN_CUBIN`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 use std::{env, fs};
+
+struct Job {
+    name: &'static str,
+    src: &'static str,
+    extra: &'static [&'static str],
+}
+
+const JOBS: &[Job] = &[
+    Job {
+        name: "kernels",
+        src: "kernels/kernels.cu",
+        extra: &[],
+    },
+    Job {
+        name: "marlin",
+        src: "kernels/marlin.cu",
+        extra: &[
+            "-I",
+            "third_party",
+            "-I",
+            "third_party/marlin",
+            "--expt-relaxed-constexpr",
+        ],
+    },
+];
+
+const COMMON: &[&str] = &[
+    "-std=c++17",
+    "-O3",
+    "-fmad=false",
+    "-lineinfo",
+    "-cubin",
+    "-arch=sm_89",
+];
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let kernels_dir = manifest.join("kernels");
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let cubin = out_dir.join("kernels.cubin");
-
-    println!("cargo:rerun-if-changed=kernels/kernels.cu");
-    println!("cargo:rerun-if-changed=kernels/common.cuh");
     println!("cargo:rerun-if-env-changed=JEV_NVCC");
     println!("cargo:rerun-if-env-changed=JEV_CUDA_IMAGE");
-    println!("cargo:rustc-env=JEV_KERNELS_CUBIN={}", cubin.display());
+    println!("cargo:rerun-if-changed=kernels");
+    println!("cargo:rerun-if-changed=third_party");
 
-    let src = kernels_dir.join("kernels.cu");
-    let nvcc_args = [
-        "-std=c++17",
-        "-O3",
-        "-fmad=false",
-        "-lineinfo",
-        "-cubin",
-        "-arch=sm_89",
-        "-o",
-    ];
+    let newest =
+        newest_mtime(&manifest.join("kernels")).max(newest_mtime(&manifest.join("third_party")));
 
-    // Fresh cubin if sources are older than the output.
-    if cubin.exists() {
-        let out_m = fs::metadata(&cubin).and_then(|m| m.modified()).ok();
-        let src_m = fs::metadata(&src).and_then(|m| m.modified()).ok();
-        let cu_m = fs::metadata(kernels_dir.join("common.cuh"))
-            .and_then(|m| m.modified())
-            .ok();
-        if let (Some(o), Some(s), Some(c)) = (out_m, src_m, cu_m) {
-            if o >= s && o >= c {
-                return;
+    for job in JOBS {
+        let src = manifest.join(job.src);
+        let cubin = out_dir.join(format!("{}.cubin", job.name));
+        if let (Some(src_m), Some(out_m)) = (
+            fs::metadata(&src).and_then(|m| m.modified()).ok(),
+            fs::metadata(&cubin).and_then(|m| m.modified()).ok(),
+        ) {
+            if out_m >= src_m && newest.map(|n| out_m >= n).unwrap_or(false) {
+                continue;
             }
         }
+        build(job, &manifest, &out_dir, &cubin);
     }
 
+    println!(
+        "cargo:rustc-env=JEV_KERNELS_CUBIN={}",
+        out_dir.join("kernels.cubin").display()
+    );
+    println!(
+        "cargo:rustc-env=JEV_MARLIN_CUBIN={}",
+        out_dir.join("marlin.cubin").display()
+    );
+}
+
+fn build(job: &Job, manifest: &Path, out_dir: &Path, cubin: &Path) {
+    let mut args: Vec<String> = COMMON.iter().map(|s| s.to_string()).collect();
+    args.extend(job.extra.iter().map(|s| s.to_string()));
+
     if let Ok(nvcc) = env::var("JEV_NVCC") {
-        run_native(Path::new(&nvcc), &nvcc_args, &src, &cubin);
+        run_native(Path::new(&nvcc), &args, manifest, job.src, cubin);
         return;
     }
     if Command::new("nvcc").arg("--version").output().is_ok() {
-        run_native(Path::new("nvcc"), &nvcc_args, &src, &cubin);
+        run_native(Path::new("nvcc"), &args, manifest, job.src, cubin);
         return;
     }
-    if let Err(e) = run_docker(&kernels_dir, &out_dir, &nvcc_args) {
+    if let Err(e) = run_docker(&args, manifest, out_dir, job, cubin) {
         panic!(
             "no nvcc found and docker toolchain failed: {e}. \
              Install CUDA or set JEV_NVCC / JEV_CUDA_IMAGE."
@@ -65,17 +107,25 @@ fn main() {
     }
 }
 
-fn run_native(nvcc: &Path, args: &[&str], src: &Path, cubin: &Path) {
+fn run_native(nvcc: &Path, args: &[String], manifest: &Path, src: &str, cubin: &Path) {
     let status = Command::new(nvcc)
         .args(args)
+        .arg("-o")
         .arg(cubin)
         .arg(src)
+        .current_dir(manifest)
         .status()
         .unwrap_or_else(|e| panic!("failed to run {}: {e}", nvcc.display()));
-    assert!(status.success(), "nvcc failed");
+    assert!(status.success(), "nvcc failed for {src}");
 }
 
-fn run_docker(kernels_dir: &Path, out_dir: &Path, nvcc_args: &[&str]) -> Result<(), String> {
+fn run_docker(
+    args: &[String],
+    manifest: &Path,
+    out_dir: &Path,
+    job: &Job,
+    cubin: &Path,
+) -> Result<(), String> {
     let image = env::var("JEV_CUDA_IMAGE")
         .unwrap_or_else(|_| "nvidia/cuda:13.1.1-devel-ubuntu24.04".into());
     let uid = Command::new("id")
@@ -93,30 +143,57 @@ fn run_docker(kernels_dir: &Path, out_dir: &Path, nvcc_args: &[&str]) -> Result<
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "0".into());
 
+    let out_name = cubin
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("kernel.cubin");
     let mut cmd = Command::new("docker");
     cmd.arg("run")
         .arg("--rm")
         .arg("--user")
         .arg(format!("{uid}:{gid}"))
         .arg("-v")
-        .arg(format!("{}:/kernels:ro", kernels_dir.display()))
+        .arg(format!("{}:/w:ro", manifest.display()))
         .arg("-v")
         .arg(format!("{}:/out", out_dir.display()))
         .arg("-w")
-        .arg("/kernels")
+        .arg("/w")
         .arg("--entrypoint")
         .arg("/usr/local/cuda/bin/nvcc")
         .arg(&image)
-        .args(nvcc_args)
-        .arg("/out/kernels.cubin")
-        .arg("/kernels/kernels.cu");
+        .args(args)
+        .arg("-o")
+        .arg(format!("/out/{out_name}"))
+        .arg(format!("/w/{}", job.src));
     let out = cmd.output().map_err(|e| format!("docker exec: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "docker nvcc failed:\nstdout: {}\nstderr: {}",
+            "docker nvcc failed for {}:\nstdout: {}\nstderr: {}",
+            job.src,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ));
     }
     Ok(())
+}
+
+fn newest_mtime(dir: &Path) -> Option<SystemTime> {
+    let mut newest = None;
+    let entries = fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let meta = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let mtime = if meta.is_dir() {
+            newest_mtime(&path)
+        } else {
+            meta.modified().ok()
+        };
+        if let Some(t) = mtime {
+            newest = Some(newest.map_or(t, |n: SystemTime| n.max(t)));
+        }
+    }
+    newest
 }

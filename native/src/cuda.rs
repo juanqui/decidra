@@ -11,6 +11,8 @@ pub struct Gpu {
     pub ctx: Arc<CudaContext>,
     pub stream: Arc<CudaStream>,
     pub module: Arc<CudaModule>,
+    /// Vendored Marlin W4A16 module (third_party/marlin).
+    pub marlin_module: Arc<CudaModule>,
     pub blas: CudaBlas,
 }
 
@@ -21,16 +23,23 @@ impl Gpu {
         let stream = ctx.default_stream();
 
         let cubin_path = env!("JEV_KERNELS_CUBIN");
+        let marlin_path = env!("JEV_MARLIN_CUBIN");
         let cubin = fs::read(cubin_path)
             .with_context(|| format!("reading compiled kernels at {cubin_path}"))?;
         let module = ctx
             .load_module(Ptx::from_binary(cubin))
             .context("loading kernel cubin")?;
+        let marlin = fs::read(marlin_path)
+            .with_context(|| format!("reading compiled Marlin kernels at {marlin_path}"))?;
+        let marlin_module = ctx
+            .load_module(Ptx::from_binary(marlin))
+            .context("loading Marlin cubin")?;
         let blas = CudaBlas::new(stream.clone()).context("creating cuBLAS handle")?;
         Ok(Self {
             ctx,
             stream,
             module,
+            marlin_module,
             blas,
         })
     }
@@ -39,6 +48,12 @@ impl Gpu {
         self.module
             .load_function(name)
             .with_context(|| format!("kernel {name} not found in cubin"))
+    }
+
+    pub fn func_marlin(&self, name: &str) -> Result<CudaFunction> {
+        self.marlin_module
+            .load_function(name)
+            .with_context(|| format!("Marlin kernel {name} not found"))
     }
 
     pub fn synchronize(&self) -> Result<()> {
