@@ -43,13 +43,16 @@ Runtime:
 - `libcublas.so.13` and `libcublasLt.so.13`. Set `JEV_CUDA_LIBS` if they are not on the
   loader path.
 - RTX 4090 / sm_89.
-- ~13.1 GiB free VRAM for Marlin's resident repacked weights plus workspace; long context
-  with tiled FA2 peaks at **18.86 GiB** at 16K.
+- ~13.1 GiB free VRAM for Marlin's resident repacked weights plus workspace; peak is
+  **18.86 GiB at 16K** and **19.09 GiB at 32K** (24 GB card, ~4.4 GiB headroom).
 - Marlin + tiled FA2 + gated split GDN full-forward latency: 1K **488 ms**, 4K
-  **2.12-2.18 s**, 8K **4.23-4.32 s**, 16K **8.62-8.97 s**. These are GEMM-bound
-  (~0.49-0.55 ms/token); a 16,444-token `/v1/decide` completed in 8.69 s.
-- Split GDN is gated to sequences >= **512 tokens**; shorter prompts use the accurate
-  shared recurrence to avoid a rare short-prompt logit shift.
+  **2.12-2.18 s**, 8K **4.23-4.32 s**, 16K **8.62-8.97 s**, 32K **18.60-19.03 s**.
+  These are GEMM-bound (~0.49-0.58 ms/token); a 16,444-token `/v1/decide` completed in
+  8.69 s and the 32,763-token probe in 18.66 s.
+- **32K is the verified maximum context** on 24 GB. Split GDN is gated to sequences
+  >= **512 tokens**; shorter prompts use the accurate shared recurrence. For
+  **seq >= 24,576** a low-memory buffer-pool mode releases dropped tensors and frees
+  large intermediates early (1K/16K timings unchanged).
 
 `curl` is used by the health check and smoke script. `python3` is optional and only used
 by the development evaluation tooling.

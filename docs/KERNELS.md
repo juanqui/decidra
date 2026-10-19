@@ -59,7 +59,7 @@ the reference GPTQ-Marlin repack / scale / zero-point permutations bit-exactly f
 | 1024 tokens | 1261.2 ms | 1261.2 ms | **488 ms** (2.58x) |
 
 Marlin resident weights use **13.1 GiB**; preload/repack takes **10.1 s**. Tiled FA2
-attention plus gated split-dk GDN makes long context **GEMM-bound** at ~0.49-0.55 ms/token:
+attention plus gated split-dk GDN makes long context **GEMM-bound** at ~0.49-0.58 ms/token:
 
 | tokens | full forward (tiled FA2 + split GDN) | previous warp | peak GPU mem |
 |---|---|---|---|
@@ -67,17 +67,23 @@ attention plus gated split-dk GDN makes long context **GEMM-bound** at ~0.49-0.5
 | 4K | **2.12-2.18 s** | 4.65 s | ~17.2 GiB |
 | 8K | **4.23-4.32 s** | 9.88 s | ~17.6 GiB |
 | 16K | **8.62-8.97 s** | 22.88 s | 18.86 GiB |
+| 32K (32,763 tok) | **18.60-19.03 s** | - | 19.09 GiB |
 
 The attention kernel itself is 7-12x faster than warp on identical buffers (kernel-only
 1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms). The split-dk GDN recurrence is 3.9x faster on its
 hot kernel (1K per-layer 13.35 -> 3.41 ms; 1K forward 958 -> 488 ms). Remaining time is
-dominated by W4A16 GEMMs; attention is <1% at 1K and still small at 16K.
+dominated by W4A16 GEMMs; attention is <1% at 1K and still small at 16K/32K.
 
 Split GDN is used only for **seq >= `gdn_split_min_seq` (default 512)**. Short prompts
 use the accurate single-column shared recurrence: the four-way f32 reduction reorders
 the state dot products enough to shift a rare short-prompt logit. Suite row `r22`
 (54 tokens) measured split two-way delta **1.43e-2** (fails) versus shared **6.43e-3**
 (passes). Long sequences keep the 3.9x split path; 16K remains 8.62-8.97 s and passes.
+
+For **seq >= 24,576** the engine enables a low-memory buffer-pool mode: dropped large
+tensors are released instead of retained, and large MLP/attention/GDN intermediates are
+freed as soon as they are consumed. This is what makes **32K fit and run on 24 GB**
+(19.09 GiB peak, ~4.4 GiB headroom); 1K/16K timings are unchanged.
 
 Long-context correctness against CPU AWQ/SDPA probes (Marlin + tiled FA2 + split GDN):
 
@@ -86,8 +92,10 @@ Long-context correctness against CPU AWQ/SDPA probes (Marlin + tiled FA2 + split
 | 4K | 0.808% | 0.999967 | 3.5e-4 | true |
 | 8K | 0.795% | 0.999968 | 3.0e-4 | true |
 | 16K | 0.692% | 0.999976 | 6.7e-4 | true |
+| 32K | 0.727% | 0.999974 | 6.0e-4 | true |
 
-All 10 long-context suite cases are correct.
+All long-context suite cases are correct, and **32K is the verified maximum context** on
+24 GB.
 
 ### Fallback paths (`JEV_NATIVE_MARLIN=false`)
 

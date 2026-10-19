@@ -94,6 +94,8 @@ measurement files are kept only for drift context.
 - Preload with Marlin: 10.1 s clean, 13.1 GiB resident (10.06 s observed in the gated
   run); 13,358 MiB in-process.
 - 16,444-token `/v1/decide`: **200 in 8.69 s**, choice `true`; no timeout/OOM.
+- 32,763-token CPU-AWQ probe `/v1/decide`: **200 in 18.656 s**, choice `true`
+  (0.98378), peak **19.09 GiB**; no timeout/OOM. This is the verified 24 GB maximum.
 - Short benchmark (16 unique requests/level, gated build): c=1 **16.444 req/s**, p50
   **60.9 ms**, p95 **75.6 ms**, p99 **82.9 ms**, ~**1,143 tok/s**; c=4 **16.826 req/s**,
   p50 **225.7 ms**, p95 **263.3 ms**, ~**1,169 tok/s**. Throughput does not scale with
@@ -124,18 +126,23 @@ Long-context latency (Marlin resident, tiled FA2 + gated split-dk GDN, default):
 | 4K | **2.12-2.18 s** | 4.65 s | ~17.2 GiB |
 | 8K | **4.23-4.32 s** | 9.88 s | ~17.6 GiB |
 | 16K | **8.62-8.97 s** | 22.88 s | 18.86 GiB |
+| 32K (32,763 tok) | **18.60-19.03 s** | - | 19.09 GiB |
 
 The standalone attention kernel is 7-12x faster than warp on identical buffers
 (1K **0.276 ms**, 4K **2.85 ms**, 8K **9.68 ms**). The split-dk GDN recurrence is 3.9x
 faster on its hot kernel: 1K per-layer **13.35 -> 3.41 ms**, 1K forward **958 -> 488 ms**.
-The full forward is now **GEMM-bound** at ~0.49-0.55 ms/token; attention is <1% at 1K and
-still small at 16K. GPU utilization is 100% at ~455 W.
+The full forward is now **GEMM-bound** at ~0.49-0.58 ms/token; attention is <1% at 1K and
+still small at 16K/32K. GPU utilization is 100% at ~455 W.
 
 Split GDN is gated to **seq >= 512 tokens** (`gdn_split_min_seq`). Shorter prompts use
 the accurate shared recurrence because the four-way f32 reduction reorders the state dot
 products enough to shift a rare short-prompt logit: on `r22` (54 tokens) split measured a
 two-way delta of 1.43e-2 (fail) versus shared 6.43e-3 (pass). Long sequences keep the
 split path and pass.
+
+For **seq >= 24,576** a low-memory buffer-pool mode releases dropped large tensors and
+frees large MLP/attention/GDN intermediates as soon as they are consumed. This makes
+**32K fit on 24 GB** (19.09 GiB peak, ~4.4 GiB headroom); 1K/16K timings are unchanged.
 
 Long-context quality gate against CPU AWQ/SDPA probes (Marlin + tiled FA2 + split GDN):
 
@@ -144,8 +151,11 @@ Long-context quality gate against CPU AWQ/SDPA probes (Marlin + tiled FA2 + spli
 | 4K | 0.808% | 0.999967 | 3.5e-4 | true |
 | 8K | 0.795% | 0.999968 | 3.0e-4 | true |
 | 16K | 0.692% | 0.999976 | 6.7e-4 | true |
+| 32K | 0.727% | 0.999974 | 6.0e-4 | true |
 
-All **10/10** long-context suite cases are correct. Deltas are BF16 accumulation noise.
+All **10/10** long-context suite cases are correct; the 32K probe is the verified maximum
+context on 24 GB (expected `true`, golden P(true)=0.98315). The 4K/8K/16K/32K rows are
+BF16 accumulation noise.
 
 At 1K the gain over the previous 1144.9 ms path is 2.58x after the GDN work (Marlin alone
 was 1.32x). Two large-M Marlin tile variants were A/B'd at 1K (982.3 / 997.1 vs 984.3 ms)

@@ -327,10 +327,10 @@ Correctness (native engine, from `native/README.md`, validated against CPU golde
 - Top-1 token and last logit identical to golden (`867`, `3.578125`); two-way softmax
   **0.8568** vs golden **0.8559**.
 - Merged-BF16 tiny model: every stage at the bf16 rounding floor.
-- Long-context CPU AWQ gate (Marlin + tiled FA2 + split GDN): final rel_rms
-  **0.808% / 0.795% / 0.692%** at 4K/8K/16K, two-way probability delta
-  **3.5e-4 / 3.0e-4 / 6.7e-4**, top-1 **true** at every length; **10/10**
-  long-context suite cases correct.
+- Long-context CPU AWQ gate (Marlin + tiled FA2 + gated split GDN): final rel_rms
+  **0.808% / 0.795% / 0.692% / 0.727%** at 4K/8K/16K/32K, two-way probability delta
+  **3.5e-4 / 3.0e-4 / 6.7e-4 / 6.0e-4**, top-1 **true** at every length; **32K is the
+  verified maximum** on 24 GB. 10/10 long-context suite cases correct.
 
 Single-forward native measurements on GPU 1 with resident packed weights
 (`native/README.md`):
@@ -344,15 +344,18 @@ Single-forward native measurements on GPU 1 with resident packed weights
 Marlin preload is **10.1 s** (repack) and uses **13.1 GiB** resident; the fallback paths
 use 5.8 s / 12.7 GiB. Init is 0.2 s. At 36 tokens Marlin runs at 100% GPU utilization.
 Long-context latency with Marlin + tiled FA2 + gated split GDN: **4K 2.12-2.18 s**,
-**8K 4.23-4.32 s**, **16K 8.62-8.97 s** (peak **18.86 GiB** at 16K, 100% GPU
-utilization, ~455 W). The split-dk GDN recurrence is 3.9x faster on its hot kernel
-(1K per-layer 13.35 -> 3.41 ms) and cuts the 1K forward from 958 to ~488 ms. It is used
-only for sequences **>= 512 tokens**: shorter prompts use the accurate shared GDN because
-the four-way f32 reduction reorders the state dot products enough to move rare
-short-prompt logits (suite `r22`, 54 tokens: split two-way delta 1.43e-2 vs shared
-6.43e-3). Full long context is now **GEMM-bound** at ~0.49-0.55 ms/token. Tiled FA2
-remains 7-12x faster than the warp kernel on identical buffers (kernel-only 1K
-0.276 ms, 4K 2.85 ms, 8K 9.68 ms).
+**8K 4.23-4.32 s**, **16K 8.62-8.97 s**, **32K (32,763 tokens) 18.60-19.03 s**. Peak
+memory is **18.86 GiB at 16K** and **19.09 GiB at 32K** (24 GB card, ~4.4 GiB headroom);
+the GPU is at 100% utilization, ~455 W. The split-dk GDN recurrence is 3.9x faster on its
+hot kernel (1K per-layer 13.35 -> 3.41 ms) and cuts the 1K forward from 958 to ~488 ms.
+It is used only for sequences **>= 512 tokens**: shorter prompts use the accurate shared
+GDN because the four-way f32 reduction reorders the state dot products enough to move
+rare short-prompt logits (suite `r22`, 54 tokens: split two-way delta 1.43e-2 vs shared
+6.43e-3). For **seq >= 24,576** the engine enables a low-memory buffer-pool mode: it
+releases dropped large tensors instead of retaining them and drops large MLP/attention/GDN
+intermediates as soon as they are consumed. 1K/16K timings are unchanged. Full long
+context is **GEMM-bound** at ~0.49-0.55 ms/token. Tiled FA2 remains 7-12x faster than the
+warp kernel on identical buffers (kernel-only 1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms).
 
 With `JEV_NATIVE_MARLIN=false`, the fallback hybrid policy uses fused only for
 `N >= 5120 && M <= 256` and falls back to dequant + cuBLAS otherwise. Marlin is the
@@ -369,8 +372,9 @@ baseline is context only: it itself differs from CPU golden by max 0.01377 / mea
 Short live benchmark (16 unique requests/level, final build, forwards serialized):
 c=1 **16.444 req/s**, p50 **60.9 ms**, p95 **75.6 ms**, p99 **82.9 ms**, ~**1,143 tok/s**;
 c=4 **16.826 req/s**, p50 **225.7 ms**, p95 **263.3 ms**, ~**1,169 tok/s**. c=4 latency
-is queueing, not batching. A 16,444-token `/v1/decide` completed in **8.69 s** with no
-timeout/OOM.
+is queueing, not batching. A 16,444-token `/v1/decide` completed in **8.69 s**, and the
+32,763-token CPU-AWQ probe completed in **18.66 s** at peak **19.09 GiB**, choice `true`
+(0.98378), with no timeout/OOM.
 
 ## One-GPU deployment example (GPU 1 only)
 
@@ -430,8 +434,10 @@ WantedBy=multi-user.target
 - One forward produces one decision read-out position. Latency is dominated by prefill;
   nothing is decoded. Marlin single-forward timings: **45.1 ms** (36 tokens),
   **73.0 ms** (76 tokens), **488 ms** (1024 tokens). Long context is GEMM-bound:
-  4K **2.12-2.18 s**, 8K **4.23-4.32 s**, 16K **8.62-8.97 s** (~0.49-0.55 ms/token;
-  peak **18.86 GiB**).
+  4K **2.12-2.18 s**, 8K **4.23-4.32 s**, 16K **8.62-8.97 s**, 32K **18.60-19.03 s**
+  (~0.49-0.58 ms/token; peak **18.86 GiB at 16K / 19.09 GiB at 32K**). For
+  seq >= 24,576 the low-memory buffer-pool mode drops intermediates early; 1K/16K
+  timings are unchanged.
 - The split-dk GDN recurrence is 3.9x faster than the previous shared-state kernel
   (1K per-layer 13.35 -> 3.41 ms) but is gated to sequences >= 512 tokens; shorter
   prompts keep the accurate shared recurrence. Tiled FA2 attention is 7-12x faster than
