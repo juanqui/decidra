@@ -240,6 +240,9 @@ pub struct Engine {
     gdn_chunked: AtomicBool,
     /// Tensor-core (TF32 WMMA) variant of the chunked prefill.
     gdn_chunked_tc: AtomicBool,
+    /// Minimum sequence length for the chunked GDN path (default 64; shorter
+    /// prompts keep the accurate shared recurrence).
+    gdn_chunked_min_seq: std::sync::atomic::AtomicUsize,
     /// Time-tiled causal conv (default); `--legacy-conv` selects the original
     /// channel-only kernel.
     conv_tiled: AtomicBool,
@@ -347,6 +350,7 @@ impl Engine {
             gdn_split: AtomicBool::new(true),
             gdn_chunked: AtomicBool::new(false),
             gdn_chunked_tc: AtomicBool::new(false),
+            gdn_chunked_min_seq: std::sync::atomic::AtomicUsize::new(64),
             conv_tiled: AtomicBool::new(true),
             gdn_split_min_seq: std::sync::atomic::AtomicUsize::new(512),
         })
@@ -402,6 +406,10 @@ impl Engine {
 
     pub fn set_gdn_chunked_tc(&self, enabled: bool) {
         self.gdn_chunked_tc.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_gdn_chunked_min_seq(&self, seq: usize) {
+        self.gdn_chunked_min_seq.store(seq, Ordering::Relaxed);
     }
 
     pub fn set_conv_tiled(&self, enabled: bool) {
@@ -1201,7 +1209,8 @@ impl Engine {
         let shared = self.gdn_shared.load(Ordering::Relaxed);
         let chunked_tc = self.gdn_chunked_tc.load(Ordering::Relaxed);
         let chunked = self.gdn_chunked.load(Ordering::Relaxed);
-        let chunked_any = (chunked || chunked_tc) && b.lens.iter().any(|&l| l >= 512);
+        let chunk_min = self.gdn_chunked_min_seq.load(Ordering::Relaxed);
+        let chunked_any = (chunked || chunked_tc) && b.lens.iter().any(|&l| l >= chunk_min);
         let dv_chunks = if dv >= 64 {
             self.gdn_chunks.load(Ordering::Relaxed).max(1).min(dv / 16)
         } else {
@@ -1272,7 +1281,7 @@ impl Engine {
                     let mut ov = core
                         .try_slice_mut(o * nv * dv..(o + l) * nv * dv)
                         .context("gdn out view")?;
-                    if (chunked || chunked_tc) && l >= 512 {
+                    if (chunked || chunked_tc) && l >= chunk_min {
                         kernels::gdn_chunked(
                             &self.gpu,
                             if chunked_tc {
@@ -1889,7 +1898,8 @@ impl Engine {
         let mut state = self.alloc_f32_zeros(nv * dk * dv)?;
         let mut core = self.alloc_bf16(seq * nv * dv)?;
         let min_seq = self.gdn_split_min_seq.load(Ordering::Relaxed);
-        if self.gdn_chunked_tc.load(Ordering::Relaxed) && seq >= 512 {
+        let chunk_min = self.gdn_chunked_min_seq.load(Ordering::Relaxed);
+        if self.gdn_chunked_tc.load(Ordering::Relaxed) && seq >= chunk_min {
             timed!(
                 self,
                 "gdn.recurrent",
@@ -1909,7 +1919,7 @@ impl Engine {
                     dv,
                 )?
             );
-        } else if self.gdn_chunked.load(Ordering::Relaxed) && seq >= 512 {
+        } else if self.gdn_chunked.load(Ordering::Relaxed) && seq >= chunk_min {
             timed!(
                 self,
                 "gdn.recurrent",

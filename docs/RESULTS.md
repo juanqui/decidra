@@ -165,16 +165,26 @@ clone without touching the engine.
 ## Chunked GDN prefill
 
 `JEV_NATIVE_GDN_CHUNKED=true` (default) selects the TF32 WMMA chunked delta-rule
-prefill (native commit `7c78a3f`) for sequences **>= 512 tokens**; shorter prompts keep
-the shared/split recurrence, and `false` restores the legacy path everywhere.
+prefill (native commit `7c78a3f`) for sequences **>= 64 tokens**
+(`JEV_NATIVE_GDN_CHUNKED_MIN_SEQ`, default 64); shorter prompts keep the
+shared/split recurrence, and `false` restores the legacy path everywhere.
 
 - GDN stage **2.1x** faster; full forward **1K 488 -> 395 ms (-17.7%)** and
   **16K 8.80 -> 6.94 s (-16.4%)** in the native benchmark.
+- Short prompts now use it too: suite28 **28/28**, KL 3.278e-5, MAE 7.362e-4,
+  max delta **1.010e-2** (`r17`, a 57-token row on the shared fallback); the
+  chunked rows are all below that (`r22` 6.37e-3). 36-token golden head logits
+  top-1 36/36, max 0.125 (shared 0.109).
+- Native forward at 76 tokens **69.5 -> 52.0 ms** (GDN 27.6 -> 7.27 ms per
+  prompt); 128 tokens **97.8 -> 64.9 ms**; 1K **478 -> 394 ms**.
+- Server uncached sweep, 16 unique ~71-token requests: c=1 **21.6-21.7 req/s,
+  p50 43.7 ms** (was 15.84 / 61.9); c=4 29.6 / 133 ms and c=8 29.9-30.0 /
+  243-258 ms are unchanged because the batched shared GDN already amortizes
+  across the batch, so the gain is single-request only. The c8 >=32 req/s
+  target is not reached; the remaining limit is not GDN.
 - Server single-request `/v1/decide`: 4K **1.63 s** (legacy 2.12-2.18), 8K **3.27 s**
   (4.23-4.32), 16K **6.77 s** (8.62-8.97), 35.3K **16.67 s** (20.15).
-- suite28 is unchanged (28/28, KL 3.281e-5, MAE 7.365e-4, max delta 1.010e-2) because
-  every suite row is below 512 tokens and takes the fallback; the long-context suite is
-  10/10 and short c1/c4/c8 latency is unchanged.
+- long-context suite 10/10; the 4K/8K/16K probes keep their documented deltas.
 
 ## Request batching
 

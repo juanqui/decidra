@@ -212,6 +212,12 @@ fn cmd_batch(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--gdn-chunked-tc") {
         eng.set_gdn_chunked_tc(true);
     }
+    if let Some(n) = opt(args, "--gdn-chunked-min-seq") {
+        eng.set_gdn_chunked_min_seq(
+            n.parse()
+                .context("--gdn-chunked-min-seq must be an integer")?,
+        );
+    }
     if args.iter().any(|a| a == "--legacy-attention") {
         eng.set_warp_attention(false);
     }
@@ -436,6 +442,12 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     }
     if args.iter().any(|a| a == "--gdn-chunked-tc") {
         eng.set_gdn_chunked_tc(true);
+    }
+    if let Some(n) = opt(args, "--gdn-chunked-min-seq") {
+        eng.set_gdn_chunked_min_seq(
+            n.parse()
+                .context("--gdn-chunked-min-seq must be an integer")?,
+        );
     }
     if let Some(c) = opt(args, "--gdn-chunks") {
         eng.set_gdn_chunks(c.parse().context("--gdn-chunks must be an integer")?);

@@ -258,15 +258,42 @@ four-way f32 summation reorders the state dot products enough to shift a rare
 short-prompt logit. Reproduced on suite row `r22` (54 tokens):
 split raw logits [2.7344, 1.7813] vs CPU golden [2.6719, 1.7891] (two-way delta
 1.43e-2, fails the suite gate); shared raw logits [2.6875, 1.7734] (delta
-6.43e-3, passes; the pre-split Marlin suite max was 6.03e-3). The 36-token
-golden head logits use the shared path (max 0.109). Configure with
+6.43e-3, passes; the pre-split Marlin suite max was 6.03e-3). Configure with
 `--gdn-split-min-seq N`; `--gdn-shared` forces the accurate path and
 `--legacy-gdn` the original global-state kernel.
 
-1K breakdown (486 ms forward): MLP GEMMs 204 ms (42%), GDN recurrence 164 ms
-(34%), other GEMMs 88 ms (18%), GDN conv 8.8 ms, MLP activation 6.7 ms,
-attention 4.0 ms, norms/residuals ~5 ms. (The profiler's `gemm.b` entry is an
-event-gap artifact; standalone it is 0.017 ms.)
+### Chunked prefill on short prompts
+
+The chunked TF32 kernel is also used for **seq >= `gdn_chunked_min_seq`
+(default 64)** when chunked prefill is enabled; the server enables it by
+default (`JEV_NATIVE_GDN_CHUNKED=true`), and shorter prompts keep the shared
+fallback. Set `--gdn-chunked-min-seq N` on the CLI or
+`JEV_NATIVE_GDN_CHUNKED_MIN_SEQ=N` for the server (0 forces every length).
+
+Measured at 54 tokens on GPU1 (suite `r22`): shared [2.6875, 1.7734],
+chunked TF32 [2.7031, 1.7891], CPU golden [2.6719, 1.7891]. Suite28 with the
+chunked path on every row: top-1 28/28, max delta 6.37e-3, MAE 6.48e-4
+(shared: 1.03e-2 / 9.97e-4), so `r22` stays inside the 0.011 gate. The
+36-token golden head logits are max 0.125 (shared 0.109), top-1 36/36; the
+4K/8K/16K probes keep their documented deltas.
+
+Full forward, warm, RTX 4090 / GPU1:
+
+| tokens | shared GDN | chunked TF32 | GDN per layer (shared -> chunked) |
+|---|---|---|---|
+| 76 | 69.5 ms | **52.0 ms** (1.34x) | 0.575 -> 0.151 ms |
+| 128 | 97.8 ms | **64.9 ms** (1.51x) | 0.966 -> 0.205 ms |
+| 1K | 478 ms | **394 ms** (1.21x) | 3.32 -> 1.57 ms |
+
+1K chunked breakdown (494 ms sum of regions, 394 ms warm forward): MLP GEMMs
+214 ms (43%), `gemm.b` 81 ms, GDN recurrence 81 ms (16%, 2.1x less than
+shared), other GEMMs 90 ms (18%), GDN conv 1.0 ms, MLP activation 6.8 ms,
+attention 4.2 ms.
+
+Shared-path 1K breakdown (486 ms forward, historical): MLP GEMMs 204 ms (42%),
+GDN recurrence 164 ms (34%), other GEMMs 88 ms (18%), GDN conv 8.8 ms, MLP
+activation 6.7 ms, attention 4.0 ms, norms/residuals ~5 ms. (The profiler's
+`gemm.b` entry is an event-gap artifact; standalone it is 0.017 ms.)
 
 Fallbacks: `--gdn-shared` (single-column shared state, 856 ms at 1K) and
 `--legacy-gdn` (original global-state kernel). Resident outputs are

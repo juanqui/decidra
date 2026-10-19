@@ -55,10 +55,13 @@ pub struct Config {
     /// Maximum total prompt tokens per batch (`JEV_NATIVE_MAX_BATCH_TOKENS`).
     /// A single larger request runs alone.
     pub native_max_batch_tokens: usize,
-    /// Use the chunked TF32 GDN prefill for sequences >= 512 tokens
+    /// Use the chunked TF32 GDN prefill for sequences >= 64 tokens
     /// (`JEV_NATIVE_GDN_CHUNKED`). Shorter sequences keep the existing
     /// shared/split recurrence.
     pub native_gdn_chunked: bool,
+    /// Minimum sequence length for the chunked GDN path
+    /// (`JEV_NATIVE_GDN_CHUNKED_MIN_SEQ`, default 64).
+    pub native_gdn_chunked_min_seq: usize,
     /// Exact-decision logits cache entries (`JEV_DECISION_CACHE_SIZE`).
     /// Zero disables the cache.
     pub decision_cache_size: usize,
@@ -119,6 +122,8 @@ impl Config {
             native_batch_window_us = 0;
         }
         let native_gdn_chunked = env_bool("JEV_NATIVE_GDN_CHUNKED")?.unwrap_or(true);
+        let native_gdn_chunked_min_seq =
+            env_usize("JEV_NATIVE_GDN_CHUNKED_MIN_SEQ")?.unwrap_or(64);
         let decision_cache_size =
             env_usize("JEV_DECISION_CACHE_SIZE")?.unwrap_or(DEFAULT_DECISION_CACHE_SIZE);
 
@@ -152,6 +157,7 @@ impl Config {
             native_batch_window_us,
             native_max_batch_tokens,
             native_gdn_chunked,
+            native_gdn_chunked_min_seq,
             decision_cache_size,
             signing_key,
             metrics_enabled,

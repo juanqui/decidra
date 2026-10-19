@@ -113,10 +113,11 @@ impl NativeBackend {
         // Must be set before preload_all: Marlin repacks into its resident layout.
         engine.set_marlin(config.native_marlin);
         engine.set_cache_weights(config.native_cache);
-        // Chunked prefill only engages at >=512 tokens; short prompts keep the
+        // Chunked prefill engages at >=64 tokens; shorter prompts keep the
         // shared/split recurrence. Both flags must be set before preload_all.
         engine.set_gdn_chunked(config.native_gdn_chunked);
         engine.set_gdn_chunked_tc(config.native_gdn_chunked);
+        engine.set_gdn_chunked_min_seq(config.native_gdn_chunked_min_seq);
         if !config.native_marlin {
             engine.set_fused_w4a16(config.native_fused_w4a16);
         }
@@ -141,6 +142,7 @@ impl NativeBackend {
             batch_window_us = config.native_batch_window_us,
             max_batch_tokens = config.native_max_batch_tokens,
             gdn_chunked = config.native_gdn_chunked,
+            gdn_chunked_min_seq = config.native_gdn_chunked_min_seq,
             decision_cache_entries = config.decision_cache_size,
             elapsed_secs = started.elapsed().as_secs_f64(),
             "native engine ready"
