@@ -108,16 +108,16 @@ Sampled with `nvidia-smi -i 1 -l 1` during the benches:
 
 - Utilization: **100% max** (short mean 74.3%, long mean 93.1%; the windows include idle
   tails).
-- Power: **410-422 W under load** (short max 388 W in the sampler window; long max
-  420.83 W, mean 389.6 W).
+- Power: **410-422 W at peak** (short max **422.22 W**, mean 299.5 W; long max
+  **420.83 W**, mean 389.6 W; the means include idle tails).
 - SM clock: **~2,910 MHz under load** as reported by the tuning run; the sampler CSV
   recorded utilization, memory, and power only. Idle SM clock was ~210 MHz; the card
   reports 3,300 MHz max.
 - Memory: **~22.1 GiB used** (22,069-22,129 MiB of 24,564 MiB).
 
-Saturation starts at concurrency 4-8. The 100% utilization and 410-422 W draw, together
-with flat long-context throughput from concurrency 1 to 4, show the GPU was saturated by
-model prefill rather than by the HTTP front end.
+Saturation starts at concurrency 4-8. The 100% utilization and 410-422 W peak draw,
+together with flat long-context throughput from concurrency 1 to 4, show the GPU was
+saturated by model prefill rather than by the HTTP front end.
 
 ## 5. Functional checks
 
