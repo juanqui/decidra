@@ -1,5 +1,6 @@
 //! Safe wrappers around the custom CUDA kernels.
 use anyhow::Result;
+use cudarc::driver::sys::CUfunction_attribute_enum;
 use cudarc::driver::{CudaFunction, CudaSlice, LaunchConfig, PushKernelArg};
 use half::bf16;
 
@@ -19,6 +20,7 @@ pub struct Kernels {
     pub gdn_recurrent: CudaFunction,
     pub dequant_w4a16: CudaFunction,
     pub gemm_w4a16: CudaFunction,
+    pub gemm_w4a16_m128: CudaFunction,
 }
 
 impl Kernels {
@@ -37,6 +39,14 @@ impl Kernels {
             gdn_recurrent: gpu.func("gdn_recurrent")?,
             dequant_w4a16: gpu.func("dequant_w4a16_bf16")?,
             gemm_w4a16: gpu.func("gemm_w4a16_bf16")?,
+            gemm_w4a16_m128: {
+                let f = gpu.func("gemm_w4a16_m128_bf16")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    90112,
+                )?;
+                f
+            },
         })
     }
 }
@@ -318,6 +328,38 @@ pub fn gemm_w4a16(
         grid_dim: (n.div_ceil(64) as u32, m.div_ceil(64) as u32, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
+    };
+    let (m_i, n_i, k_i) = (m as i32, n as i32, kk as i32);
+    let mut l = gpu.stream.launch_builder(k);
+    l.arg(x);
+    l.arg(packed);
+    l.arg(scale);
+    l.arg(zp);
+    l.arg(out);
+    l.arg(&m_i);
+    l.arg(&n_i);
+    l.arg(&k_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gemm_w4a16_m128(
+    gpu: &Gpu,
+    k: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    packed: &CudaSlice<i32>,
+    scale: &CudaSlice<bf16>,
+    zp: &CudaSlice<i32>,
+    out: &mut CudaSlice<bf16>,
+    m: usize,
+    n: usize,
+    kk: usize,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (n.div_ceil(128) as u32, m.div_ceil(128) as u32, 1),
+        block_dim: (512, 1, 1),
+        shared_mem_bytes: 90112,
     };
     let (m_i, n_i, k_i) = (m as i32, n as i32, kk as i32);
     let mut l = gpu.stream.launch_builder(k);

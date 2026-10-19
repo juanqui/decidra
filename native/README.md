@@ -1,8 +1,8 @@
 # jev-native
 
 Native CUDA inference engine for the JEV-27B checkpoint. The runtime is Rust +
-custom CUDA kernels (+ cuBLAS for BF16 GEMM). It does not import or link vLLM,
-PyTorch, or Python.
+custom CUDA kernels (+ cuBLAS for BF16 GEMM). It does not import or link an
+external inference runtime, PyTorch, or Python.
 
 ## Layout
 
@@ -26,7 +26,7 @@ otherwise runs the CUDA compiler from a container:
 
 ```sh
 cd native
-cargo build --release          # default: docker run vllm/vllm-openai:v0.31.0 nvcc -cubin
+cargo build --release          # default: docker run nvidia/cuda:13.1.1-devel-ubuntu24.04 nvcc -cubin
 JEV_NVCC=/usr/local/cuda/bin/nvcc cargo build --release   # if nvcc is installed
 JEV_CUDA_IMAGE=nvidia/cuda:13.1.1-devel-ubuntu24.04 cargo build --release
 ```
@@ -48,7 +48,7 @@ Runtime requirements (no toolkit needed):
 
 ## Run
 
-GPU 1 only (GPU 0 and the vLLM oracle on :8002 are left alone):
+GPU 1 only (GPU 0 is left alone):
 
 ```sh
 export CUDA_VISIBLE_DEVICES=1 LD_LIBRARY_PATH=/tmp/cudalibs
@@ -199,8 +199,17 @@ removes per-call `cuMemAlloc` jitter (a fresh allocation of some sizes costs
 ~0.6 ms on this driver). At most two buffers per size are retained.
 
 Correctness: layer 0 vs AWQ golden max 0.125 mean 9.96e-5 rel_rms 0.306%, and
-full logits max 0.0625 mean 2.57e-3 rel_rms 0.238%, top-1 identical. At 76 rows
-the kernel needs two 64-row M tiles (W read twice and 128 padded rows), which is
-why the speedup there is 1.6x rather than 2x; a 128-row or 128-column tile with
-dynamic shared memory, and fusing the remaining RMSNorm/GDN/attention work, are
-the next steps.
+full logits max 0.0625 mean 2.57e-3 rel_rms 0.238%, top-1 identical.
+
+A 128x128 tile variant (`--fused-tile128`, 16 warps, 90 KiB dynamic shared, one
+M tile for M <= 128) was implemented and correctness-checked (65-token layer 0
+mean 1.2e-4 vs the reference path), but it is **slower**: 180 ms at 76 tokens and
+1395 ms at 1K, versus 126 ms and 1270 ms. With 90 KiB shared and 98 registers
+only one CTA fits per SM, and `grid.x = N/128` leaves SMs idle (e.g. 40 blocks
+for `down_proj`). Forcing the 64x64 kernel at 1K is 1336 ms vs 1270 ms for the
+reference path, so the `M > 128` fallback stays.
+
+At 76 rows the winning 64x64 kernel still needs two M tiles (128 padded rows),
+which is why the speedup there is 1.6x rather than 2x. Fusing the remaining
+RMSNorm/GDN/attention work and a pipelined 128-row tile with 2-CTA occupancy are
+the next steps toward the ~60 ms ideal.

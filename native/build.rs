@@ -3,8 +3,8 @@
 //! The host may not have nvcc. Resolution order:
 //!   1. `JEV_NVCC` (path to nvcc)
 //!   2. `nvcc` on PATH
-//!   3. `docker run` the image in `JEV_CUDA_IMAGE` (default vllm/vllm-openai:v0.31.0,
-//!      used strictly as a build toolchain; nothing from it is linked or imported)
+//!   3. `docker run` the CUDA image in `JEV_CUDA_IMAGE` (default
+//!      nvidia/cuda:13.1.1-devel-ubuntu24.04) purely as a build toolchain
 //!
 //! The resulting cubin is embedded by path through `JEV_KERNELS_CUBIN`.
 
@@ -76,7 +76,8 @@ fn run_native(nvcc: &Path, args: &[&str], src: &Path, cubin: &Path) {
 }
 
 fn run_docker(kernels_dir: &Path, out_dir: &Path, nvcc_args: &[&str]) -> Result<(), String> {
-    let image = env::var("JEV_CUDA_IMAGE").unwrap_or_else(|_| "vllm/vllm-openai:v0.31.0".into());
+    let image = env::var("JEV_CUDA_IMAGE")
+        .unwrap_or_else(|_| "nvidia/cuda:13.1.1-devel-ubuntu24.04".into());
     let uid = Command::new("id")
         .arg("-u")
         .output()

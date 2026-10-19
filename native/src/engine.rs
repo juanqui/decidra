@@ -125,6 +125,8 @@ pub struct Engine {
     /// Above this M, use dequant+cuBLAS: the fused kernel re-dequantizes W per
     /// M tile, so large prefills are better served by the reference path.
     fused_max_m: std::sync::atomic::AtomicUsize,
+    /// Experimental 128x128 tile (slower on this GPU at the tested shapes).
+    fused_tile128: AtomicBool,
 }
 
 const _: fn() = || {
@@ -152,7 +154,8 @@ impl Engine {
             cache_weights: AtomicBool::new(true),
             fused_w4a16: AtomicBool::new(false),
             fused_min_n: std::sync::atomic::AtomicUsize::new(5120),
-            fused_max_m: std::sync::atomic::AtomicUsize::new(256),
+            fused_max_m: std::sync::atomic::AtomicUsize::new(128),
+            fused_tile128: AtomicBool::new(false),
         })
     }
 
@@ -174,6 +177,10 @@ impl Engine {
 
     pub fn set_fused_max_m(&self, m: usize) {
         self.fused_max_m.store(m, Ordering::Relaxed);
+    }
+
+    pub fn set_fused_tile128(&self, enabled: bool) {
+        self.fused_tile128.store(enabled, Ordering::Relaxed);
     }
 
     pub fn set_cache_weights(&self, enabled: bool) {
@@ -844,18 +851,33 @@ impl Engine {
                     let mut c = self.alloc_bf16(rows * n)?;
                     mark("  alloc", t0);
                     let t1 = std::time::Instant::now();
-                    kernels::gemm_w4a16(
-                        &self.gpu,
-                        &self.kernels.gemm_w4a16,
-                        x,
-                        packed,
-                        scale,
-                        zp,
-                        &mut c,
-                        rows,
-                        n,
-                        k,
-                    )?;
+                    if rows <= 64 || !self.fused_tile128.load(Ordering::Relaxed) {
+                        kernels::gemm_w4a16(
+                            &self.gpu,
+                            &self.kernels.gemm_w4a16,
+                            x,
+                            packed,
+                            scale,
+                            zp,
+                            &mut c,
+                            rows,
+                            n,
+                            k,
+                        )?;
+                    } else {
+                        kernels::gemm_w4a16_m128(
+                            &self.gpu,
+                            &self.kernels.gemm_w4a16_m128,
+                            x,
+                            packed,
+                            scale,
+                            zp,
+                            &mut c,
+                            rows,
+                            n,
+                            k,
+                        )?;
+                    }
                     mark("  fused", t1);
                     return Ok(c);
                 }
@@ -878,6 +900,8 @@ impl Engine {
                     k,
                     *group_size,
                 )?;
+                mark("  dequant", t0);
+                let t2 = std::time::Instant::now();
                 let view = ws.try_slice(..need).context("dequant workspace view")?;
                 let mut c = self.alloc_bf16(rows * n)?;
                 let cfg = GemmConfig {
@@ -898,6 +922,7 @@ impl Engine {
                         .gemm(cfg, &view, x, &mut *c)
                         .context("cublas packed W4A16 gemm")?;
                 }
+                mark("  cublas", t2);
                 Ok(c)
             }
         }

@@ -182,6 +182,9 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     if let Some(m) = opt(args, "--fused-max-m") {
         eng.set_fused_max_m(m.parse().context("--fused-max-m must be an integer")?);
     }
+    if args.iter().any(|a| a == "--fused-tile128") {
+        eng.set_fused_tile128(true);
+    }
     if args.iter().any(|a| a == "--no-cache") {
         eng.set_cache_weights(false);
     }

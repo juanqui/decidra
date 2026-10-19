@@ -562,6 +562,159 @@ extern "C" __global__ void gemm_w4a16_bf16(
 }
 
 // ---------------------------------------------------------------------------
+// Large-tile fused W4A16 GEMM for 65 <= M <= 128 (one 128-row M tile) and as an
+// experiment for 1K prefills. BM=BN=128, BK=64, 16 warps, dynamic shared:
+//   sw[2] 128x72 bf16 (36 KiB), sx[2] 128x72 bf16 (36 KiB), sacc 16 KiB.
+// Same coalesced packed staging as the 64x64 kernel.
+// ---------------------------------------------------------------------------
+#define M128_BM 128
+#define M128_BN 128
+#define M128_BK 64
+#define M128_WARPS 16
+#define M128_FLD 72
+#define M128_SMEM_BYTES (4 * M128_BM * M128_FLD * 2 + M128_WARPS * 16 * 16 * 4)
+
+extern "C" __global__ void gemm_w4a16_m128_bf16(
+    const bf16* __restrict__ x, const int* __restrict__ packed,
+    const bf16* __restrict__ scale, const int* __restrict__ zp,
+    bf16* __restrict__ out, int M, int N, int K) {
+  extern __shared__ __align__(32) unsigned char smem_raw[];
+  bf16* sbase = reinterpret_cast<bf16*>(smem_raw);
+  bf16* sw[2] = {sbase, sbase + M128_BM * M128_FLD};
+  bf16* sx[2] = {sbase + 2 * M128_BM * M128_FLD,
+                 sbase + 3 * M128_BM * M128_FLD};
+  float* sacc = reinterpret_cast<float*>(sbase + 4 * M128_BM * M128_FLD);
+
+  const int n0 = blockIdx.x * M128_BN;
+  const int m0 = blockIdx.y * M128_BM;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int words_per_row = K >> 3;
+  const int groups = K >> 6;
+  const int wrow0 = tid >> 3;  // 0..63, two passes -> 128 rows
+  const int wcol = tid & 7;
+  const int xrow = tid >> 2;  // 0..127
+  const int xkq = tid & 3;
+
+  using namespace nvcuda;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) wmma::fill_fragment(acc[i], 0.f);
+
+#pragma unroll
+  for (int p = 0; p < 2; ++p) {
+    int row = wrow0 + (p << 6);
+    int gn = n0 + row;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (gn < N) {
+      unsigned w = (unsigned)packed[(long)gn * words_per_row + wcol];
+      unsigned zw = (unsigned)zp[(long)(gn >> 3) * groups];
+      int z = (zw >> (4 * (gn & 7))) & 0xF;
+      float sc = bf2f(scale[(long)gn * groups]);
+      v = pack8(w, z, sc);
+    }
+    *reinterpret_cast<uint4*>(sw[0] + row * M128_FLD + wcol * 8) = v;
+  }
+  if (m0 + xrow < M) {
+    const bf16* src = x + (long)(m0 + xrow) * K + xkq * 16;
+    uint4 v0 = *reinterpret_cast<const uint4*>(src);
+    uint4 v1 = *reinterpret_cast<const uint4*>(src + 8);
+    bf16* d = sx[0] + xrow * M128_FLD + xkq * 16;
+    *reinterpret_cast<uint4*>(d) = v0;
+    *reinterpret_cast<uint4*>(d + 8) = v1;
+  } else {
+    bf16* d = sx[0] + xrow * M128_FLD + xkq * 16;
+    for (int jj = 0; jj < 16; ++jj) d[jj] = f2bf(0.f);
+  }
+  __syncthreads();
+
+  int buf = 0;
+  for (int k0 = 0; k0 < K; k0 += M128_BK) {
+    const int next = k0 + M128_BK;
+    const bool has_next = next < K;
+
+    unsigned pw[2] = {0u, 0u};
+    unsigned pz[2] = {0u, 0u};
+    float psc[2] = {0.f, 0.f};
+    uint4 px0 = make_uint4(0, 0, 0, 0);
+    uint4 px1 = make_uint4(0, 0, 0, 0);
+    if (has_next) {
+      int wbase = (next >> 3) + wcol;
+      int g = next >> 6;
+#pragma unroll
+      for (int p = 0; p < 2; ++p) {
+        int row = wrow0 + (p << 6);
+        int gn = n0 + row;
+        if (gn < N) {
+          pw[p] = (unsigned)packed[(long)gn * words_per_row + wbase];
+          pz[p] = (unsigned)zp[(long)(gn >> 3) * groups + g];
+          psc[p] = bf2f(scale[(long)gn * groups + g]);
+        }
+      }
+      if (m0 + xrow < M) {
+        const bf16* src = x + (long)(m0 + xrow) * K + next + xkq * 16;
+        px0 = *reinterpret_cast<const uint4*>(src);
+        px1 = *reinterpret_cast<const uint4*>(src + 8);
+      }
+    }
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      int t = warp * 4 + i;
+      int tr = t >> 3;
+      int tc = t & 7;
+#pragma unroll
+      for (int ki = 0; ki < M128_BK; ki += 16) {
+        wmma::fragment<wmma::matrix_a, 16, 16, 16, bf16, wmma::row_major> a;
+        wmma::fragment<wmma::matrix_b, 16, 16, 16, bf16, wmma::col_major> b;
+        wmma::load_matrix_sync(a, sx[buf] + (tr * 16) * M128_FLD + ki, M128_FLD);
+        wmma::load_matrix_sync(b, sw[buf] + (tc * 16) * M128_FLD + ki, M128_FLD);
+        wmma::mma_sync(acc[i], a, b, acc[i]);
+      }
+    }
+
+    if (has_next) {
+      int nb = buf ^ 1;
+#pragma unroll
+      for (int p = 0; p < 2; ++p) {
+        int row = wrow0 + (p << 6);
+        int gn = n0 + row;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (gn < N) {
+          int z = (pz[p] >> (4 * (gn & 7))) & 0xF;
+          v = pack8(pw[p], z, psc[p]);
+        }
+        *reinterpret_cast<uint4*>(sw[nb] + row * M128_FLD + wcol * 8) = v;
+      }
+      bf16* d = sx[nb] + xrow * M128_FLD + xkq * 16;
+      *reinterpret_cast<uint4*>(d) = px0;
+      *reinterpret_cast<uint4*>(d + 8) = px1;
+    }
+    __syncthreads();
+    buf ^= 1;
+  }
+
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    int t = warp * 4 + i;
+    int tr = t >> 3;
+    int tc = t & 7;
+    float* sa = sacc + warp * 256;
+    wmma::store_matrix_sync(sa, acc[i], 16, wmma::mem_row_major);
+    __syncwarp();
+    for (int idx = lane; idx < 256; idx += 32) {
+      int r = idx >> 4;
+      int cc = idx & 15;
+      int ogm = m0 + tr * 16 + r;
+      int ogn = n0 + tc * 16 + cc;
+      if (ogm < M && ogn < N) out[(long)ogm * N + ogn] = f2bf(sa[idx]);
+    }
+    __syncwarp();
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Embedding gather (device-side variant, not used by the CPU-gather path).
 // ---------------------------------------------------------------------------
 extern "C" __global__ void embed_gather_bf16(const bf16* __restrict__ table,
