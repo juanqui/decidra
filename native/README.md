@@ -118,11 +118,21 @@ Long-context latency (Marlin weights, resident, SM89 RTX 4090):
 | 8K | 9.88 s | 19.17 s | 17.6 GiB |
 | 16K | 22.88 s | (not run; ~60 s by fit) | 18.9 GiB |
 
-There is no CPU AWQ golden beyond 36 tokens. Quality is checked causally: the
-first 36 positions of the 76/1K/4K/8K/16K prompts are the golden prompt, and the
-head logits at positions 0..35 match the 36-token golden within max
-0.051-0.086 / mean 0.014-0.018 (Marlin + warp attention: 76 0.086, 1K 0.078,
-4K 0.082, 8K 0.051, 16K 0.051).
+Long-context quality gate against the CPU AWQ/SDPA probes
+(`/tmp/jev-native-ref/long-context/probes`, Marlin + warp attention):
+
+| probe | final hidden max / mean / rel_rms / cosine | head logits (3721, 1802) | two-way prob delta | top-1 |
+|---|---|---|---|---|
+| 4K (4090 tok) | 0.0469 / 4.14e-3 / 0.721% / 0.999974 | [1.2656, 5.0] vs [1.2734, 5.0313] | 5.3e-4 | true |
+| 8K (8178 tok) | 0.0664 / 4.21e-3 / 0.761% / 0.999971 | [1.2031, 5.1563] vs [1.2188, 5.1563] | 2.9e-4 | true |
+| 16K (16383 tok) | 0.0313 / 4.05e-3 / 0.690% / 0.999977 | [1.2734, 5.25] vs [1.2422, 5.25] | 5.6e-4 | true |
+
+The probe `probs` include the decision-head transform (bias/temperature); the
+raw two-way softmax of the head logits is within 6e-4 of the golden raw values.
+Deltas are BF16 accumulation noise and the expected choice is `true` at every
+length. Causally, the first 36 positions of the 76/1K/4K/8K/16K prompts also
+match the 36-token golden head logits within max 0.051-0.086 / mean
+0.014-0.018.
 K/V are transient per layer (bf16, no persistent KV cache, no FP8 KV); the GDN
 state is f32. 16K peaks at 18.9 GiB including the 13.1 GiB resident weights, so
 24 GiB fits with headroom.
@@ -199,16 +209,20 @@ Resident (`--preload`, GPU 1 freed, 12.66 GiB used / 10.86 GiB free):
 |---|---|---|---|
 | 36 tokens | 174.7 ms | 84.8 ms | **45.1 ms** (3.87x) |
 | 76 tokens | 202.2 ms | 126.4 ms | **73.0 ms** (2.77x) |
-| 1024 tokens | 1261.2 ms | 1261.2 ms | **1144.9 ms** (1.10x) |
+| 1024 tokens | 1261.2 ms | 1261.2 ms | **984.3 ms** (1.28x) |
 
 Marlin preload is 10.1 s (repack) and uses 13.1 GiB; the other paths preload in
 5.8 s / 12.7 GiB. Init 0.2 s. GPU samples: reference/fused ~184-231 W,
 Marlin ~45 ms at 36 tokens with 100% utilization. Marlin golden checks: layer 0
 mean 1.58e-4 / rel_rms 0.347%; final norm rel_rms 1.23%, cosine 0.999924.
 
-At 1K the gain is only 9%: that case is compute-bound and cuBLAS+dequant was
+At 1K the gain is 1.28x: that case is compute-bound and cuBLAS+dequant was
 already efficient; the fixed 64-row M tile and re-reading W per M tile limit
-Marlin's large-M benefit. A persistent M-loop / larger tile is the next step. Resident outputs are
+Marlin's large-M benefit. Two 128-thread large-M tile variants
+(`thread_n_blocks=8/4`, `thread_k_blocks=4/8`) were compiled and A/B'd at 1K:
+982.3 ms and 997.1 ms versus 984.3 ms for the default, with bit-identical
+outputs. There is no win, so the default 256-thread config stays and the
+variants were removed. Resident outputs are
 bit-identical to the streaming (`--no-cache`) run. Golden after residency
 (hybrid): final norm rel_rms 1.07% (reference 1.25%), full logits rel_rms 0.24%,
 top-1 identical, two-way softmax identical at f32 print precision.
