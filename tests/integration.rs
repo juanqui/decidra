@@ -146,6 +146,7 @@ fn test_config(vllm_url: String) -> Config {
         signing_key: None,
         metrics_enabled: false,
         max_body_bytes: 8 * 1024 * 1024,
+        served_identity: "test/JEV-27B-VL".to_owned(),
     }
 }
 
@@ -546,6 +547,195 @@ async fn proxy_rewrites_model_and_streams() {
     let text = String::from_utf8_lossy(&bytes);
     assert!(text.contains("data: {\"choices\""));
     assert!(text.contains("[DONE]"));
+}
+
+#[tokio::test]
+async fn systemone_noul_choice_image_and_validation() {
+    let (app, requests) = app_for().await;
+
+    // noul with criteria, object state, and exact usage accounting.
+    let body = json!({
+        "state": {"ticket": "refund", "amount": 42},
+        "questions": {
+            "safe": {
+                "type": "noul",
+                "instructions": "Is this safe?",
+                "criteria": {"true": "no abuse", "false": "abuse"}
+            },
+            "team": {
+                "type": "choice",
+                "instructions": "Which team?",
+                "criteria": {
+                    "billing": "charges",
+                    "support": "bugs",
+                    "sales": null
+                }
+            }
+        }
+    });
+    let (status, _, bytes) = call(&app, Method::POST, "/v1/systemone", Some(&body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let response = decode(&bytes);
+    let id = response["id"].as_str().unwrap();
+    assert!(id.starts_with("xpnp-hosted-"));
+    assert_eq!(id.len(), "xpnp-hosted-".len() + 32);
+    assert_eq!(response["model"], "test/JEV-27B-VL");
+    assert_eq!(response["provider"], "xPNP Hosted");
+    assert_eq!(response["answers"]["safe"]["type"], "noul");
+    assert!(response["answers"]["safe"]["noul"].as_f64().unwrap() > 0.99);
+    assert_eq!(response["answers"]["team"]["type"], "choice");
+    assert_eq!(response["answers"]["team"]["choice"], "sales");
+    assert!(response["answers"]["team"]["confidence"].as_f64().unwrap() > 0.99);
+    let distribution = response["answers"]["team"]["probabilities"]
+        .as_object()
+        .unwrap();
+    assert_eq!(
+        distribution.keys().cloned().collect::<Vec<_>>(),
+        ["billing", "support", "sales"]
+    );
+    assert!(close(
+        distribution
+            .values()
+            .map(|value| value.as_f64().unwrap())
+            .sum(),
+        1.0
+    ));
+    assert_eq!(response["usage"]["input_tokens"], 20);
+    assert_eq!(response["usage"]["output_tokens"], 0);
+    assert_eq!(response["usage"]["cost"], 0);
+    assert_eq!(response["usage"]["num_model_requests"], 2);
+
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let noul = requests[0]["prompt"].as_str().unwrap();
+        assert!(noul.contains("[state] {\"ticket\": \"refund\", \"amount\": 42}\nAnswer true when: no abuse\nAnswer false when: abuse\n\n[question] Is this safe?"));
+        let choice = requests[1]["prompt"].as_str().unwrap();
+        assert!(
+            choice.contains(
+                "[options]\nA) billing: charges\nB) support: bugs\nC) sales\n[decision]:"
+            )
+        );
+    }
+
+    // Image state goes through the raw chat template.
+    let before = requests.lock().unwrap().len();
+    let body = json!({
+        "state": ["look at this", {"image": "data:image/png;base64,AAAA"}],
+        "questions": {
+            "notable": {"type": "noul", "instructions": "Is this notable?"}
+        }
+    });
+    let (status, _, bytes) = call(&app, Method::POST, "/v1/systemone", Some(&body)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(
+        decode(&bytes)["answers"]["notable"]["noul"]
+            .as_f64()
+            .unwrap()
+            > 0.99
+    );
+    {
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), before + 1);
+        let upstream = &requests[before];
+        assert!(upstream.get("prompt").is_none());
+        assert_eq!(upstream["chat_template"], RAW_TEMPLATE);
+        assert_eq!(
+            upstream["messages"][0]["content"][1]["text"],
+            "look at this\n"
+        );
+        assert_eq!(upstream["messages"][0]["content"][2]["type"], "image_url");
+    }
+
+    // Validation failures use the xPNP error envelope and make no upstream calls.
+    let before = requests.lock().unwrap().len();
+    let mut nine = serde_json::Map::new();
+    for index in 0..9 {
+        nine.insert(
+            format!("q{index}"),
+            json!({"type": "noul", "instructions": "is it?"}),
+        );
+    }
+    let body = json!({"state": "x", "questions": nine});
+    let (status, bytes) = call_raw(
+        &app,
+        "/v1/systemone",
+        &serde_json::to_string(&body).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let error = decode(&bytes);
+    assert_eq!(error["error"]["code"], 400);
+    assert_eq!(error["error"]["message"], "at most 8 questions per request");
+
+    let body = json!({
+        "state": "x",
+        "questions": {"q": {"type": "score", "instructions": "rate it"}}
+    });
+    let (status, bytes) = call_raw(
+        &app,
+        "/v1/systemone",
+        &serde_json::to_string(&body).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        decode(&bytes)["error"]["message"],
+        "score questions are not served by this backend"
+    );
+
+    let body = json!({
+        "state": "x",
+        "questions": {"q": {"type": "choice", "instructions": "pick", "criteria": {"Bad_Key": "x", "ok": "y"}}}
+    });
+    let (status, bytes) = call_raw(
+        &app,
+        "/v1/systemone",
+        &serde_json::to_string(&body).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        decode(&bytes)["error"]["message"],
+        "choice keys must match [a-z0-9-]+, got 'Bad_Key'"
+    );
+
+    let body = json!({"state": "x", "questions": {}});
+    let (status, bytes) = call_raw(
+        &app,
+        "/v1/systemone",
+        &serde_json::to_string(&body).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        decode(&bytes)["error"]["message"],
+        "questions must be a non-empty object"
+    );
+
+    let body = json!({"state": null, "questions": {"q": {"type": "noul", "instructions": "x"}}});
+    let (status, bytes) = call_raw(
+        &app,
+        "/v1/systemone",
+        &serde_json::to_string(&body).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        decode(&bytes)["error"]["message"],
+        "state must be a string, an object, or an array"
+    );
+    assert_eq!(requests.lock().unwrap().len(), before);
 }
 
 #[tokio::test]

@@ -369,7 +369,90 @@ uses the default `tournament` strategy (which degrades to single for 16 or fewer
 }
 ```
 
-## 8. Passthrough routes
+## 8. `POST /v1/systemone`
+
+xPNP hosted System One, ported from the shim's `systemone` handler. It is a batch of
+independent single-pass decisions (no tournament/permute), with its own error envelope.
+
+### Request
+
+```json
+{
+  "state": "text | object | array",
+  "questions": {
+    "name": {
+      "type": "noul | choice",
+      "instructions": "string",
+      "criteria": {"true": "...", "false": "..."}
+    }
+  }
+}
+```
+
+- `questions` must be a non-empty object with at most **8** entries.
+- `state` follows `_s1_split_state`, which differs from `_parts`:
+  - string → text; object → CPython `json.dumps` text; array → text parts concatenated
+    with `"\n"`.
+  - `{"type":"text","text":...}` appends text.
+  - `{"type":"image_url","image_url":{"url":"..."}}` (or a string `image_url`) appends an
+    image; a missing/empty URL is a 400.
+  - `{"image":"..."}` appends an image when the value is a string.
+  - Other parts are dumped as JSON text.
+  - More than one image is a 400.
+- Each question must be an object with non-empty `instructions` after Python `.strip()`.
+- `noul`: if `criteria` is an object and `true` or `false` is non-null, append
+  `"\nAnswer true when: <true>\nAnswer false when: <false>"` to the state text. A missing
+  or null criterion becomes `""`.
+- `choice`: `criteria` must be an object with 2..16 entries. Keys must match
+  `[a-z0-9-]{1,64}`. Options are `"key: value"` when the value is non-null, else `"key"`.
+- `score` is rejected with 400 `score questions are not served by this backend`; any other
+  type is rejected with 400 using the Python repr of the value.
+- All questions are validated before any upstream call.
+
+### Execution
+
+For each question, `s1_pass` runs **once** with the same decision-head bias, per-kind
+temperature, fitted calibration (if enabled), and softmax as `/v1/decide`. There is no
+tournament or permute. The prompt state is `[text + "\n"]`, plus the one normalized image
+part when present. Questions execute sequentially.
+
+### Response
+
+```json
+{
+  "id": "xpnp-hosted-<32 lowercase hex>",
+  "model": "autotrust/JEV-27B-VL@ba3f0d58+awq-w4a16",
+  "provider": "xPNP Hosted",
+  "answers": {
+    "safe": {"type": "noul", "noul": 0.9997},
+    "team": {
+      "type": "choice",
+      "choice": "sales",
+      "confidence": 0.9998,
+      "probabilities": {"billing": 0.0001, "support": 0.0001, "sales": 0.9998}
+    }
+  },
+  "usage": {
+    "input_tokens": 42,
+    "output_tokens": 0,
+    "cost": 0,
+    "num_model_requests": 2
+  }
+}
+```
+
+- `model` comes from `JEV_SERVED_IDENTITY` (default
+  `autotrust/JEV-27B-VL@ba3f0d58+awq-w4a16`).
+- `answers` preserves question insertion order.
+- `choice` uses the lowest-index tie-break and reports per-key probabilities.
+- `usage.input_tokens` sums prompt tokens across questions; `output_tokens` is always 0;
+  `cost` is 0; `num_model_requests` is the number of passes.
+- Errors use the xPNP envelope:
+  `{"error":{"message":"...","code":400}}`. Backend failures become
+  `{"error":{"message":"backend: ...","code":502|504}}` with the server-wide upstream
+  status policy. `/v1/systemone` is not signed (same as the shim).
+
+## 9. Passthrough routes
 
 `POST /v1/chat/completions` and `POST /v1/completions`:
 
@@ -381,7 +464,7 @@ uses the default `tournament` strategy (which degrades to single for 16 or fewer
   concurrency permit is held until the stream ends.
 - Passthrough errors are not signed.
 
-## 9. Signing
+## 10. Signing
 
 If `JEV_SIGNING_KEY` is non-empty:
 
@@ -392,7 +475,7 @@ If `JEV_SIGNING_KEY` is non-empty:
 - `content-length` is removed and recomputed by the HTTP stack; `content-type` is preserved.
 - All other paths are not signed.
 
-## 10. Endpoints
+## 11. Endpoints
 
 ### `GET /health`
 
@@ -428,7 +511,7 @@ If `JEV_SIGNING_KEY` is non-empty:
 Prometheus text format. Returns a comment-only body when metrics are disabled or the
 recorder is not installed.
 
-## 11. Edge cases
+## 12. Edge cases
 
 | Case | Behavior |
 |---|---|
@@ -439,6 +522,11 @@ recorder is not installed.
 | Null or scalar `state` | 400. |
 | More than one image | 400. |
 | `input_image` in `/v1/decisions` | 400, text-only front. |
+| `/v1/systemone` questions missing/not object/empty | 400, `questions must be a non-empty object`. |
+| `/v1/systemone` more than 8 questions | 400, `at most 8 questions per request`. |
+| `/v1/systemone` `score` question | 400, `score questions are not served by this backend`. |
+| `/v1/systemone` bad criterion key | 400, `choice keys must match [a-z0-9-]+, got '<key>'`. |
+| `/v1/systemone` image state | One image maximum; `image_url` must carry a non-empty URL. |
 | Unknown question type | 400, Python-repr of the value. |
 | Upstream 4xx/5xx | 502, upstream status and first 600 characters in the message. |
 | Upstream timeout | 504. |
@@ -451,7 +539,7 @@ recorder is not installed.
 | `JEV_TOKENIZER`/head mismatch | Process refuses to start. |
 | `JEV_CALIBRATION_FITTED` path absent | Warning; fitted calibration disabled. |
 
-## 12. Parity notes
+## 13. Parity notes
 
 - Prompt construction, label ids (verified against the real tokenizer: 256 labels,
   ids `32..57` then two-letter tokens), CPython JSON rendering, CRC32, and MT19937
@@ -460,6 +548,6 @@ recorder is not installed.
   last place on some platforms; probability vectors should agree to `~1e-15`.
 - Upstream error status mapping, the additive `confidence` field, one-image validation, and
   the structured error envelope are intentional differences from the Python shim.
-- `/v1/systemone` is intentionally absent.
+- `/v1/systemone` ports the shim handler, including its separate error envelope; it is not signed.
 - The server never starts or stops vLLM and never touches the production ports `8001` and
   `8500`.

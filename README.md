@@ -159,6 +159,7 @@ stack.
 | `JEV_SIGNING_KEY` | unset | Enables `x-jev-signature`; empty string disables. |
 | `JEV_METRICS_ENABLED` | `true` | Install the Prometheus recorder. |
 | `JEV_MAX_BODY_BYTES` | `67108864` | Axum request body limit (images as data URLs). |
+| `JEV_SERVED_IDENTITY` | `autotrust/JEV-27B-VL@ba3f0d58+awq-w4a16` | `model` returned by `/v1/systemone`. |
 | `RUST_LOG` | `jev_engine=info` | `tracing-subscriber` filter. |
 
 Calibration discovery order, relative to the checkpoint then the HF snapshot:
@@ -182,6 +183,7 @@ to `decision_head/decision_head.json` and `decision_head/calibration.json`.
 | `GET` | `/metrics` | Prometheus text exposition. |
 | `POST` | `/v1/decide` | JEV native decision (`noul`, `score`, `choice`). |
 | `POST` | `/v1/decisions` | OpenAI Decisions API shape (`predicate`, `choice`, `score`). |
+| `POST` | `/v1/systemone` | xPNP hosted System One (`noul`/`choice`, text or one image). |
 | `POST` | `/v1/chat/completions` | Transparent vLLM passthrough, model rewritten. |
 | `POST` | `/v1/completions` | Transparent vLLM passthrough, model rewritten. |
 
@@ -201,6 +203,13 @@ curl -s http://127.0.0.1:8080/v1/decide \
   -H 'content-type: application/json' \
   -d '{"kind":"choice","state":["look at this",{"image":"data:image/png;base64,..."}],
        "question":"Is the receipt visible?","options":["no","yes"]}'
+
+curl -s http://127.0.0.1:8080/v1/systemone \
+  -H 'content-type: application/json' \
+  -d '{"state":"Customer: my card was charged twice.",
+       "questions":{"safe":{"type":"noul","instructions":"Is this abusive?"},
+                    "team":{"type":"choice","instructions":"Which team?",
+                            "criteria":{"billing":"charges","support":"bugs","sales":"pricing"}}}}'
 ```
 
 Image states mix text and at most one image; `{"image": "..."}` and OpenAI
@@ -264,8 +273,9 @@ permutation vectors generated from CPython, tournament grouping/combination, and
 parsing.
 
 Integration tests spin up a mock vLLM (axum) and exercise noul/choice/score, tournament and
-permute request counts, image chat-completions requests, OpenAI decisions mapping, model
-rewriting, streaming passthrough, signing, 400/502/504 semantics, and malformed JSON.
+permute request counts, image chat-completions requests, OpenAI decisions mapping, xPNP
+System One (noul/choice/image/validation), model rewriting, streaming passthrough, signing,
+400/502/504 semantics, and malformed JSON.
 
 To evaluate against the Python reference or a saved baseline, use the independent harness
 in `eval/` (no model import, no GPU control):
@@ -401,6 +411,7 @@ Prometheus metrics exposed:
 - `jev_decide_total{kind,strategy}`
 - `jev_decide_options`, `jev_decide_pass_options`
 - `jev_decisions_total{kind}`
+- `jev_systemone_requests_total`, `jev_systemone_questions_total{kind}`
 
 ## Behavioral notes and intentional differences
 
@@ -409,7 +420,8 @@ Prometheus metrics exposed:
   directly.
 - `/v1/decide` additionally reports `confidence` (the top probability), as requested for this
   service. The Python shim omits it.
-- `/v1/systemone` is not implemented; it is outside this server's contract.
+- `/v1/systemone` is ported from the shim's xPNP handler: one pass per question, no
+  tournament/permute, at most 8 questions, `noul`/`choice` only, and one image maximum.
 - Image states are rejected client-side with 400 when more than one image is present.
 - Optional fitted calibration is applied to raw head logits exactly like the shim. If a fit
   file supplies fewer biases than the served option count (the shipped fit covers 9 choice

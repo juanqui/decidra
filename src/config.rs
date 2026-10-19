@@ -13,6 +13,7 @@ pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
 pub const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 600;
 pub const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+pub const DEFAULT_SERVED_IDENTITY: &str = "autotrust/JEV-27B-VL@ba3f0d58+awq-w4a16";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -30,6 +31,8 @@ pub struct Config {
     pub signing_key: Option<Vec<u8>>,
     pub metrics_enabled: bool,
     pub max_body_bytes: usize,
+    /// Identity reported by the xPNP `/v1/systemone` endpoint.
+    pub served_identity: String,
 }
 
 impl Config {
@@ -86,6 +89,8 @@ impl Config {
         if max_body_bytes == 0 {
             bail!("JEV_MAX_BODY_BYTES must be greater than 0");
         }
+        let served_identity =
+            env_string("JEV_SERVED_IDENTITY").unwrap_or_else(|| DEFAULT_SERVED_IDENTITY.to_owned());
 
         Ok(Self {
             bind_addr,
@@ -102,6 +107,7 @@ impl Config {
             signing_key,
             metrics_enabled,
             max_body_bytes,
+            served_identity,
         })
     }
 

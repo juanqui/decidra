@@ -9,7 +9,7 @@ use axum::{
     body::{Body, Bytes, to_bytes},
     extract::{DefaultBodyLimit, Request, State, rejection::JsonRejection},
     http::{
-        HeaderValue,
+        HeaderValue, StatusCode,
         header::{CONTENT_LENGTH, CONTENT_TYPE},
     },
     middleware::{self, Next},
@@ -21,12 +21,13 @@ use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::Sha256;
+use uuid::Uuid;
 
 use crate::{
     DEFAULT_STRATEGY, MAX_OPTIONS, NATIVE_CHOICE_OPTIONS, PROTOCOL, PUBLIC_ALIAS, PUBLIC_MODEL,
     config::Config,
     engine::{DecisionEngine, Kind, Strategy, Usage},
-    error::ApiError,
+    error::{ApiError, EngineError},
     head::{self, FittedKind},
     prompt::{self, LABEL_CONTEXT},
     upstream::Upstream,
@@ -151,6 +152,7 @@ impl AppState {
             .route("/v1/decide/info", get(decide_info))
             .route("/v1/decide", post(decide))
             .route("/v1/decisions", post(decisions))
+            .route("/v1/systemone", post(systemone))
             .route("/v1/chat/completions", post(chat_completions))
             .route("/v1/completions", post(completions))
             .route("/metrics", get(metrics_endpoint))
@@ -565,6 +567,355 @@ fn option_line(value: &Value, description: &Value) -> String {
     } else {
         crate::pyjson::py_str(value)
     }
+}
+
+const MAX_SYSTEMONE_QUESTIONS: usize = 8;
+const SYSTEMONE_PROVIDER: &str = "xPNP Hosted";
+
+struct SystemonePlan {
+    name: String,
+    kind: &'static str,
+    state_text: String,
+    instructions: String,
+    choice: Option<(Vec<String>, Vec<String>)>,
+}
+
+fn s1_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": {
+                "message": message.into(),
+                "code": status.as_u16(),
+            }
+        })),
+    )
+        .into_response()
+}
+
+/// Port of `_s1_text`: None becomes "", strings are verbatim, other JSON is dumped
+/// with CPython-compatible formatting.
+fn s1_text(value: Option<&Value>) -> String {
+    match value {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text.clone(),
+        Some(value) => crate::pyjson::dumps(value),
+    }
+}
+
+/// Port of `_s1_split_state`: text plus at most one normalized image part.
+fn s1_split_state(state: &Value) -> Result<(String, Option<Value>), String> {
+    match state {
+        Value::String(text) => Ok((text.clone(), None)),
+        Value::Object(_) => Ok((crate::pyjson::dumps(state), None)),
+        Value::Array(parts) => {
+            let mut texts = Vec::new();
+            let mut images: Vec<Value> = Vec::new();
+            for part in parts {
+                match part {
+                    Value::String(text) => texts.push(text.clone()),
+                    Value::Object(map)
+                        if map.get("type") == Some(&Value::String("text".to_owned())) =>
+                    {
+                        texts.push(s1_text(map.get("text")));
+                    }
+                    Value::Object(map)
+                        if map.get("type") == Some(&Value::String("image_url".to_owned())) =>
+                    {
+                        let url = match map.get("image_url") {
+                            Some(Value::Object(image_url)) => image_url.get("url"),
+                            other => other,
+                        };
+                        let Some(url) = url.and_then(Value::as_str).filter(|url| !url.is_empty())
+                        else {
+                            return Err("an image_url part needs a url".to_owned());
+                        };
+                        let mut image_url = serde_json::Map::new();
+                        image_url.insert("url".to_owned(), Value::String(url.to_owned()));
+                        let mut image = serde_json::Map::new();
+                        image.insert("type".to_owned(), Value::String("image_url".to_owned()));
+                        image.insert("image_url".to_owned(), Value::Object(image_url));
+                        images.push(Value::Object(image));
+                    }
+                    Value::Object(map) if map.get("image").is_some_and(Value::is_string) => {
+                        let mut image_url = serde_json::Map::new();
+                        image_url.insert("url".to_owned(), map["image"].clone());
+                        let mut image = serde_json::Map::new();
+                        image.insert("type".to_owned(), Value::String("image_url".to_owned()));
+                        image.insert("image_url".to_owned(), Value::Object(image_url));
+                        images.push(Value::Object(image));
+                    }
+                    other => texts.push(crate::pyjson::dumps(other)),
+                }
+            }
+            if images.len() > 1 {
+                return Err(format!(
+                    "this backend reads one image per request, got {}",
+                    images.len()
+                ));
+            }
+            Ok((texts.join("\n"), images.pop()))
+        }
+        _ => Err("state must be a string, an object, or an array".to_owned()),
+    }
+}
+
+fn valid_choice_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 64
+        && key
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+/// xPNP hosted System One: one decision pass per question, no tournament/permute.
+async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
+    let body: Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(_) => {
+            return s1_error(
+                StatusCode::BAD_REQUEST,
+                "send a JSON body with state and questions",
+            );
+        }
+    };
+    let Some(object) = body.as_object() else {
+        return s1_error(StatusCode::BAD_REQUEST, "send a JSON object");
+    };
+    let Some(questions) = object.get("questions").and_then(Value::as_object) else {
+        return s1_error(
+            StatusCode::BAD_REQUEST,
+            "questions must be a non-empty object",
+        );
+    };
+    if questions.is_empty() {
+        return s1_error(
+            StatusCode::BAD_REQUEST,
+            "questions must be a non-empty object",
+        );
+    }
+    if questions.len() > MAX_SYSTEMONE_QUESTIONS {
+        return s1_error(StatusCode::BAD_REQUEST, "at most 8 questions per request");
+    }
+    let state_value = object
+        .get("state")
+        .cloned()
+        .unwrap_or_else(|| Value::String(String::new()));
+    let (text, image) = match s1_split_state(&state_value) {
+        Ok(parts) => parts,
+        Err(message) => return s1_error(StatusCode::BAD_REQUEST, message),
+    };
+
+    let mut plans = Vec::with_capacity(questions.len());
+    for (name, question) in questions {
+        let Some(question) = question.as_object() else {
+            return s1_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "question {} must be an object",
+                    crate::pyjson::py_repr(&Value::String(name.clone()))
+                ),
+            );
+        };
+        let type_value = question.get("type").cloned().unwrap_or(Value::Null);
+        let kind = type_value.as_str().unwrap_or("");
+        let instructions = s1_text(question.get("instructions")).trim().to_owned();
+        if instructions.is_empty() {
+            return s1_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "question {} needs instructions",
+                    crate::pyjson::py_repr(&Value::String(name.clone()))
+                ),
+            );
+        }
+        let criteria = question.get("criteria");
+        match kind {
+            "noul" => {
+                let mut lines = text.clone();
+                if let Some(criteria) = criteria.and_then(Value::as_object) {
+                    let true_value = criteria.get("true");
+                    let false_value = criteria.get("false");
+                    if true_value.is_some_and(|value| !value.is_null())
+                        || false_value.is_some_and(|value| !value.is_null())
+                    {
+                        lines = format!(
+                            "{text}\nAnswer true when: {}\nAnswer false when: {}",
+                            s1_text(true_value),
+                            s1_text(false_value)
+                        );
+                    }
+                }
+                plans.push(SystemonePlan {
+                    name: name.clone(),
+                    kind: "noul",
+                    state_text: format!("{lines}\n"),
+                    instructions,
+                    choice: None,
+                });
+            }
+            "choice" => {
+                let Some(criteria) = criteria.and_then(Value::as_object) else {
+                    return s1_error(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "choice question {} needs 2 to 16 criteria",
+                            crate::pyjson::py_repr(&Value::String(name.clone()))
+                        ),
+                    );
+                };
+                if !(2..=16).contains(&criteria.len()) {
+                    return s1_error(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "choice question {} needs 2 to 16 criteria",
+                            crate::pyjson::py_repr(&Value::String(name.clone()))
+                        ),
+                    );
+                }
+                let keys: Vec<String> = criteria.keys().cloned().collect();
+                if let Some(bad) = keys.iter().find(|key| !valid_choice_key(key)) {
+                    return s1_error(
+                        StatusCode::BAD_REQUEST,
+                        format!(
+                            "choice keys must match [a-z0-9-]+, got {}",
+                            crate::pyjson::py_repr(&Value::String(bad.clone()))
+                        ),
+                    );
+                }
+                let options = keys
+                    .iter()
+                    .map(|key| match criteria.get(key) {
+                        Some(value) if !value.is_null() => {
+                            format!("{key}: {}", s1_text(Some(value)))
+                        }
+                        _ => key.clone(),
+                    })
+                    .collect();
+                plans.push(SystemonePlan {
+                    name: name.clone(),
+                    kind: "choice",
+                    state_text: format!("{text}\n"),
+                    instructions,
+                    choice: Some((keys, options)),
+                });
+            }
+            "score" => {
+                return s1_error(
+                    StatusCode::BAD_REQUEST,
+                    "score questions are not served by this backend",
+                );
+            }
+            _ => {
+                return s1_error(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "question {} has an unknown type {}",
+                        crate::pyjson::py_repr(&Value::String(name.clone())),
+                        crate::pyjson::py_repr(&type_value)
+                    ),
+                );
+            }
+        }
+    }
+
+    metrics::counter!("jev_systemone_requests_total").increment(1);
+    let mut usage = Usage::default();
+    let mut answers = serde_json::Map::with_capacity(plans.len());
+    for plan in plans {
+        let kind = if plan.kind == "noul" {
+            Kind::Noul
+        } else {
+            Kind::Choice
+        };
+        let options = if kind == Kind::Noul {
+            vec!["false".to_owned(), "true".to_owned()]
+        } else {
+            plan.choice
+                .as_ref()
+                .map(|(_, options)| options.clone())
+                .unwrap_or_default()
+        };
+        let mut state_parts = vec![Value::String(plan.state_text.clone())];
+        if let Some(image) = &image {
+            state_parts.push(image.clone());
+        }
+        let state_value = Value::Array(state_parts);
+        let (probabilities, pass_usage) = match state
+            .engine
+            .s1_pass(kind, &state_value, &plan.instructions, &options)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                let status = if matches!(&error, EngineError::Timeout(_)) {
+                    StatusCode::GATEWAY_TIMEOUT
+                } else {
+                    StatusCode::BAD_GATEWAY
+                };
+                return s1_error(status, format!("backend: {error}"));
+            }
+        };
+        usage.add(pass_usage);
+        metrics::counter!("jev_systemone_questions_total", "kind" => plan.kind).increment(1);
+
+        if kind == Kind::Noul {
+            answers.insert(
+                plan.name,
+                json!({
+                    "type": "noul",
+                    "noul": probabilities.get(1).copied().unwrap_or(0.0),
+                }),
+            );
+        } else {
+            let Some((keys, _)) = plan.choice.as_ref() else {
+                return s1_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal: choice plan missing option keys",
+                );
+            };
+            let Some(best) = head::argmax_first(&probabilities) else {
+                return s1_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal: choice returned no probabilities",
+                );
+            };
+            let (Some(key), Some(confidence)) = (keys.get(best), probabilities.get(best).copied())
+            else {
+                return s1_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal: choice probabilities do not match option keys",
+                );
+            };
+            let mut distribution = serde_json::Map::with_capacity(keys.len());
+            for (key, probability) in keys.iter().zip(probabilities.iter()) {
+                distribution.insert(key.clone(), json!(probability));
+            }
+            answers.insert(
+                plan.name,
+                json!({
+                    "type": "choice",
+                    "choice": key,
+                    "confidence": confidence,
+                    "probabilities": distribution,
+                }),
+            );
+        }
+    }
+
+    Json(json!({
+        "id": format!("xpnp-hosted-{}", Uuid::new_v4().simple()),
+        "model": state.config.served_identity,
+        "provider": SYSTEMONE_PROVIDER,
+        "answers": answers,
+        "usage": {
+            "input_tokens": usage.prompt_tokens,
+            "output_tokens": 0,
+            "cost": 0,
+            "num_model_requests": usage.requests,
+        },
+    }))
+    .into_response()
 }
 
 async fn chat_completions(
