@@ -786,3 +786,340 @@ extern "C" __global__ void embed_gather_bf16(const bf16* __restrict__ table,
   for (int j = threadIdx.x; j < hidden; j += blockDim.x)
     out[(size_t)t * hidden + j] = table[(size_t)tok * hidden + j];
 }
+
+
+// ===========================================================================
+// Tiled causal GQA attention (FlashAttention-2 style) for sm_89, BF16.
+// Added by the standalone /tmp/jev-attn work; see attn.cu for the host wrapper.
+// Grid: (ceil(seq/64), n_heads), block: 256, dynamic smem: 101376 B at hd=256.
+// ===========================================================================
+
+#include <cstdint>
+
+namespace {
+
+constexpr int BLOCK_M = 64;   // queries per CTA
+constexpr int BLOCK_N = 32;   // keys per K/V tile
+constexpr int THREADS = 256;  // 8 warps
+constexpr int PAD = 8;        // bf16 elements of row padding (16 B)
+
+__device__ __forceinline__ uint32_t smem_addr(const void* p) {
+  return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src) {
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(dst),
+               "l"(src));
+}
+
+__device__ __forceinline__ void cp_async_commit() {
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+__device__ __forceinline__ void cp_async_wait_all() {
+  asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], uint32_t addr) {
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+      : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+      : "r"(addr));
+}
+
+// Row-major 8x16 K block -> B fragment of m16n8k16 (K is [n=key][k=dim]).
+__device__ __forceinline__ void ldmatrix_x2(uint32_t (&r)[2], uint32_t addr) {
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+      : "=r"(r[0]), "=r"(r[1])
+      : "r"(addr));
+}
+
+// Two 8x8 V blocks, transposed -> B fragment for P*V.
+__device__ __forceinline__ void ldmatrix_x2_trans(uint32_t (&r)[2],
+                                                  uint32_t addr) {
+  asm volatile(
+      "ldmatrix.sync.aligned.m8n8.x2.trans.shared.b16 {%0,%1}, [%2];\n"
+      : "=r"(r[0]), "=r"(r[1])
+      : "r"(addr));
+}
+
+// D += A * B, fp32 accumulate, bf16 inputs.
+__device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4],
+                                         const uint32_t (&b)[2]) {
+  asm volatile(
+      "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+      "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+      : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
+}
+
+__device__ __forceinline__ uint32_t pack2(float x, float y) {
+  __nv_bfloat162 p = __floats2bfloat162_rn(x, y);
+  uint32_t r;
+  __builtin_memcpy(&r, &p, sizeof(r));
+  return r;
+}
+
+__device__ __forceinline__ float warp_max4(float x) {
+  x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 1));
+  x = fmaxf(x, __shfl_xor_sync(0xffffffffu, x, 2));
+  return x;
+}
+
+__device__ __forceinline__ float warp_sum4(float x) {
+  x += __shfl_xor_sync(0xffffffffu, x, 1);
+  x += __shfl_xor_sync(0xffffffffu, x, 2);
+  return x;
+}
+
+// D is head_dim. Rows in shared memory are padded by PAD bf16 elements.
+template <int D>
+__device__ __forceinline__ void attention_tc_body(
+    const bf16* __restrict__ q, const bf16* __restrict__ k,
+    const bf16* __restrict__ v, bf16* __restrict__ out, int seq, int n_heads,
+    int n_kv, float scale) {
+  constexpr int QS = D + PAD;
+  constexpr int HALF = D / 2;    // output dims handled per warp column
+  constexpr int NT8 = HALF / 8;  // n8 mma tiles per warp column
+  constexpr int NK = D / 8;      // 16-byte chunks per row
+
+  extern __shared__ __align__(16) unsigned char smem_raw[];
+  bf16* Qs = reinterpret_cast<bf16*>(smem_raw);
+  bf16* Ks = Qs + BLOCK_M * QS;
+  bf16* Vs = Ks + 2 * BLOCK_N * QS;
+
+  const int q_start = blockIdx.x * BLOCK_M;
+  const int h = blockIdx.y;
+  const int kvh = h / (n_heads / n_kv);
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5;
+  const int lane = tid & 31;
+  const int wm = warp & 3;   // query row group
+  const int wn = warp >> 2;  // output dim group
+  const int row0 = wm * 16;
+  const int dim0 = wn * HALF;
+
+  const int nkeys = min(q_start + BLOCK_M, seq);
+  const int ntiles = (nkeys + BLOCK_N - 1) / BLOCK_N;
+
+  // ---- prologue: Q + first K/V tile -------------------------------------
+  for (int idx = tid; idx < BLOCK_M * NK; idx += THREADS) {
+    const int r = idx / NK;
+    const int c = idx - r * NK;
+    const int gr = min(q_start + r, seq - 1);
+    cp_async16(smem_addr(&Qs[r * QS + c * 8]),
+               q + (static_cast<size_t>(gr) * n_heads + h) * D + c * 8);
+  }
+  for (int idx = tid; idx < BLOCK_N * NK; idx += THREADS) {
+    const int r = idx / NK;
+    const int c = idx - r * NK;
+    const int gk = min(r, seq - 1);
+    const bf16* src_k = k + (static_cast<size_t>(gk) * n_kv + kvh) * D + c * 8;
+    const bf16* src_v = v + (static_cast<size_t>(gk) * n_kv + kvh) * D + c * 8;
+    cp_async16(smem_addr(&Ks[r * QS + c * 8]), src_k);
+    cp_async16(smem_addr(&Vs[r * QS + c * 8]), src_v);
+  }
+  cp_async_commit();
+  cp_async_wait_all();
+  __syncthreads();
+
+  // ---- running state (per thread: row r = lane/4, row r+8) --------------
+  float m0 = -INFINITY, m1 = -INFINITY;
+  float l0 = 0.f, l1 = 0.f;
+  float o[NT8][4];
+#pragma unroll
+  for (int t = 0; t < NT8; ++t) {
+    o[t][0] = 0.f;
+    o[t][1] = 0.f;
+    o[t][2] = 0.f;
+    o[t][3] = 0.f;
+  }
+
+  const float scale_l2 = scale * 1.4426950408889634f;  // log2(e)
+  const int qpos0 = q_start + row0 + (lane >> 2);
+  const int qpos1 = qpos0 + 8;
+  const int lane_c = 2 * (lane & 3);
+
+  for (int j = 0; j < ntiles; ++j) {
+    const int cb = j & 1;
+
+    // Prefetch the next K/V tile into the other buffer while computing.
+    if (j + 1 < ntiles) {
+      const int nk0 = (j + 1) * BLOCK_N;
+      for (int idx = tid; idx < BLOCK_N * NK; idx += THREADS) {
+        const int r = idx / NK;
+        const int c = idx - r * NK;
+        const int gk = min(nk0 + r, seq - 1);
+        const bf16* src_k =
+            k + (static_cast<size_t>(gk) * n_kv + kvh) * D + c * 8;
+        const bf16* src_v =
+            v + (static_cast<size_t>(gk) * n_kv + kvh) * D + c * 8;
+        cp_async16(smem_addr(&Ks[((cb ^ 1) * BLOCK_N + r) * QS + c * 8]), src_k);
+        cp_async16(smem_addr(&Vs[((cb ^ 1) * BLOCK_N + r) * QS + c * 8]), src_v);
+      }
+    }
+    cp_async_commit();
+
+    // ---- S = Q * K^T ----------------------------------------------------
+    float s[4][4];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      s[t][0] = 0.f;
+      s[t][1] = 0.f;
+      s[t][2] = 0.f;
+      s[t][3] = 0.f;
+    }
+
+    const int qa_row = row0 + (lane & 15);
+    const int qa_col_hi = (lane >> 4) * 8;
+#pragma unroll
+    for (int kk = 0; kk < D / 16; ++kk) {
+      uint32_t a[4];
+      ldmatrix_x4(a, smem_addr(&Qs[qa_row * QS + kk * 16 + qa_col_hi]));
+      const int kb_row = (lane & 7);
+      const int kb_col_hi = ((lane >> 3) & 1) * 8;
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        uint32_t b[2];
+        ldmatrix_x2(
+            b, smem_addr(&Ks[(cb * BLOCK_N + t * 8 + kb_row) * QS + kk * 16 +
+                             kb_col_hi]));
+        mma16816(s[t], a, b);
+      }
+    }
+
+    // ---- causal mask + online softmax -----------------------------------
+    const bool need_mask = ((j + 1) * BLOCK_N - 1) > q_start;
+    if (need_mask) {
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        const int col = j * BLOCK_N + t * 8 + lane_c;
+        s[t][0] = (col > qpos0) ? -INFINITY : s[t][0] * scale_l2;
+        s[t][1] = (col + 1 > qpos0) ? -INFINITY : s[t][1] * scale_l2;
+        s[t][2] = (col > qpos1) ? -INFINITY : s[t][2] * scale_l2;
+        s[t][3] = (col + 1 > qpos1) ? -INFINITY : s[t][3] * scale_l2;
+      }
+    } else {
+#pragma unroll
+      for (int t = 0; t < 4; ++t) {
+        s[t][0] *= scale_l2;
+        s[t][1] *= scale_l2;
+        s[t][2] *= scale_l2;
+        s[t][3] *= scale_l2;
+      }
+    }
+
+    float mt0 = s[0][0], mt1 = s[0][2];
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      mt0 = fmaxf(mt0, fmaxf(s[t][0], s[t][1]));
+      mt1 = fmaxf(mt1, fmaxf(s[t][2], s[t][3]));
+    }
+    mt0 = warp_max4(mt0);
+    mt1 = warp_max4(mt1);
+
+    const float mn0 = fmaxf(m0, mt0);
+    const float mn1 = fmaxf(m1, mt1);
+    const float a0 = (mn0 == -INFINITY) ? 0.f : exp2f(m0 - mn0);
+    const float a1 = (mn1 == -INFINITY) ? 0.f : exp2f(m1 - mn1);
+
+    float sum0 = 0.f, sum1 = 0.f;
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      s[t][0] = (mn0 == -INFINITY) ? 0.f : exp2f(s[t][0] - mn0);
+      s[t][1] = (mn0 == -INFINITY) ? 0.f : exp2f(s[t][1] - mn0);
+      s[t][2] = (mn1 == -INFINITY) ? 0.f : exp2f(s[t][2] - mn1);
+      s[t][3] = (mn1 == -INFINITY) ? 0.f : exp2f(s[t][3] - mn1);
+      sum0 += s[t][0] + s[t][1];
+      sum1 += s[t][2] + s[t][3];
+    }
+    sum0 = warp_sum4(sum0);
+    sum1 = warp_sum4(sum1);
+    l0 = l0 * a0 + sum0;
+    l1 = l1 * a1 + sum1;
+    m0 = mn0;
+    m1 = mn1;
+
+    // ---- O = O * alpha + P * V ------------------------------------------
+#pragma unroll
+    for (int t = 0; t < NT8; ++t) {
+      o[t][0] *= a0;
+      o[t][1] *= a0;
+      o[t][2] *= a1;
+      o[t][3] *= a1;
+    }
+
+    uint32_t pa[2][4];
+#pragma unroll
+    for (int f = 0; f < 2; ++f) {
+      const int t0 = 2 * f, t1 = 2 * f + 1;
+      pa[f][0] = pack2(s[t0][0], s[t0][1]);
+      pa[f][1] = pack2(s[t0][2], s[t0][3]);
+      pa[f][2] = pack2(s[t1][0], s[t1][1]);
+      pa[f][3] = pack2(s[t1][2], s[t1][3]);
+    }
+
+    const int vb_row = (lane & 7) + (((lane >> 3) & 1) * 8);
+#pragma unroll
+    for (int f = 0; f < 2; ++f) {
+      const int vbase = cb * BLOCK_N + f * 16;
+#pragma unroll
+      for (int t = 0; t < NT8; ++t) {
+        uint32_t b[2];
+        ldmatrix_x2_trans(
+            b, smem_addr(&Vs[(vbase + vb_row) * QS + dim0 + t * 8]));
+        mma16816(o[t], pa[f], b);
+      }
+    }
+
+    if (j + 1 < ntiles) {
+      cp_async_wait_all();
+    }
+    __syncthreads();
+  }
+
+  // ---- epilogue ---------------------------------------------------------
+  const float inv0 = l0 > 0.f ? 1.f / l0 : 0.f;
+  const float inv1 = l1 > 0.f ? 1.f / l1 : 0.f;
+  const int qrow0 = q_start + row0 + (lane >> 2);
+  const int qrow1 = qrow0 + 8;
+  const size_t obase0 =
+      (static_cast<size_t>(qrow0) * n_heads + h) * D + dim0 + lane_c;
+  const size_t obase1 =
+      (static_cast<size_t>(qrow1) * n_heads + h) * D + dim0 + lane_c;
+  const bool w0 = qrow0 < seq;
+  const bool w1 = qrow1 < seq;
+#pragma unroll
+  for (int t = 0; t < NT8; ++t) {
+    if (w0) {
+      __nv_bfloat162 p =
+          __floats2bfloat162_rn(o[t][0] * inv0, o[t][1] * inv0);
+      __builtin_memcpy(out + obase0 + t * 8, &p, sizeof(p));
+    }
+    if (w1) {
+      __nv_bfloat162 p =
+          __floats2bfloat162_rn(o[t][2] * inv1, o[t][3] * inv1);
+      __builtin_memcpy(out + obase1 + t * 8, &p, sizeof(p));
+    }
+  }
+}
+
+}  // namespace
+
+// Fixed-symbol entry points (one per supported head_dim). These are the
+// functions the engine's cubin loader looks up; the templated body above is
+// inlined into each.
+#define ATTN_TC_WRAPPER(D)                                                    \
+  extern "C" __global__ void __launch_bounds__(256, 1)                        \
+      attention_tc_bf16_d##D(const __nv_bfloat16* __restrict__ q,             \
+                             const __nv_bfloat16* __restrict__ k,             \
+                             const __nv_bfloat16* __restrict__ v,             \
+                             __nv_bfloat16* __restrict__ out, int seq,        \
+                             int n_heads, int n_kv, float scale) {            \
+    attention_tc_body<D>(q, k, v, out, seq, n_heads, n_kv, scale);            \
+  }
+
+ATTN_TC_WRAPPER(64)
+ATTN_TC_WRAPPER(128)
+ATTN_TC_WRAPPER(256)

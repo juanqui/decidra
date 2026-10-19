@@ -103,36 +103,48 @@ CLI commands remain available for validation (`self-test`, `layer`, `compare`,
 
 ## Attention
 
-Two causal GQA kernels share the same graph:
+Three causal GQA kernels share the same graph:
 
-- **warp-per-query** (default): one warp owns a query, lanes hold 8 head dims in
-  registers, the QK dot is a warp shuffle, and online softmax/PV stay in
-  registers. No block synchronization inside the key loop.
-- **block-per-query** (`--legacy-attention`): the original kernel, kept for A/B.
+- **tiled FA2-style** (default): 64-query CTAs, 32-key K/V tiles, cp.async
+  double buffering, `ldmatrix` + `mma.sync` m16n8k16 BF16, online softmax in
+  registers. Fixed entry points for head_dim 64/128/256; dynamic shared
+  27.6/52.2/99 KiB.
+- **warp-per-query** (`--legacy-attention`): one warp per query, no block
+  synchronization in the key loop. Kept as the fallback.
+- **block-per-query**: the original kernel, still compiled for A/B but not
+  exposed on the CLI.
 
 Long-context latency (Marlin weights, resident, SM89 RTX 4090):
 
-| tokens | warp attention | legacy attention | peak GPU mem |
+| tokens | tiled FA2 | warp (`--legacy-attention`) | peak GPU mem |
 |---|---|---|---|
-| 4K | 4.65 s | 6.81 s | 17.2 GiB |
-| 8K | 9.88 s | 19.17 s | 17.6 GiB |
-| 16K | 22.88 s | (not run; ~60 s by fit) | 18.9 GiB |
+| 1K | 0.959 s | 0.959 s | 13.1 GiB resident |
+| 4K | 3.99-4.04 s | 4.65 s | ~17.2 GiB |
+| 8K | 7.95-8.05 s | 9.88 s | ~17.6 GiB |
+| 16K | 16.10-16.32 s | 22.88 s | 18.9 GiB |
+
+The standalone attention kernel is 7-12x faster than the warp kernel, but the
+full forward is now **GEMM-bound**: ~0.96 ms/token (1K 0.96 s, 4K 4.0 s, 8K
+8.0 s, 16K 16.3 s). Attention is no longer the quadratic term; reaching
+<2 s at 4K requires a faster large-M W4A16 path, not a faster attention kernel.
 
 Long-context quality gate against the CPU AWQ/SDPA probes
-(`/tmp/jev-native-ref/long-context/probes`, Marlin + warp attention):
+(`/tmp/jev-native-ref/long-context/probes`, Marlin + tiled attention):
 
 | probe | final hidden max / mean / rel_rms / cosine | head logits (3721, 1802) | two-way prob delta | top-1 |
 |---|---|---|---|---|
-| 4K (4090 tok) | 0.0469 / 4.14e-3 / 0.721% / 0.999974 | [1.2656, 5.0] vs [1.2734, 5.0313] | 5.3e-4 | true |
-| 8K (8178 tok) | 0.0664 / 4.21e-3 / 0.761% / 0.999971 | [1.2031, 5.1563] vs [1.2188, 5.1563] | 2.9e-4 | true |
-| 16K (16383 tok) | 0.0313 / 4.05e-3 / 0.690% / 0.999977 | [1.2734, 5.25] vs [1.2422, 5.25] | 5.6e-4 | true |
+| 4K (4090 tok) | 0.0938 / 4.41e-3 / 0.783% / 0.999970 | [1.2344, 5.0] vs [1.2734, 5.0313] | 1.7e-4 | true |
+| 8K (8178 tok) | 0.0781 / 4.26e-3 / 0.805% / 0.999967 | [1.2109, 5.1563] vs [1.2188, 5.1563] | 1.5e-4 | true |
+| 16K (16383 tok) | 0.0703 / 4.14e-3 / 0.731% / 0.999974 | [1.2422, 5.2188] vs [1.2422, 5.25] | 5.6e-4 | true |
 
 The probe `probs` include the decision-head transform (bias/temperature); the
-raw two-way softmax of the head logits is within 6e-4 of the golden raw values.
-Deltas are BF16 accumulation noise and the expected choice is `true` at every
-length. Causally, the first 36 positions of the 76/1K/4K/8K/16K prompts also
-match the 36-token golden head logits within max 0.051-0.086 / mean
-0.014-0.018.
+raw two-way softmax of the head logits is within 5.6e-4 of the golden raw
+values. Deltas are BF16 accumulation noise and the expected choice is `true` at
+every length. The warp kernel has slightly smaller final-hidden deltas
+(0.72/0.76/0.69% rel_rms) but is slower; both pass. Causally, the first 36
+positions of the 76/1K/4K/8K/16K prompts also match the 36-token golden head
+logits within max 0.051-0.086 / mean 0.014-0.018.
+
 K/V are transient per layer (bf16, no persistent KV cache, no FP8 KV); the GDN
 state is f32. 16K peaks at 18.9 GiB including the 13.1 GiB resident weights, so
 24 GiB fits with headroom.
@@ -209,14 +221,14 @@ Resident (`--preload`, GPU 1 freed, 12.66 GiB used / 10.86 GiB free):
 |---|---|---|---|
 | 36 tokens | 174.7 ms | 84.8 ms | **45.1 ms** (3.87x) |
 | 76 tokens | 202.2 ms | 126.4 ms | **73.0 ms** (2.77x) |
-| 1024 tokens | 1261.2 ms | 1261.2 ms | **984.3 ms** (1.28x) |
+| 1024 tokens | 1261.2 ms | 1261.2 ms | **958.5 ms** (1.32x) |
 
 Marlin preload is 10.1 s (repack) and uses 13.1 GiB; the other paths preload in
 5.8 s / 12.7 GiB. Init 0.2 s. GPU samples: reference/fused ~184-231 W,
 Marlin ~45 ms at 36 tokens with 100% utilization. Marlin golden checks: layer 0
 mean 1.58e-4 / rel_rms 0.347%; final norm rel_rms 1.23%, cosine 0.999924.
 
-At 1K the gain is 1.28x: that case is compute-bound and cuBLAS+dequant was
+At 1K the gain is 1.32x: that case is compute-bound and cuBLAS+dequant was
 already efficient; the fixed 64-row M tile and re-reading W per M tile limit
 Marlin's large-M benefit. Two 128-thread large-M tile variants
 (`thread_n_blocks=8/4`, `thread_k_blocks=4/8`) were compiled and A/B'd at 1K:

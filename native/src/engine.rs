@@ -631,23 +631,46 @@ impl Engine {
 
         let mut attn = self.alloc_bf16(seq * heads * hd)?;
         if self.warp_attention.load(Ordering::Relaxed) {
+            let tc = match hd {
+                64 => Some(&self.kernels.attention_tc_64),
+                128 => Some(&self.kernels.attention_tc_128),
+                256 => Some(&self.kernels.attention_tc_256),
+                _ => None,
+            };
+            if let Some(tc) = tc {
+                kernels::attention_tc(
+                    &self.gpu,
+                    tc,
+                    &qn,
+                    &kn,
+                    &vv,
+                    &mut attn,
+                    seq,
+                    heads,
+                    kv,
+                    hd,
+                    1.0 / (hd as f32).sqrt(),
+                )?;
+            } else {
+                kernels::attention_warp(
+                    &self.gpu,
+                    &self.kernels.attention_warp,
+                    &qn,
+                    &kn,
+                    &vv,
+                    &mut attn,
+                    seq,
+                    heads,
+                    kv,
+                    hd,
+                    1.0 / (hd as f32).sqrt(),
+                )?;
+            }
+        } else {
+            // --legacy-attention: warp-per-query kernel.
             kernels::attention_warp(
                 &self.gpu,
                 &self.kernels.attention_warp,
-                &qn,
-                &kn,
-                &vv,
-                &mut attn,
-                seq,
-                heads,
-                kv,
-                hd,
-                1.0 / (hd as f32).sqrt(),
-            )?;
-        } else {
-            kernels::attention(
-                &self.gpu,
-                &self.kernels.attention,
                 &qn,
                 &kn,
                 &vv,

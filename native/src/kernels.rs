@@ -18,6 +18,10 @@ pub struct Kernels {
     pub rope: CudaFunction,
     pub attention: CudaFunction,
     pub attention_warp: CudaFunction,
+    /// Tiled FlashAttention-2-style kernel, one entry per supported head_dim.
+    pub attention_tc_64: CudaFunction,
+    pub attention_tc_128: CudaFunction,
+    pub attention_tc_256: CudaFunction,
     pub conv1d_silu: CudaFunction,
     pub gdn_prepare: CudaFunction,
     pub gdn_recurrent: CudaFunction,
@@ -42,6 +46,23 @@ impl Kernels {
             rope: gpu.func("rope_bf16")?,
             attention: gpu.func("attention_bf16")?,
             attention_warp: gpu.func("attention_warp_bf16")?,
+            attention_tc_64: gpu.func("attention_tc_bf16_d64")?,
+            attention_tc_128: {
+                let f = gpu.func("attention_tc_bf16_d128")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    52224,
+                )?;
+                f
+            },
+            attention_tc_256: {
+                let f = gpu.func("attention_tc_bf16_d256")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    101376,
+                )?;
+                f
+            },
             conv1d_silu: gpu.func("conv1d_silu_bf16")?,
             gdn_prepare: gpu.func("gdn_prepare")?,
             gdn_recurrent: gpu.func("gdn_recurrent")?,
@@ -563,6 +584,46 @@ pub fn attention_warp(
     l.arg(&nh);
     l.arg(&nkv);
     l.arg(&hd_i);
+    l.arg(&scale);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_tc(
+    gpu: &Gpu,
+    k: &CudaFunction,
+    q: &CudaSlice<bf16>,
+    kk: &CudaSlice<bf16>,
+    v: &CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+    seq: usize,
+    n_heads: usize,
+    n_kv: usize,
+    hd: usize,
+    scale: f32,
+) -> Result<()> {
+    // hd is one of 64/128/256 (validated by the caller / loaded cubin).
+    let smem = match hd {
+        64 => 27648usize,
+        128 => 52224,
+        256 => 101376,
+        _ => anyhow::bail!("attention_tc: unsupported head_dim {hd}"),
+    };
+    let cfg = LaunchConfig {
+        grid_dim: (seq.div_ceil(64) as u32, n_heads as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: smem as u32,
+    };
+    let (seq_i, nh, nkv) = (seq as i32, n_heads as i32, n_kv as i32);
+    let mut l = gpu.stream.launch_builder(k);
+    l.arg(q);
+    l.arg(kk);
+    l.arg(v);
+    l.arg(out);
+    l.arg(&seq_i);
+    l.arg(&nh);
+    l.arg(&nkv);
     l.arg(&scale);
     unsafe { l.launch(cfg) }?;
     Ok(())
