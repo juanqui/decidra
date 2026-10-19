@@ -377,21 +377,47 @@ extern "C" __global__ void dequant_w4a16_bf16(const int* __restrict__ packed,
 }
 
 // ---------------------------------------------------------------------------
-// Fused W4A16 GEMM: C[M,N] = X[M,K] @ W[N,K]^T with W dequantized in shared
-// memory. BM=BN=64, BK=64 (one quantization group), 8 warps, bf16 tensor cores.
-// No intermediate BF16 weight ever reaches global memory.
+// Fused W4A16 GEMM: C[M,N] = X[M,K] @ W[N,K]^T, no BF16 weight image in global
+// memory. BM=BN=BK=64 (BK is one quantization group), 8 warps, bf16 tensor
+// cores. Double-buffered shared memory with register prefetch: the packed next
+// group and activation tile are in flight while the current tile multiplies.
+//
+// Staging maps one warp to 4 output rows: threads 0..7 cover the 8 packed words
+// (32B) of row 0, threads 8..15 row 1, etc. Packed loads are coalesced and each
+// thread stores one aligned uint4 (8 bf16) to shared.
 // ---------------------------------------------------------------------------
 #define FBM 64
 #define FBN 64
 #define FBK 64
 #define FWARPS 8
+// Padded shared row stride: avoids 128-byte strides, which put every row in
+// the same bank set for column-wise tensor-core loads.
+#define FLD (FBK + 8)
+
+__device__ __forceinline__ uint4 pack8(const unsigned w, int z, float sc) {
+  bf16 v[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    int q = (w >> (4 * j)) & 0xF;
+    v[j] = f2bf((float)(q - z) * sc);
+  }
+  return make_uint4(
+      (unsigned)__bfloat16_as_ushort(v[0]) |
+          ((unsigned)__bfloat16_as_ushort(v[1]) << 16),
+      (unsigned)__bfloat16_as_ushort(v[2]) |
+          ((unsigned)__bfloat16_as_ushort(v[3]) << 16),
+      (unsigned)__bfloat16_as_ushort(v[4]) |
+          ((unsigned)__bfloat16_as_ushort(v[5]) << 16),
+      (unsigned)__bfloat16_as_ushort(v[6]) |
+          ((unsigned)__bfloat16_as_ushort(v[7]) << 16));
+}
 
 extern "C" __global__ void gemm_w4a16_bf16(
     const bf16* __restrict__ x, const int* __restrict__ packed,
     const bf16* __restrict__ scale, const int* __restrict__ zp,
     bf16* __restrict__ out, int M, int N, int K) {
-  __shared__ bf16 sx[FBM][FBK];
-  __shared__ bf16 sw[FBN][FBK];
+  __shared__ __align__(32) bf16 sw[2][FBN][FLD];
+  __shared__ __align__(32) bf16 sx[2][FBM][FLD];
   __shared__ float sacc[FWARPS][16 * 16];
 
   const int n0 = blockIdx.x * FBN;
@@ -399,66 +425,121 @@ extern "C" __global__ void gemm_w4a16_bf16(
   const int tid = threadIdx.x;
   const int warp = tid >> 5;
   const int lane = tid & 31;
-  const int words_per_row = (K + 7) / 8;
-  const int groups = K / 64;
+  const int words_per_row = K >> 3;
+  const int groups = K >> 6;
+
+  // Weight staging: 8 threads per output row, one packed word each.
+  const int wrow0 = tid >> 3;  // 0..31
+  const int wcol = tid & 7;    // packed word within the 64-k group
+  // Activation staging: 4 threads per row, 16 k each.
+  const int xrow = tid >> 2;   // 0..63
+  const int xkq = tid & 3;
 
   using namespace nvcuda;
   wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc0, acc1;
   wmma::fill_fragment(acc0, 0.f);
   wmma::fill_fragment(acc1, 0.f);
 
-  for (int k0 = 0; k0 < K; k0 += FBK) {
-    // Dequantize the 64x64 weight tile into shared memory.
-    for (int idx = tid; idx < FBN * FBK; idx += blockDim.x) {
-      int n = idx >> 6;
-      int kk = idx & 63;
-      int gn = n0 + n;
-      bf16 w = f2bf(0.f);
-      if (gn < N) {
-        int k = k0 + kk;
-        int g = k0 >> 6;
-        int word = packed[(long)gn * words_per_row + (k >> 3)];
-        int q = (word >> (4 * (k & 7))) & 0xF;
-        int zword = zp[(long)(gn >> 3) * groups + g];
-        int z = (zword >> (4 * (gn & 7))) & 0xF;
-        float sc = bf2f(scale[(long)gn * groups + g]);
-        w = f2bf((float)(q - z) * sc);
-      }
-      sw[n][kk] = w;
+#pragma unroll
+  for (int p = 0; p < 2; ++p) {
+    int row = wrow0 + (p << 5);
+    int gn = n0 + row;
+    uint4 v = make_uint4(0, 0, 0, 0);
+    if (gn < N) {
+      unsigned w = (unsigned)packed[(long)gn * words_per_row + wcol];
+      unsigned zw = (unsigned)zp[(long)(gn >> 3) * groups];
+      int z = (zw >> (4 * (gn & 7))) & 0xF;
+      float sc = bf2f(scale[(long)gn * groups]);
+      v = pack8(w, z, sc);
     }
-    // Stage the X tile; rows past M are zero.
-    for (int idx = tid; idx < FBM * FBK; idx += blockDim.x) {
-      int m = idx >> 6;
-      int kk = idx & 63;
-      int gm = m0 + m;
-      sx[m][kk] = (gm < M) ? x[(long)gm * K + k0 + kk] : f2bf(0.f);
-    }
-    __syncthreads();
+    *reinterpret_cast<uint4*>(&sw[0][row][wcol * 8]) = v;
+  }
+  if (m0 + xrow < M) {
+    const bf16* src = x + (long)(m0 + xrow) * K + xkq * 16;
+    uint4 v0 = *reinterpret_cast<const uint4*>(src);
+    uint4 v1 = *reinterpret_cast<const uint4*>(src + 8);
+    bf16* d = &sx[0][xrow][xkq * 16];
+    *reinterpret_cast<uint4*>(d) = v0;
+    *reinterpret_cast<uint4*>(d + 8) = v1;
+  } else {
+    bf16* d = &sx[0][xrow][xkq * 16];
+    for (int jj = 0; jj < 16; ++jj) d[jj] = f2bf(0.f);
+  }
+  __syncthreads();
 
-    int t0 = warp;
-    int t1 = warp + FWARPS;
+  int buf = 0;
+  for (int k0 = 0; k0 < K; k0 += FBK) {
+    const int next = k0 + FBK;
+    const bool has_next = next < K;
+
+    // Prefetch the next quantization group (one packed word + one scale + one
+    // zp word per row) and the next 16 activation values per thread.
+    unsigned pw[2] = {0u, 0u};
+    unsigned pz[2] = {0u, 0u};
+    float psc[2] = {0.f, 0.f};
+    uint4 px0 = make_uint4(0, 0, 0, 0);
+    uint4 px1 = make_uint4(0, 0, 0, 0);
+    if (has_next) {
+      int wbase = (next >> 3) + wcol;
+      int g = next >> 6;
+#pragma unroll
+      for (int p = 0; p < 2; ++p) {
+        int row = wrow0 + (p << 5);
+        int gn = n0 + row;
+        if (gn < N) {
+          pw[p] = (unsigned)packed[(long)gn * words_per_row + wbase];
+          pz[p] = (unsigned)zp[(long)(gn >> 3) * groups + g];
+          psc[p] = bf2f(scale[(long)gn * groups + g]);
+        }
+      }
+      if (m0 + xrow < M) {
+        const bf16* src = x + (long)(m0 + xrow) * K + next + xkq * 16;
+        px0 = *reinterpret_cast<const uint4*>(src);
+        px1 = *reinterpret_cast<const uint4*>(src + 8);
+      }
+    }
+
+    // MMA on the current group: four 16-wide K sub-blocks.
 #pragma unroll
     for (int ti = 0; ti < 2; ++ti) {
-      int t = ti == 0 ? t0 : t1;
+      int t = ti == 0 ? warp : warp + FWARPS;
       int tr = t >> 2;
       int tc = t & 3;
-      // The staged K extent is 64 (one quantization group), but each MMA
-      // consumes 16 columns; accumulate all four sub-blocks.
 #pragma unroll
       for (int ki = 0; ki < FBK; ki += 16) {
         wmma::fragment<wmma::matrix_a, 16, 16, 16, bf16, wmma::row_major> a;
         wmma::fragment<wmma::matrix_b, 16, 16, 16, bf16, wmma::col_major> b;
-        wmma::load_matrix_sync(a, &sx[tr * 16][ki], FBK);
-        wmma::load_matrix_sync(b, &sw[tc * 16][ki], FBK);
+        wmma::load_matrix_sync(a, &sx[buf][tr * 16][ki], FLD);
+        wmma::load_matrix_sync(b, &sw[buf][tc * 16][ki], FLD);
         if (ti == 0)
           wmma::mma_sync(acc0, a, b, acc0);
         else
           wmma::mma_sync(acc1, a, b, acc1);
       }
     }
+
+    if (has_next) {
+      const int nb = buf ^ 1;
+#pragma unroll
+      for (int p = 0; p < 2; ++p) {
+        int row = wrow0 + (p << 5);
+        int gn = n0 + row;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (gn < N) {
+          int z = (pz[p] >> (4 * (gn & 7))) & 0xF;
+          v = pack8(pw[p], z, psc[p]);
+        }
+        *reinterpret_cast<uint4*>(&sw[nb][row][wcol * 8]) = v;
+      }
+      bf16* dx = &sx[nb][xrow][xkq * 16];
+      *reinterpret_cast<uint4*>(dx) = px0;
+      *reinterpret_cast<uint4*>(dx + 8) = px1;
+    }
     __syncthreads();
+    buf ^= 1;
   }
 
+  // Epilogue: 16 warp tiles of 16x16.
 #pragma unroll
   for (int ti = 0; ti < 2; ++ti) {
     int t = ti == 0 ? warp : warp + FWARPS;
@@ -472,9 +553,9 @@ extern "C" __global__ void gemm_w4a16_bf16(
     for (int idx = lane; idx < 256; idx += 32) {
       int r = idx >> 4;
       int cc = idx & 15;
-      int gm = m0 + tr * 16 + r;
-      int gn = n0 + tc * 16 + cc;
-      if (gm < M && gn < N) out[(long)gm * N + gn] = f2bf(sacc[warp][idx]);
+      int ogm = m0 + tr * 16 + r;
+      int ogn = n0 + tc * 16 + cc;
+      if (ogm < M && ogn < N) out[(long)ogm * N + ogn] = f2bf(sacc[warp][idx]);
     }
     __syncwarp();
   }

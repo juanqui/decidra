@@ -1,4 +1,5 @@
 //! Decoder forward.
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +16,53 @@ use crate::tensor::Store;
 use crate::weights::{
     FullAttentionWeights, GdnWeights, LayerWeights, LinearWeight, MixerWeights, WeightProvider,
 };
+
+type BufferPool = Arc<Mutex<HashMap<usize, Vec<CudaSlice<bf16>>>>>;
+
+/// Recycled device buffer. Returning outputs to the pool avoids per-GEMM
+/// cuMemAlloc: on this driver a fresh allocation of some sizes costs ~0.6 ms,
+/// which dwarfed the kernel for large-N projections. Slices are reused on the
+/// same stream, so ordering guarantees correctness.
+pub struct Buf {
+    slice: Option<CudaSlice<bf16>>,
+    pool: BufferPool,
+}
+
+impl Buf {
+    pub fn len(&self) -> usize {
+        self.slice.as_ref().map(|s| s.len()).unwrap_or(0)
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl std::ops::Deref for Buf {
+    type Target = CudaSlice<bf16>;
+    fn deref(&self) -> &Self::Target {
+        self.slice.as_ref().expect("buffer taken")
+    }
+}
+
+impl std::ops::DerefMut for Buf {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.slice.as_mut().expect("buffer taken")
+    }
+}
+
+impl Drop for Buf {
+    fn drop(&mut self) {
+        if let Some(s) = self.slice.take() {
+            let mut pool = self.pool.lock().unwrap();
+            // Keep at most two buffers per size so long-running servers with
+            // many prompt lengths do not accumulate device memory.
+            let keep = pool.get(&s.len()).map(|v| v.len() < 2).unwrap_or(true);
+            if keep {
+                pool.entry(s.len()).or_default().push(s);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct LogitsOpts {
@@ -64,6 +112,7 @@ pub struct Engine {
     /// Reused across GEMMs on the same stream.
     dequant_ws: Mutex<Option<CudaSlice<bf16>>>,
     logits_opts: Mutex<LogitsOpts>,
+    pool: BufferPool,
     /// Stream layers instead of keeping them resident. Needed to run the merged
     /// BF16 checkpoint (51 GiB) on a 24 GiB card; the shipped AWQ path keeps
     /// every packed layer resident instead.
@@ -73,6 +122,9 @@ pub struct Engine {
     fused_w4a16: AtomicBool,
     /// Minimum N for the fused kernel; smaller modules use dequant+cuBLAS.
     fused_min_n: std::sync::atomic::AtomicUsize,
+    /// Above this M, use dequant+cuBLAS: the fused kernel re-dequantizes W per
+    /// M tile, so large prefills are better served by the reference path.
+    fused_max_m: std::sync::atomic::AtomicUsize,
 }
 
 const _: fn() = || {
@@ -96,9 +148,11 @@ impl Engine {
             dump_dir: Mutex::new(None),
             dequant_ws: Mutex::new(None),
             logits_opts: Mutex::new(LogitsOpts::default()),
+            pool: Arc::new(Mutex::new(HashMap::new())),
             cache_weights: AtomicBool::new(true),
             fused_w4a16: AtomicBool::new(false),
-            fused_min_n: std::sync::atomic::AtomicUsize::new(0),
+            fused_min_n: std::sync::atomic::AtomicUsize::new(5120),
+            fused_max_m: std::sync::atomic::AtomicUsize::new(256),
         })
     }
 
@@ -116,6 +170,10 @@ impl Engine {
 
     pub fn set_fused_min_n(&self, n: usize) {
         self.fused_min_n.store(n, Ordering::Relaxed);
+    }
+
+    pub fn set_fused_max_m(&self, m: usize) {
+        self.fused_max_m.store(m, Ordering::Relaxed);
     }
 
     pub fn set_cache_weights(&self, enabled: bool) {
@@ -185,11 +243,29 @@ impl Engine {
         Ok(w)
     }
 
-    fn alloc_bf16(&self, n: usize) -> Result<CudaSlice<bf16>> {
-        Ok(self.gpu.stream.alloc_zeros::<bf16>(n)?)
+    fn alloc_bf16(&self, n: usize) -> Result<Buf> {
+        {
+            let mut pool = self.pool.lock().unwrap();
+            if pool.len() > 128 {
+                pool.clear();
+            }
+        }
+        if let Some(v) = self.pool.lock().unwrap().get_mut(&n) {
+            if let Some(s) = v.pop() {
+                return Ok(Buf {
+                    slice: Some(s),
+                    pool: self.pool.clone(),
+                });
+            }
+        }
+        let s = self.gpu.stream.alloc_zeros::<bf16>(n)?;
+        Ok(Buf {
+            slice: Some(s),
+            pool: self.pool.clone(),
+        })
     }
 
-    pub fn embed(&self, tokens: &[u32]) -> Result<CudaSlice<bf16>> {
+    pub fn embed(&self, tokens: &[u32]) -> Result<Buf> {
         let h = self.cfg.hidden_size;
         let name = WeightProvider::new(&self.store, &self.gpu.stream)?.embedding();
         let mut host = vec![bf16::ZERO; tokens.len() * h];
@@ -204,7 +280,9 @@ impl Engine {
                 .bf16_row(&name, tok as usize, &mut host[t * h..(t + 1) * h])
                 .with_context(|| format!("embedding row {tok}"))?;
         }
-        Ok(self.gpu.stream.clone_htod(&host)?)
+        let mut buf = self.alloc_bf16(tokens.len() * h)?;
+        self.gpu.stream.memcpy_htod(&host, &mut *buf)?;
+        Ok(buf)
     }
 
     /// causal LM over a prompt, returning the hidden state at the requested
@@ -239,7 +317,8 @@ impl Engine {
             );
         }
         let host: Vec<bf16> = hidden.iter().map(|v| bf16::from_f32(*v)).collect();
-        let x = self.gpu.stream.clone_htod(&host)?;
+        let mut x = self.alloc_bf16(seq * h)?;
+        self.gpu.stream.memcpy_htod(&host, &mut *x)?;
         if layer < 0 {
             bail!("--input requires --layer >= 0");
         }
@@ -248,7 +327,7 @@ impl Engine {
 
     fn forward_dev(
         &self,
-        x: CudaSlice<bf16>,
+        x: Buf,
         seq: usize,
         start: usize,
         layer: isize,
@@ -335,8 +414,8 @@ impl Engine {
         w: &LayerWeights,
         capture: bool,
         stage: Stage,
-        captured: &mut Option<CudaSlice<bf16>>,
-    ) -> Result<CudaSlice<bf16>> {
+        captured: &mut Option<Buf>,
+    ) -> Result<Buf> {
         let hidden = self.cfg.hidden_size;
         let h = self.alloc_bf16(seq * hidden)?;
         let mut h = h;
@@ -407,7 +486,7 @@ impl Engine {
         Ok(out)
     }
 
-    fn mlp(&self, h: &CudaSlice<bf16>, seq: usize, w: &LayerWeights) -> Result<CudaSlice<bf16>> {
+    fn mlp(&self, h: &CudaSlice<bf16>, seq: usize, w: &LayerWeights) -> Result<Buf> {
         let inter = self.cfg.intermediate_size;
         let gate = self.gemm(h, seq, &w.gate_proj)?;
         let up = self.gemm(h, seq, &w.up_proj)?;
@@ -429,7 +508,7 @@ impl Engine {
         seq: usize,
         w: &FullAttentionWeights,
         capture: bool,
-    ) -> Result<CudaSlice<bf16>> {
+    ) -> Result<Buf> {
         let cfg = &self.cfg;
         let (heads, kv, hd) = (
             cfg.num_attention_heads,
@@ -558,13 +637,7 @@ impl Engine {
         self.gemm(&gated, seq, &w.o_proj)
     }
 
-    fn gdn(
-        &self,
-        h: &CudaSlice<bf16>,
-        seq: usize,
-        w: &GdnWeights,
-        capture: bool,
-    ) -> Result<CudaSlice<bf16>> {
+    fn gdn(&self, h: &CudaSlice<bf16>, seq: usize, w: &GdnWeights, capture: bool) -> Result<Buf> {
         let cfg = &self.cfg;
         let (nk, nv) = (cfg.linear_num_key_heads, cfg.linear_num_value_heads);
         let (dk, dv) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
@@ -715,19 +788,26 @@ impl Engine {
     }
 
     /// C = x @ W^T for row-major bf16 buffers (cuBLAS column-major trick).
-    pub fn gemm(
-        &self,
-        x: &CudaSlice<bf16>,
-        rows: usize,
-        w: &LinearWeight,
-    ) -> Result<CudaSlice<bf16>> {
+    pub fn gemm(&self, x: &CudaSlice<bf16>, rows: usize, w: &LinearWeight) -> Result<Buf> {
         let (n, k) = (w.out(), w.in_());
         if x.len() != rows * k {
             bail!("gemm input has {} values, expected {}", x.len(), rows * k);
         }
+        let dbg = std::env::var("JEV_GEMM_DEBUG").is_ok();
+        let mark = |label: &str, t: std::time::Instant| {
+            if dbg {
+                let _ = self.gpu.synchronize();
+                eprintln!("{label}: {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
+            }
+        };
+        if dbg {
+            let _ = self.gpu.synchronize();
+        }
+        let t0 = std::time::Instant::now();
         match w {
             LinearWeight::Bf16 { w: wd, .. } => {
                 let mut c = self.alloc_bf16(rows * n)?;
+                mark("  alloc", t0);
                 let cfg = GemmConfig {
                     transa: cublasOperation_t::CUBLAS_OP_T,
                     transb: cublasOperation_t::CUBLAS_OP_N,
@@ -740,12 +820,14 @@ impl Engine {
                     beta: bf16::from_f32(0.0),
                     ldc: n as i32,
                 };
+                let t1 = std::time::Instant::now();
                 unsafe {
                     self.gpu
                         .blas
-                        .gemm(cfg, wd, x, &mut c)
+                        .gemm(cfg, wd, x, &mut *c)
                         .context("cublas bf16 gemm")?;
                 }
+                mark("  cublas", t1);
                 Ok(c)
             }
             LinearWeight::PackedW4A16 {
@@ -757,8 +839,11 @@ impl Engine {
             } => {
                 if self.fused_w4a16.load(Ordering::Relaxed)
                     && n >= self.fused_min_n.load(Ordering::Relaxed)
+                    && rows <= self.fused_max_m.load(Ordering::Relaxed)
                 {
                     let mut c = self.alloc_bf16(rows * n)?;
+                    mark("  alloc", t0);
+                    let t1 = std::time::Instant::now();
                     kernels::gemm_w4a16(
                         &self.gpu,
                         &self.kernels.gemm_w4a16,
@@ -771,6 +856,7 @@ impl Engine {
                         n,
                         k,
                     )?;
+                    mark("  fused", t1);
                     return Ok(c);
                 }
                 // Reference path: dequantize into a reusable BF16 workspace,
@@ -809,7 +895,7 @@ impl Engine {
                 unsafe {
                     self.gpu
                         .blas
-                        .gemm(cfg, &view, x, &mut c)
+                        .gemm(cfg, &view, x, &mut *c)
                         .context("cublas packed W4A16 gemm")?;
                 }
                 Ok(c)

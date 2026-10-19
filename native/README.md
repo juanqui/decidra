@@ -35,8 +35,15 @@ Runtime requirements (no toolkit needed):
 
 - NVIDIA driver exposing `libcuda.so.1` (CUDA >= 13.0 bindings).
 - `libcublas.so.13` and `libcublasLt.so.13` (CUDA 13 runtime), found via
-  `LD_LIBRARY_PATH`/`ldconfig`. For development these were copied out of the
-  CUDA image to `/tmp/cudalibs`.
+  `LD_LIBRARY_PATH`/`ldconfig`. The stable host copy is
+  `/srv/models/jev-awq/cudalibs` (568 MB, not committed):
+
+  ```sh
+  export LD_LIBRARY_PATH=/srv/models/jev-awq/cudalibs
+  ```
+
+  `JEV_CUDA_LIBS` names this directory for scripts; the binary itself only needs
+  `LD_LIBRARY_PATH` because cuBLAS is loaded with `dlopen`.
 - RTX 4090 / sm_89.
 
 ## Run
@@ -153,28 +160,47 @@ Top-1 token/last logit are identical (`867`, `3.578125`); two-way softmax is
 
 Resident (`--preload`, GPU 1 freed, 12.66 GiB used / 10.86 GiB free):
 
-| prompt | reference path (dequant+cuBLAS) | fused `--fused-w4a16` |
+| prompt | reference path (dequant+cuBLAS) | hybrid fused (`--fused-w4a16`) |
 |---|---|---|
-| 36 tokens | 176.6 ms (first 267 ms) | 405 ms |
-| 76 tokens | 202.9 ms | 460 ms |
-| 1024 tokens | 1277.6 ms | 2689 ms |
+| 36 tokens | 174.7 ms (first 259 ms) | **84.8 ms** (2.06x) |
+| 76 tokens | 202.2 ms | **126.4 ms** (1.60x) |
+| 1024 tokens | 1261.2 ms | **1261.2 ms** (falls back, 1.00x) |
 
-Preload 5.8 s, init 0.2 s. GPU sample during the 36-token reference run: 100%
-utilization, ~231 W peak; the fused kernel is latency-bound at ~156 W. Resident
-outputs are bit-identical to the streaming (`--no-cache`) run, and the golden
-checks are unchanged (final norm rel_rms 1.25%, full logits rel_rms 0.26%,
-top-1 identical, two-way softmax delta 9.6e-4).
+Preload 5.8 s, init 0.2 s. GPU sample during the 36-token hybrid run: 100%
+utilization, ~184 W mean / 213 W peak, 12.7 GiB used. Resident outputs are
+bit-identical to the streaming (`--no-cache`) run. Golden after residency
+(hybrid): final norm rel_rms 1.07% (reference 1.25%), full logits rel_rms 0.24%,
+top-1 identical, two-way softmax identical at f32 print precision.
 
 ### Fused W4A16 status
 
-`gemm_w4a16_bf16` dequantizes packed weights directly into shared memory and
-runs bf16 tensor-core WMMA (BM=BN=64, BK=64). It is numerically correct (layer 0
-mean_abs 1.0e-4 vs golden; full logits rel_rms 0.22%, top-1 identical) but **not
-faster** than dequantize-to-BF16 + cuBLAS on this workload: kernel-only averages
-are gate_proj 0.67 vs 0.63 ms, in_proj_qkv 1.20 vs 0.80 ms, out_proj 0.55 vs
-0.19 ms, down_proj 1.54 vs 0.63 ms, in_proj_a/b 0.40 vs 0.014 ms. The reference
-path is bandwidth-efficient and cuBLAS is already good at these small M; the
-naive fused schedule serializes dequant with MMA and re-dequantizes W per M
-tile. It stays selectable (`--fused-w4a16`, `--fused-min-n`) but is off by
-default. A Marlin-style pipeline (double-buffered cp.async, W tile reused across
-M tiles) is required to beat the reference path.
+`gemm_w4a16_bf16` dequantizes packed weights directly into padded shared memory
+and runs bf16 tensor-core WMMA (BM=BN=64, BK=64) with double-buffered staging and
+register prefetch. The padded shared stride (72 halfs) removes the 128-byte
+stride bank conflicts that made the first prototype slower than cuBLAS. One warp
+covers four output rows: threads 0..7 load the 8 packed words (32 B, coalesced)
+of a row, and each thread writes one aligned `uint4` (8 bf16) into shared. The
+next group's packed word, scale, zero point, and activation tile are prefetched
+into registers while the current group multiplies. 72 registers, 45 KiB shared
+(2 CTAs/SM), no spills.
+
+Policy: use the fused kernel when `N >= 5120` and `M <= 256`, otherwise fall
+back to dequant+cuBLAS (`--fused-min-n`, `--fused-max-m`). Small-N projections
+(`k/v/a/b`) and large prefills are faster on the reference path; the 1K-token
+case is exactly the reference latency.
+
+Kernel-only averages (36 rows, ms, reference -> fused):
+gate_proj 0.630 -> 0.170; down_proj 0.625 -> 0.231; q_proj 0.447 -> 0.119;
+in_proj_z 0.193 -> 0.083; out_proj 0.187 -> 0.097; in_proj_qkv 0.357 -> 0.113;
+k_proj 0.039 -> 0.082; in_proj_a/b 0.014 -> 0.076.
+
+GEMM outputs are recycled through a small per-size buffer pool (`Buf`), which
+removes per-call `cuMemAlloc` jitter (a fresh allocation of some sizes costs
+~0.6 ms on this driver). At most two buffers per size are retained.
+
+Correctness: layer 0 vs AWQ golden max 0.125 mean 9.96e-5 rel_rms 0.306%, and
+full logits max 0.0625 mean 2.57e-3 rel_rms 0.238%, top-1 identical. At 76 rows
+the kernel needs two 64-row M tiles (W read twice and 128 padded rows), which is
+why the speedup there is 1.6x rather than 2x; a 128-row or 128-column tile with
+dynamic shared memory, and fusing the remaining RMSNorm/GDN/attention work, are
+the next steps.

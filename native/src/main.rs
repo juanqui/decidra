@@ -18,7 +18,10 @@ fn main() -> Result<()> {
         "info" => cmd_info(&args[1..]),
         "dequant" => cmd_dequant(&args[1..]),
         "matmul" => cmd_matmul(&args[1..]),
-        other => bail!("unknown command {other:?} (self-test|layer|compare|info|dequant|matmul)"),
+        "alloctest" => cmd_alloctest(),
+        other => bail!(
+            "unknown command {other:?} (self-test|layer|compare|info|dequant|matmul|alloctest)"
+        ),
     }
 }
 
@@ -85,6 +88,25 @@ fn cmd_info(args: &[String]) -> Result<()> {
     println!("model: {}", model.display());
     println!("{cfg:#?}");
     println!("tensors: {}", store.tensor_names().count());
+    Ok(())
+}
+
+fn cmd_alloctest() -> Result<()> {
+    use half::bf16;
+    let gpu = cuda::Gpu::new(0)?;
+    for kib in [64usize, 256, 512, 640, 700, 716, 720, 724, 800, 1024, 2048] {
+        let n = kib * 1024 / 2;
+        let mut times = Vec::new();
+        for _ in 0..6 {
+            gpu.synchronize()?;
+            let t = std::time::Instant::now();
+            let s = gpu.stream.alloc_zeros::<bf16>(n)?;
+            gpu.synchronize()?;
+            times.push(t.elapsed().as_secs_f64() * 1e3);
+            drop(s);
+        }
+        eprintln!("{kib:5} KiB: {times:?}");
+    }
     Ok(())
 }
 
@@ -156,6 +178,9 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     }
     if let Some(n) = opt(args, "--fused-min-n") {
         eng.set_fused_min_n(n.parse().context("--fused-min-n must be an integer")?);
+    }
+    if let Some(m) = opt(args, "--fused-max-m") {
+        eng.set_fused_max_m(m.parse().context("--fused-max-m must be an integer")?);
     }
     if args.iter().any(|a| a == "--no-cache") {
         eng.set_cache_weights(false);
