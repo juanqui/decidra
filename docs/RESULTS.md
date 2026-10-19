@@ -86,7 +86,7 @@ measurement files are kept only for drift context.
 - `/v1/decide` noul/score/choice: 200 with normalized probabilities.
 - `/v1/decisions`: predicate + choice + score, 200.
 - `/v1/systemone`: noul + choice, 200.
-- 256-option choice: 200 in 2.14 s.
+- 256-option choice: 200 in 1.36 s.
 - Image state: 400 `native vision not implemented`.
 - Generation routes: 501 `not_implemented_error`.
 - HMAC signing: `x-jev-signature` matches the exact body; `/health` unsigned.
