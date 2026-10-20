@@ -2,7 +2,7 @@
 //!
 //! The HTTP/API layer, tokenization, prompt construction, decision-head math,
 //! concurrency control, signing, and metrics live here. Inference runs in the
-//! in-process `jev-native` CUDA engine (feature `native`); tests use
+//! in-process `decidra-native` CUDA engine (feature `native`); tests use
 //! [`backend::MockBackend`]. There is no HTTP upstream, Python, PyTorch, or
 //! external model server on the runtime path.
 

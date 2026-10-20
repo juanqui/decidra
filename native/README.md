@@ -1,4 +1,4 @@
-# jev-native
+# decidra-native
 
 Native CUDA inference engine for the JEV-27B checkpoint. The runtime is Rust +
 custom CUDA kernels (+ cuBLAS for BF16 GEMM). It does not import or link an
@@ -28,8 +28,8 @@ otherwise runs the CUDA compiler from a container:
 ```sh
 cd native
 cargo build --release          # default: docker run nvidia/cuda:13.1.1-devel-ubuntu24.04 nvcc -cubin
-JEV_NVCC=/usr/local/cuda/bin/nvcc cargo build --release   # if nvcc is installed
-JEV_CUDA_IMAGE=nvidia/cuda:13.1.1-devel-ubuntu24.04 cargo build --release
+DECIDRA_NVCC=/usr/local/cuda/bin/nvcc cargo build --release   # if nvcc is installed
+DECIDRA_CUDA_IMAGE=nvidia/cuda:13.1.1-devel-ubuntu24.04 cargo build --release
 ```
 
 Runtime requirements (no toolkit needed):
@@ -43,7 +43,7 @@ Runtime requirements (no toolkit needed):
   export LD_LIBRARY_PATH=/srv/models/jev-awq/cudalibs
   ```
 
-  `JEV_CUDA_LIBS` names this directory for scripts; the binary itself only needs
+  `DECIDRA_CUDA_LIBS` names this directory for scripts; the binary itself only needs
   `LD_LIBRARY_PATH` because cuBLAS is loaded with `dlopen`.
 - RTX 4090 / sm_89.
 
@@ -54,15 +54,15 @@ GPU 1 only (GPU 0 is left alone):
 ```sh
 export CUDA_VISIBLE_DEVICES=1 LD_LIBRARY_PATH=/tmp/cudalibs
 
-./target/release/jev-native self-test
+./target/release/decidra-native self-test
 
-./target/release/jev-native layer \
-  --model /tmp/jev-native-ref/tiny \
+./target/release/decidra-native layer \
+  --model /tmp/decidra-native-ref/tiny \
   --tokens '[313,288,307,312,259,311,471,16]' \
   --layer 3 --stage final_norm --out /tmp/final.f32
 
-./target/release/jev-native compare \
-  --ref /tmp/jev-native-ref/tiny/ref/final_hidden.f32 --got /tmp/final.f32
+./target/release/decidra-native compare \
+  --ref /tmp/decidra-native-ref/tiny/ref/final_hidden.f32 --got /tmp/final.f32
 ```
 
 `--tokens` accepts inline JSON or a path to a JSON file. `--stage` is one of
@@ -75,18 +75,18 @@ decoder layers resident; `--no-cache` streams one layer at a time (needed for th
 
 ## Profiling
 
-`JEV_PROFILE=1` records per-stage CUDA events. The debug variables
-`JEV_MARLIN_DEBUG` and `JEV_GEMM_DEBUG` now only log (they no longer call
+`DECIDRA_PROFILE=1` records per-stage CUDA events. The debug variables
+`DECIDRA_MARLIN_DEBUG` and `DECIDRA_GEMM_DEBUG` now only log (they no longer call
 `cudaStreamSynchronize`); per-GEMM timing needs the explicit
-`JEV_GEMM_DEBUG_SYNC=1` opt-in. Do not leave debug variables exported while
+`DECIDRA_GEMM_DEBUG_SYNC=1` opt-in. Do not leave debug variables exported while
 benchmarking: a single synchronize per GEMM serializes the stream and inflates
-the enclosing event windows. Use `env -u JEV_MARLIN_DEBUG -u JEV_GEMM_DEBUG
--u JEV_PROFILE` for clean timings.
+the enclosing event windows. Use `env -u DECIDRA_MARLIN_DEBUG -u DECIDRA_GEMM_DEBUG
+-u DECIDRA_PROFILE` for clean timings.
 
 ## Library API
 
 ```rust
-use jev_native::Engine;
+use decidra_native::Engine;
 
 let engine = Engine::new(model_dir)?;   // validates config, opens shards, CUDA ctx
 engine.preload_all()?;                  // 12.4 GiB packed weights resident, ~5.8 s
@@ -131,8 +131,8 @@ dlopen'd at runtime). 24Q/4KV head_dim 256 BF16 prefill uses FA2 split-K and
 runs 1.80x faster than the native tiled d256 kernel: 16K attention
 567 -> 315 ms over the 16 layers, full 16K forward 6.25 -> 6.00 s. 8K saves
 2.2%, 4K 1.3%, 1K 0.5%. Batched requests, other shapes, and load failures use
-the native tiled/warp kernels. Disable with `JEV_FLASHINFER_ATTENTION=0`,
-change the threshold with `JEV_FLASHINFER_MIN_SEQ` (default 1024). See
+the native tiled/warp kernels. Disable with `DECIDRA_FLASHINFER_ATTENTION=0`,
+change the threshold with `DECIDRA_FLASHINFER_MIN_SEQ` (default 1024). See
 `native/third_party/flashinfer/INTEGRATION.md`.
 
 Long-context latency (Marlin weights, resident, SM89 RTX 4090, mixed W4A8-INT8):
@@ -152,7 +152,7 @@ across repeated 16K requests (low-memory pool from 12,288 tokens). The embedding
 table is resident on the GPU (2.37 GiB, row gather on-device).
 
 Long-context quality gate against the CPU AWQ/SDPA probes
-(`/tmp/jev-native-ref/long-context/probes`, Marlin + tiled attention):
+(`/tmp/decidra-native-ref/long-context/probes`, Marlin + tiled attention):
 
 | probe | final hidden max / mean / rel_rms / cosine | head logits diff (3721, 1802) | two-way prob delta | top-1 |
 |---|---|---|---|---|
@@ -211,7 +211,7 @@ head is never required in full.
 
 ## Status
 
-Validated against `/tmp/jev-native-ref/tiny` (4 layers, GDN + full attention):
+Validated against `/tmp/decidra-native-ref/tiny` (4 layers, GDN + full attention):
 
 | tensor | max_abs | mean_abs | rel_rms |
 |---|---|---|---|
@@ -226,7 +226,7 @@ Validated against `/tmp/jev-native-ref/tiny` (4 layers, GDN + full attention):
 Per-layer isolated errors are at the bf16 rounding floor (<=1 bf16 ulp for most
 elements).
 
-AWQ 27B against `/tmp/jev-native-ref/golden-27b` (36-token prompt, CPU golden
+AWQ 27B against `/tmp/decidra-native-ref/golden-27b` (36-token prompt, CPU golden
 from `compressed_tensors` dequant):
 
 | tensor | max_abs | mean_abs | rel_rms | cosine |
@@ -288,9 +288,9 @@ split raw logits [2.7344, 1.7813] vs CPU golden [2.6719, 1.7891] (two-way delta
 
 The chunked TF32 kernel is also used for **seq >= `gdn_chunked_min_seq`
 (default 64)** when chunked prefill is enabled; the server enables it by
-default (`JEV_NATIVE_GDN_CHUNKED=true`), and shorter prompts keep the shared
+default (`DECIDRA_NATIVE_GDN_CHUNKED=true`), and shorter prompts keep the shared
 fallback. Set `--gdn-chunked-min-seq N` on the CLI or
-`JEV_NATIVE_GDN_CHUNKED_MIN_SEQ=N` for the server (0 forces every length).
+`DECIDRA_NATIVE_GDN_CHUNKED_MIN_SEQ=N` for the server (0 forces every length).
 
 Measured at 54 tokens on GPU1 (suite `r22`): shared [2.6875, 1.7734],
 chunked TF32 [2.7031, 1.7891], CPU golden [2.6719, 1.7891]. Suite28 with the
@@ -405,28 +405,28 @@ Server suite (batch=1, CPU AWQ golden): **28/28, KL 3.269e-5, MAE 7.166e-4, max
 Server: c1/c8/c16 **25.8 / 57.0 / 56.9 req/s**; long 4K/8K/16K **0.833 / 1.711 /
 3.740 s**, all at 100% GPU for long prompts.
 
-The environment knobs are `JEV_NATIVE_INT8` (default true),
-`JEV_NATIVE_INT8_EXCLUDE` (modules kept on W4A16),
-`JEV_NATIVE_INT8_ALL_LAYERS` (layer subset that runs all-linear INT8),
-`JEV_NATIVE_INT8_GROUP_SCALE` (default true),
-`JEV_NATIVE_INT8_GROUP_EXCLUDE` (modules kept on per-token scales) and
-`JEV_NATIVE_INT8_CLIP` (abs-max clip factor, default 1.0). The CLI equivalents
+The environment knobs are `DECIDRA_NATIVE_INT8` (default true),
+`DECIDRA_NATIVE_INT8_EXCLUDE` (modules kept on W4A16),
+`DECIDRA_NATIVE_INT8_ALL_LAYERS` (layer subset that runs all-linear INT8),
+`DECIDRA_NATIVE_INT8_GROUP_SCALE` (default true),
+`DECIDRA_NATIVE_INT8_GROUP_EXCLUDE` (modules kept on per-token scales) and
+`DECIDRA_NATIVE_INT8_CLIP` (abs-max clip factor, default 1.0). The CLI equivalents
 are `--marlin-int8`, `--int8-exclude`, `--int8-all-layers`, `--int8-group-scale`,
 `--int8-group-exclude`, `--int8-clip`, and `--gdn-chunked-min-seq` for the GDN
 threshold. `--marlin-int8` without exclusions runs all-linear INT8 (group-64 by
 default in the CLI only if `--int8-group-scale` is passed).
 
-Marlin launches the whole M in one kernel by default (`JEV_MARLIN_CHUNK=0`,
-the kernel's internal `parallel` loop); `JEV_MARLIN_CHUNK=N` caps each launch
+Marlin launches the whole M in one kernel by default (`DECIDRA_MARLIN_CHUNK=0`,
+the kernel's internal `parallel` loop); `DECIDRA_MARLIN_CHUNK=N` caps each launch
 at roughly N rows. Full-M removes the outer 1024-row split (16 launches at 16K
 become 2: 16320 + tail) and measures 16K 5991 -> 5935 ms, 4K 1432 -> 1425 ms;
 the 4K/8K/16K probe deltas stay inside the W4A16 envelope and suite28 is
 bit-identical (short rows are a single launch either way).
 
-The environment knobs are `JEV_NATIVE_INT8` (server default true),
-`JEV_NATIVE_INT8_EXCLUDE` (comma-separated module substrings),
-`JEV_NATIVE_INT8_ALL_LAYERS` (layer subset that runs all-linear INT8) and
-`JEV_NATIVE_INT8_CLIP` (abs-max clip factor, default 1.0). The CLI equivalents
+The environment knobs are `DECIDRA_NATIVE_INT8` (server default true),
+`DECIDRA_NATIVE_INT8_EXCLUDE` (comma-separated module substrings),
+`DECIDRA_NATIVE_INT8_ALL_LAYERS` (layer subset that runs all-linear INT8) and
+`DECIDRA_NATIVE_INT8_CLIP` (abs-max clip factor, default 1.0). The CLI equivalents
 are `--marlin-int8`, `--int8-exclude`, `--int8-all-layers`, `--int8-clip`, and
 `--gdn-chunked-min-seq` for the GDN threshold. `--marlin-int8` without
 exclusions runs all-linear INT8.
@@ -436,5 +436,5 @@ set elsewhere): `first:N` and `alt:N` fail suite28 for N=8..32; the largest
 passing subset is **`last:8`** (layers 56-63): 28/28, KL 2.37e-5, MAE 6.91e-4,
 max 7.48e-3. On the 500-row holdout it agrees with the selective config on
 481/500 top-1; every flip is a 0.5/0.5 or <0.008-margin tie. This subset is
-the **server default** (`JEV_NATIVE_INT8_ALL_LAYERS=last:8`); it improves the
+the **server default** (`DECIDRA_NATIVE_INT8_ALL_LAYERS=last:8`); it improves the
 suite margin and costs ~4 ms at 16K. Set it empty to disable.

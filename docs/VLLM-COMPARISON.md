@@ -9,12 +9,12 @@ GPU 1 only.
 - **GPU**: GPU 1, RTX 4090 24 GB; GPU 0 was not used. Clocks ~2,910 MHz SM /
   11,451 MHz memory; power 280–440 W depending on load.
 - **Native**: release binary with `--features native`. Defaults:
-  `JEV_NATIVE_MARLIN=true`, `JEV_NATIVE_INT8=true`,
-  `JEV_NATIVE_INT8_GROUP_SCALE=true` (group-64 activation scales; `mlp.gate_proj`
-  stays on the faster per-token epilogue), `JEV_NATIVE_GDN_CHUNKED=true`,
-  FlashInfer attention enabled (`JEV_FLASHINFER_MIN_SEQ=1024`),
-  `JEV_NATIVE_MAX_BATCH=8`, `JEV_NATIVE_BATCH_WINDOW_US=2000`,
-  `JEV_NATIVE_MAX_BATCH_TOKENS=16384`. `JEV_DECISION_CACHE_SIZE=0` so unique
+  `DECIDRA_NATIVE_MARLIN=true`, `DECIDRA_NATIVE_INT8=true`,
+  `DECIDRA_NATIVE_INT8_GROUP_SCALE=true` (group-64 activation scales; `mlp.gate_proj`
+  stays on the faster per-token epilogue), `DECIDRA_NATIVE_GDN_CHUNKED=true`,
+  FlashInfer attention enabled (`DECIDRA_FLASHINFER_MIN_SEQ=1024`),
+  `DECIDRA_NATIVE_MAX_BATCH=8`, `DECIDRA_NATIVE_BATCH_WINDOW_US=2000`,
+  `DECIDRA_NATIVE_MAX_BATCH_TOKENS=16384`. `DECIDRA_DECISION_CACHE_SIZE=0` so unique
   prompts are actually uncached. One resident server; all levels run back to back.
 - **vLLM**: `vllm/vllm-openai:v0.31.0` (vLLM 0.31.0, Torch 2.13.0+cu130,
   CUDA 13.0), exact A_ref flags `--logprobs-mode processed_logprobs
@@ -116,7 +116,7 @@ The prior native exact-decision cache result remains much faster than vLLM on
 repeated prompts (warm c1 ~2,989 req/s / 0.330 ms vs vLLM ~19.4 req/s /
 51.1 ms; c8 ~2,298 / 1.258 ms vs vLLM ~41.0 / 193 ms). vLLM's 1,568-token
 prefix block cannot cache a 58-token prompt. This comparison used
-`JEV_DECISION_CACHE_SIZE=0` for unique-prompt fairness and is not a cache test.
+`DECIDRA_DECISION_CACHE_SIZE=0` for unique-prompt fairness and is not a cache test.
 
 ## Kernel/execution stacks
 

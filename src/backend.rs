@@ -2,7 +2,7 @@
 //!
 //! `DecisionEngine` only needs raw head logits for a prompt and a list of token
 //! ids. The shipped implementation is [`NativeBackend`](crate::native_backend)
-//! (in-process `jev-native` CUDA engine); [`MockBackend`] keeps the API tests
+//! (in-process `decidra-native` CUDA engine); [`MockBackend`] keeps the API tests
 //! independent of a GPU and of the native crate.
 
 use std::{future::Future, pin::Pin, sync::Arc};

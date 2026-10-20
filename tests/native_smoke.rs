@@ -9,14 +9,14 @@
 
 #![cfg(feature = "native")]
 
-use jev_engine::{backend::Backend, config::Config, native_backend::NativeBackend};
+use decidra::{backend::Backend, config::Config, native_backend::NativeBackend};
 
 #[test]
 #[ignore = "requires the AWQ checkpoint and GPU1 (use scripts/native-smoke.sh)"]
 fn native_forward_produces_finite_head_logits() {
     let config = Config::from_env().unwrap();
     let backend = NativeBackend::load(&config).unwrap();
-    let prompt = jev_engine::prompt::text_prompt(
+    let prompt = decidra::prompt::text_prompt(
         "noul",
         "native smoke test",
         "Is the native engine ready?",
@@ -41,9 +41,9 @@ fn native_forward_produces_finite_head_logits() {
 #[test]
 #[ignore = "requires the AWQ checkpoint and GPU1 (use scripts/native-smoke.sh)"]
 fn int8_tail_rows_match_head_rows() {
-    let model = std::env::var("JEV_NATIVE_MODEL")
+    let model = std::env::var("DECIDRA_NATIVE_MODEL")
         .unwrap_or_else(|_| "/srv/models/jev-awq/awq-w4a16-v2".to_owned());
-    let engine = jev_native::Engine::new(std::path::Path::new(&model)).unwrap();
+    let engine = decidra_native::Engine::new(std::path::Path::new(&model)).unwrap();
     engine.set_marlin(true);
     engine.set_marlin_int8(true);
     engine.preload_all().unwrap();

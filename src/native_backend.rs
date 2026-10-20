@@ -1,7 +1,7 @@
-//! In-process backend: the native CUDA engine (`jev-native`) and the existing
+//! In-process backend: the native CUDA engine (`decidra-native`) and the existing
 //! `tokenizers` tokenizer. No HTTP hop, no Python, no external model server.
 //!
-//! `jev_native::Engine` is `Send` but owns one CUDA context/stream and is not
+//! `decidra_native::Engine` is `Send` but owns one CUDA context/stream and is not
 //! safe for concurrent forwards. It is moved into a dedicated worker thread
 //! (see [`crate::batch`]); requests are tokenized on the async reactor, queued,
 //! and executed in small FIFO batches. The reactor never blocks on a forward.
@@ -22,7 +22,7 @@ use crate::{
 
 /// Owns the engine on the batch worker thread.
 struct EngineExecutor {
-    engine: jev_native::Engine,
+    engine: decidra_native::Engine,
     /// Whether the queue may submit multi-request batches. When false the
     /// queue is configured for single requests anyway; this flag also lets the
     /// adapter take the single-call path explicitly.
@@ -109,7 +109,7 @@ impl NativeBackend {
             &config.hf_snapshot,
         )?;
         let started = Instant::now();
-        let engine = jev_native::Engine::new(&config.native_model).with_context(|| {
+        let engine = decidra_native::Engine::new(&config.native_model).with_context(|| {
             format!(
                 "opening native engine checkpoint {}",
                 config.native_model.display()
@@ -204,10 +204,10 @@ impl Backend for NativeBackend {
             // The key is the exact token/head-id pair; no prefix matching.
             let cache_key = if self.cache.enabled() {
                 if let Some(logits) = self.cache.get(&tokens, &ids) {
-                    metrics::counter!("jev_decision_cache_hits_total").increment(1);
+                    metrics::counter!("decidra_decision_cache_hits_total").increment(1);
                     return Ok(logits);
                 }
-                metrics::counter!("jev_decision_cache_misses_total").increment(1);
+                metrics::counter!("decidra_decision_cache_misses_total").increment(1);
                 Some((tokens.clone(), ids.clone()))
             } else {
                 None
@@ -216,13 +216,12 @@ impl Backend for NativeBackend {
             let result = receiver.await.map_err(|_| {
                 EngineError::Internal("native batch worker dropped the request".to_owned())
             })?;
-            metrics::histogram!("jev_backend_forward_seconds")
+            metrics::histogram!("decidra_backend_forward_seconds")
                 .record(started.elapsed().as_secs_f64());
             match &result {
-                Ok(_) => {
-                    metrics::counter!("jev_backend_requests_total", "status" => "ok").increment(1)
-                }
-                Err(_) => metrics::counter!("jev_backend_requests_total", "status" => "error")
+                Ok(_) => metrics::counter!("decidra_backend_requests_total", "status" => "ok")
+                    .increment(1),
+                Err(_) => metrics::counter!("decidra_backend_requests_total", "status" => "error")
                     .increment(1),
             }
             let logits = result.map_err(EngineError::Backend)?;
@@ -236,7 +235,7 @@ impl Backend for NativeBackend {
             // Only successful, length-checked logits are cached.
             if let Some((key_tokens, key_ids)) = cache_key {
                 self.cache.insert(&key_tokens, &key_ids, logits.clone());
-                metrics::gauge!("jev_decision_cache_entries").set(self.cache.len() as f64);
+                metrics::gauge!("decidra_decision_cache_entries").set(self.cache.len() as f64);
             }
             Ok(logits)
         })

@@ -1,5 +1,4 @@
 //! CUDA context, cubin module, cuBLAS handle.
-use std::fs;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -22,17 +21,13 @@ impl Gpu {
             .with_context(|| format!("creating CUDA context on device {ordinal}"))?;
         let stream = ctx.default_stream();
 
-        let cubin_path = env!("JEV_KERNELS_CUBIN");
-        let marlin_path = env!("JEV_MARLIN_CUBIN");
-        let cubin = fs::read(cubin_path)
-            .with_context(|| format!("reading compiled kernels at {cubin_path}"))?;
+        let cubin: &[u8] = include_bytes!(env!("DECIDRA_KERNELS_CUBIN"));
+        let marlin: &[u8] = include_bytes!(env!("DECIDRA_MARLIN_CUBIN"));
         let module = ctx
-            .load_module(Ptx::from_binary(cubin))
+            .load_module(Ptx::from_binary(cubin.to_vec()))
             .context("loading kernel cubin")?;
-        let marlin = fs::read(marlin_path)
-            .with_context(|| format!("reading compiled Marlin kernels at {marlin_path}"))?;
         let marlin_module = ctx
-            .load_module(Ptx::from_binary(marlin))
+            .load_module(Ptx::from_binary(marlin.to_vec()))
             .context("loading Marlin cubin")?;
         let blas = CudaBlas::new(stream.clone()).context("creating cuBLAS handle")?;
         Ok(Self {

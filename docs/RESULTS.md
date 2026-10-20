@@ -73,7 +73,7 @@ scratch) and 16K peaks at **20.11 GiB**, flat across repeated requests. Engine-o
   `/v1/systemone`, HMAC signing, OpenAI-compatible `/v1/chat/completions` and
   `/v1/completions`, and 400/502/504 semantics.
 - `cargo check --all-targets --features native` compiles the server against the public
-  `jev_native::Engine`, `preload_all`, `set_marlin`, `set_cache_weights`,
+  `decidra_native::Engine`, `preload_all`, `set_marlin`, `set_cache_weights`,
   `set_fused_w4a16`, and `decision_logits` API.
 - `--check-config` validates the production tokenizer/head labels without loading the GPU.
 - `scripts/native-smoke.sh` runs one real forward and asserts two finite head logits.
@@ -81,7 +81,7 @@ scratch) and 16K peaks at **20.11 GiB**, flat across repeated requests. Engine-o
 ### Live server vs CPU AWQ golden (primary)
 
 Measured with the release binary on GPU 1 (resident weights, Marlin W4A16 default
-`JEV_NATIVE_MARLIN=true`) against `eval/data/awq-cpu-suite28.json`, 28 rows:
+`DECIDRA_NATIVE_MARLIN=true`) against `eval/data/awq-cpu-suite28.json`, 28 rows:
 
 | metric | value |
 |---|---|
@@ -136,7 +136,7 @@ measurement files are kept only for drift context.
   **30.35-31.41 / 218.9-254.3 ms**. One 16K probe returned a single 502 during the
   first long-context run; it did not reproduce in seven subsequent 16K attempts or the
   five prior 17.7K runs, and the root cause was not captured
-  (`jev_backend_requests_total{status="error"} 1`).
+  (`decidra_backend_requests_total{status="error"} 1`).
 - Short benchmark, serialized build (16 unique requests/level, gated): c=1
   **16.444 req/s**, p50 **60.9 ms**; c=4 **16.826 req/s**, p50 **225.7 ms**. Throughput
   was flat because forwards were serialized; c=4 latency was queueing.
@@ -173,13 +173,13 @@ measurement files are kept only for drift context.
   batch GEMM path, not the INT8 selection.
   Two concurrent 4K requests differ from their single-run probabilities by at most
   **4.2e-5** with identical top-1.
-- Batch metrics observed during the sweep (`jev_native_batch_size` mean per level):
+- Batch metrics observed during the sweep (`decidra_native_batch_size` mean per level):
   c=1 **1.0**, c=2 **2.0**, c=4 **4.0**, c=8 **5.33**, c=16 **5.33-8.0**;
-  `jev_native_batch_queue_depth` peaked at **8** at c=16.
+  `decidra_native_batch_queue_depth` peaked at **8** at c=16.
 
 ## Exact-decision cache
 
-`JEV_DECISION_CACHE_SIZE` (default **256**, `0` disables) adds a thread-safe LRU in
+`DECIDRA_DECISION_CACHE_SIZE` (default **256**, `0` disables) adds a thread-safe LRU in
 `src/cache.rs` keyed by the exact `(token ids, head ids)` pair and holding raw head
 logits. `NativeBackend::logits` checks it after tokenization and before enqueueing;
 successful, length-checked forwards insert, errors are never cached, and hits return a
@@ -193,8 +193,8 @@ clone without touching the engine.
 - **Repeated exact prompt, c=8, 16 concurrent**: cold round **72.4 req/s, p50 70.9 ms,
   p95 216.5 ms** (the first concurrent wave misses); warm rounds **1,560-2,000 req/s,
   p50 2.5-3.1 ms** versus 30.26 req/s / 225.8 ms uncached.
-- Cache metrics: `jev_decision_cache_hits_total`, `jev_decision_cache_misses_total`,
-  `jev_decision_cache_entries` (81 entries after the validation run). Memory is
+- Cache metrics: `decidra_decision_cache_hits_total`, `decidra_decision_cache_misses_total`,
+  `decidra_decision_cache_entries` (81 entries after the validation run). Memory is
   negligible next to the 13.8 GiB process RSS: a 70-token entry is a few hundred bytes,
   and the absolute worst case (256 x 35K-token prompts) is ~36 MB.
 - **Limitation**: exact prompt+ids only. Shared-prefix reuse (KV cache plus GDN state
@@ -202,9 +202,9 @@ clone without touching the engine.
 
 ## Chunked GDN prefill
 
-`JEV_NATIVE_GDN_CHUNKED=true` (default) selects the TF32 WMMA chunked delta-rule
+`DECIDRA_NATIVE_GDN_CHUNKED=true` (default) selects the TF32 WMMA chunked delta-rule
 prefill (native commit `7c78a3f`) for sequences **>= 64 tokens**
-(`JEV_NATIVE_GDN_CHUNKED_MIN_SEQ`, default 64); shorter prompts keep the
+(`DECIDRA_NATIVE_GDN_CHUNKED_MIN_SEQ`, default 64); shorter prompts keep the
 shared/split recurrence, and `false` restores the legacy path everywhere.
 
 - GDN stage **2.1x** faster; full forward **1K 488 -> 395 ms (-17.7%)** and
@@ -254,13 +254,13 @@ epilogue, full-M) at batch=1: 28/28, KL 3.269e-5, MAE **7.166e-4**, max **1.027e
 4K/8K/16K probe logits: FI on vs
 golden [-0.0469,+0.0313], [+0.0156,-0.0313], [+0.0156,0.0], within the
 W4A16 envelope with unchanged top-1. Disable with
-`JEV_FLASHINFER_ATTENTION=0`; `JEV_FLASHINFER_MIN_SEQ` sets the threshold.
+`DECIDRA_FLASHINFER_ATTENTION=0`; `DECIDRA_FLASHINFER_MIN_SEQ` sets the threshold.
 
 ## Marlin full-M launches
 
 The W4A16 and INT8 Marlin paths now launch the whole M once by default
-(`JEV_MARLIN_CHUNK=0`, the kernel's internal `parallel` loop) instead of
-splitting into <=1024-row launches; `JEV_MARLIN_CHUNK=N` restores a cap. At
+(`DECIDRA_MARLIN_CHUNK=0`, the kernel's internal `parallel` loop) instead of
+splitting into <=1024-row launches; `DECIDRA_MARLIN_CHUNK=N` restores a cap. At
 16K this is 2 launches instead of 16 (16320 + tail): full forward 5991 ->
 5935 ms (-0.9%), 4K 1432 -> 1425 ms (-0.5%), INT8 16K 5184 -> 5133 ms
 (-1.0%), 1K unchanged. suite28 is bit-identical and passes; 4K/8K/16K probe
@@ -270,7 +270,7 @@ inside the existing envelope and with unchanged top-1.
 ## Marlin layer-wise INT8 and tile probes
 
 Layer subsets that run all-linear INT8 on top of the selective bypass
-(`JEV_NATIVE_INT8_ALL_LAYERS`): `last:8` (layers 56-63) is the largest passing
+(`DECIDRA_NATIVE_INT8_ALL_LAYERS`): `last:8` (layers 56-63) is the largest passing
 set (28/28, KL 2.37e-5, MAE 6.91e-4, max 7.48e-3); `first:N` and `alt:N` fail
 for N=8..32, and `last:10/12/14/16/24/32` fail. Held-out 500 rows: 481/500
 top-1 vs the selective config, all flips being <=0.008-margin ties. The speed
@@ -292,25 +292,25 @@ enqueue `{tokens, head_ids, oneshot reply}`, and await the reply; the worker own
 CUDA context. Batch formation:
 
 - block for the first request;
-- drain more until the window (`JEV_NATIVE_BATCH_WINDOW_US`, default **2000 µs**),
-  `JEV_NATIVE_MAX_BATCH` (default **8**), or `JEV_NATIVE_MAX_BATCH_TOKENS`
+- drain more until the window (`DECIDRA_NATIVE_BATCH_WINDOW_US`, default **2000 µs**),
+  `DECIDRA_NATIVE_MAX_BATCH` (default **8**), or `DECIDRA_NATIVE_MAX_BATCH_TOKENS`
   (default **16384**) is reached;
 - strict FIFO; a request never spans batches; a request that does not fit is pushed
   back to the head for the next batch;
 - a single request larger than the token cap (e.g. 16K/32K) runs alone;
 - closed client receivers are skipped; executor errors are returned per request;
-- `JEV_NATIVE_BATCH=false` sets max batch 1 and window 0.
+- `DECIDRA_NATIVE_BATCH=false` sets max batch 1 and window 0.
 
-Lone requests pay the window; `JEV_NATIVE_BATCH_WINDOW_US=0` removes it. The default
+Lone requests pay the window; `DECIDRA_NATIVE_BATCH_WINDOW_US=0` removes it. The default
 2 ms window is the smallest that keeps a lone request near 62 ms p50. The worker
 executes one batch at a time; there is no separate in-flight semaphore, so extra
 concurrency only queues. Throughput saturates at batch 4; `MAX_BATCH=8` allows a burst
 to drain in one pass, while 12/16 measured no gain and worse p50.
 
-Metrics: `jev_native_batch_size`, `jev_native_batch_queue_depth`,
-`jev_native_batch_wait_seconds`, `jev_decision_cache_hits_total`,
-`jev_decision_cache_misses_total`, `jev_decision_cache_entries`, plus the existing
-`jev_backend_*` counters.
+Metrics: `decidra_native_batch_size`, `decidra_native_batch_queue_depth`,
+`decidra_native_batch_wait_seconds`, `decidra_decision_cache_hits_total`,
+`decidra_decision_cache_misses_total`, `decidra_decision_cache_entries`, plus the existing
+`decidra_backend_*` counters.
 
 ## Performance
 

@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Smoke-test a running jev-engine instance (native backend). python3 is used
+# Smoke-test a running decidra instance (native backend). python3 is used
 # only for JSON assertions in this development script.
 set -euo pipefail
 
-BASE="${JEV_SMOKE_URL:-${JEV_URL:-http://127.0.0.1:8501}}"
+BASE="${DECIDRA_SMOKE_URL:-${DECIDRA_URL:-http://127.0.0.1:8501}}"
 BASE="${BASE%/}"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT

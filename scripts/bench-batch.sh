@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Run the batching concurrency sweep against an already-running jev-engine.
+# Run the batching concurrency sweep against an already-running decidra.
 #
 # Requires:
-#   - jev-engine on JEV_SMOKE_URL (default http://127.0.0.1:8501)
+#   - decidra on DECIDRA_SMOKE_URL (default http://127.0.0.1:8501)
 #   - Python dependencies from eval/requirements.txt (dev tooling only)
 #
 # This script never starts or stops the server and never touches the GPU.
@@ -15,13 +15,13 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVAL="$ROOT/eval"
 PYTHON="${PYTHON:-python3}"
 
-RUST_URL="${JEV_SMOKE_URL:-${JEV_DECIDE_URL:-http://127.0.0.1:8501}}"
-OUT="${JEV_BATCH_OUT:-$EVAL/out/bench_batch.json}"
-CONCURRENCY="${JEV_BATCH_CONCURRENCY:-1,2,4,8,16}"
-REQUESTS="${JEV_BATCH_REQUESTS:-16}"
-TOKENS="${JEV_BATCH_TOKENS:-69}"
-CHARS_PER_TOKEN="${JEV_BATCH_CHARS_PER_TOKEN:-3.38}"
-WARMUP="${JEV_BATCH_WARMUP:-3}"
+RUST_URL="${DECIDRA_SMOKE_URL:-${DECIDRA_DECIDE_URL:-http://127.0.0.1:8501}}"
+OUT="${DECIDRA_BATCH_OUT:-$EVAL/out/bench_batch.json}"
+CONCURRENCY="${DECIDRA_BATCH_CONCURRENCY:-1,2,4,8,16}"
+REQUESTS="${DECIDRA_BATCH_REQUESTS:-16}"
+TOKENS="${DECIDRA_BATCH_TOKENS:-69}"
+CHARS_PER_TOKEN="${DECIDRA_BATCH_CHARS_PER_TOKEN:-3.38}"
+WARMUP="${DECIDRA_BATCH_WARMUP:-3}"
 
 RUST_URL="${RUST_URL%/}"
 mkdir -p "$(dirname "$OUT")"
@@ -37,7 +37,7 @@ need curl
 need "$PYTHON"
 
 if ! curl -fsS --max-time 3 "$RUST_URL/health" >/dev/null 2>&1; then
-  echo "error: jev-engine is not healthy at $RUST_URL/health" >&2
+  echo "error: decidra is not healthy at $RUST_URL/health" >&2
   exit 1
 fi
 

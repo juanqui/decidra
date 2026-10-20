@@ -59,8 +59,8 @@ per-row activation scale in the epilogue. Two granularities are compiled:
   the shipped kernel uses a fused multiply-add in the group epilogue to trim that to
   ~30% (4K `up` 2.14 vs 1.62 ms/op).
 
-The granularity is fixed per module at repack (`JEV_NATIVE_INT8_GROUP_SCALE`,
-`JEV_NATIVE_INT8_GROUP_EXCLUDE`). Default: `gate_proj` per-token; the expanded set
+The granularity is fixed per module at repack (`DECIDRA_NATIVE_INT8_GROUP_SCALE`,
+`DECIDRA_NATIVE_INT8_GROUP_EXCLUDE`). Default: `gate_proj` per-token; the expanded set
 group-64; `o_proj/v_proj/k_proj` stay W4A16 outside layers 56-63; layers 56-63 are
 all-linear INT8. Split-K correctness: a partial slice starts at group
 `slice_row * (thread_k_blocks / group_blocks)`; forgetting this offset corrupts every
@@ -69,7 +69,7 @@ MAE 7.166e-4, max Δ 1.027e-2.
 
 ### Marlin W4A16 (shipped default)
 
-`JEV_NATIVE_MARLIN=true` repacks the compressed-tensors layout on the GPU into Marlin's
+`DECIDRA_NATIVE_MARLIN=true` repacks the compressed-tensors layout on the GPU into Marlin's
 `[K/16, 2N]` layout during `preload_all` and runs the vendored Marlin W4A16 kernel
 (Apache-2.0, `native/third_party/marlin`). Repacked qweight, scales, and zero points match
 the reference GPTQ-Marlin repack / scale / zero-point permutations bit-exactly for a
@@ -121,10 +121,10 @@ Long-context correctness against CPU AWQ/SDPA probes (Marlin + tiled FA2 + split
 All long-context suite cases are correct, and **32K is the verified maximum context** on
 24 GB.
 
-### Fallback paths (`JEV_NATIVE_MARLIN=false`)
+### Fallback paths (`DECIDRA_NATIVE_MARLIN=false`)
 
 Dequantize one module into a reusable BF16 workspace (largest module 17408×5120) and run
-cuBLAS BF16 GEMM. With `JEV_NATIVE_FUSED_W4A16=true`, the hybrid fused kernel dequantizes
+cuBLAS BF16 GEMM. With `DECIDRA_NATIVE_FUSED_W4A16=true`, the hybrid fused kernel dequantizes
 into padded shared memory and runs BF16 WMMA (BM=BN=64, BK=64) with double-buffered
 staging for `N >= 5120 && M <= 256`; otherwise it falls back to dequant + cuBLAS. The
 fused path ignores the Marlin-specific repacked layout.
@@ -135,7 +135,7 @@ fused path ignores the Marlin-specific repacked layout.
 With Marlin the repacked layout uses **13.1 GiB**, the resident embedding table adds
 **2.37 GiB**, and preload takes **9.1 s**; the
 dequant fallback uses ~12.7 GiB / 5.8 s. Embedding rows are gathered on-device from the resident table
-(the host mmap gather remains as the `JEV_NATIVE_GPU_EMBED=false` fallback); lm_head rows are gathered/streamed so the 2.5 GiB head is
+(the host mmap gather remains as the `DECIDRA_NATIVE_GPU_EMBED=false` fallback); lm_head rows are gathered/streamed so the 2.5 GiB head is
 never required in full.
 
 The alternative `--no-cache` CLI mode streams one layer at a time (needed for the 51 GiB

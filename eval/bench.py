@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Concurrency and long-context benchmark for a JEV ``/v1/decide`` backend.
+"""Concurrency and long-context benchmark for a Decidra ``/v1/decide`` backend.
 
 Short mode replays the 28-row decision suite (with a per-request nonce so no
 two requests share a prompt prefix).  Long mode builds synthetic, *unique*
@@ -14,8 +14,8 @@ explicitly want to measure a warm/shared-prefix case.
 Batch mode is the batching/scheduler sweep: each concurrency level sends a
 fixed number of unique decision prompts of approximately ``--batch-tokens``
 tokens (default 69).  When the server exposes ``/metrics``, the result also
-records the ``jev_native_batch_size`` histogram and the
-``jev_native_batch_queue_depth`` gauge (sampled during the level).
+records the ``decidra_native_batch_size`` histogram and the
+``decidra_native_batch_queue_depth`` gauge (sampled during the level).
 """
 from __future__ import annotations
 
@@ -248,16 +248,16 @@ def batch_metrics_snapshot(text: str | None) -> dict[str, Any] | None:
         return None
     samples = _prometheus_samples(text)
     buckets: dict[str, float] = {}
-    for labels, value in samples.get("jev_native_batch_size_bucket", []):
+    for labels, value in samples.get("decidra_native_batch_size_bucket", []):
         buckets[labels.get("le", "")] = buckets.get(labels.get("le", ""), 0.0) + value
-    count = sum(value for _, value in samples.get("jev_native_batch_size_count", []))
-    total = sum(value for _, value in samples.get("jev_native_batch_size_sum", []))
-    queue_values = [value for _, value in samples.get("jev_native_batch_queue_depth", [])]
+    count = sum(value for _, value in samples.get("decidra_native_batch_size_count", []))
+    total = sum(value for _, value in samples.get("decidra_native_batch_size_sum", []))
+    queue_values = [value for _, value in samples.get("decidra_native_batch_queue_depth", [])]
     batch_size = (
         {"count": count, "sum": total, "buckets": buckets}
-        if samples.get("jev_native_batch_size_bucket")
-        or samples.get("jev_native_batch_size_count")
-        or samples.get("jev_native_batch_size_sum")
+        if samples.get("decidra_native_batch_size_bucket")
+        or samples.get("decidra_native_batch_size_count")
+        or samples.get("decidra_native_batch_size_sum")
         else None
     )
     queue_depth = max(queue_values) if queue_values else None
@@ -493,7 +493,7 @@ def parse_ints(text: str) -> list[int]:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--url", default=os.environ.get("JEV_DECIDE_URL", "http://127.0.0.1:8501"))
+    parser.add_argument("--url", default=os.environ.get("DECIDRA_DECIDE_URL", "http://127.0.0.1:8501"))
     parser.add_argument("--model", default=None)
     parser.add_argument(
         "--mode", choices=["short", "long", "both", "batch"], default="short"

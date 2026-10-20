@@ -1,4 +1,4 @@
-use jev_native::{Engine, Stage, config, cuda, tensor};
+use decidra_native::{Engine, Stage, config, cuda, tensor};
 
 use std::path::Path;
 use std::path::PathBuf;

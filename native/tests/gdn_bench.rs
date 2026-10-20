@@ -1,16 +1,16 @@
 //! Kernel-level benchmark + correctness for the chunked GDN kernels.
 //!
 //! Run on GPU1:
-//! `CUDA_VISIBLE_DEVICES=1 cargo test -p jev-native --release --test gdn_bench -- --ignored --nocapture`
+//! `CUDA_VISIBLE_DEVICES=1 cargo test -p decidra-native --release --test gdn_bench -- --ignored --nocapture`
 //!
 //! Synthetic data, no checkpoint. Reports kernel-only wall time per sequence
 //! length and compares each chunked variant against `gdn_recurrent_split`.
 
 use cudarc::driver::sys::CUfunction_attribute_enum;
 use cudarc::driver::{CudaSlice, DevicePtr, DevicePtrMut, LaunchConfig, PushKernelArg};
+use decidra_native::cuda::Gpu;
+use decidra_native::kernels::{self, Kernels};
 use half::bf16;
-use jev_native::cuda::Gpu;
-use jev_native::kernels::{self, Kernels};
 
 const PHASES: [&str; 10] = [
     "load", "KK^T", "A mask", "solve", "Vnew", "Q load", "QS", "QK+mask", "output", "state",

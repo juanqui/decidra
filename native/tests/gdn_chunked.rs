@@ -1,15 +1,15 @@
 //! GPU A/B check for the experimental chunked GDN kernel.
 //!
 //! Run explicitly on GPU1:
-//! `cargo test -p jev-native --test gdn_chunked -- --ignored --nocapture`
+//! `cargo test -p decidra-native --test gdn_chunked -- --ignored --nocapture`
 //!
 //! Ignored by default: it needs a CUDA device. It uses synthetic data (no
 //! checkpoint) and compares the f32 chunked path against `gdn_recurrent_split`.
 
 use cudarc::driver::CudaSlice;
+use decidra_native::cuda::Gpu;
+use decidra_native::kernels::{self, Kernels};
 use half::bf16;
-use jev_native::cuda::Gpu;
-use jev_native::kernels::{self, Kernels};
 
 fn host_data(n: usize, a: f32, b: f32) -> Vec<f32> {
     (0..n)

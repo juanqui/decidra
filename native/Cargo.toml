@@ -1,18 +1,18 @@
 [package]
-name = "jev-native"
+name = "decidra-native"
 version = "0.1.0"
 edition = "2024"
-description = "Native CUDA inference engine for JEV-27B (AWQ W4A16), no Python runtime"
+description = "Native CUDA backend for Decidra (AWQ W4A16 decision models), no Python runtime"
 license = "MIT OR Apache-2.0"
 rust-version = "1.85"
 publish = false
 
 [lib]
-name = "jev_native"
+name = "decidra_native"
 path = "src/lib.rs"
 
 [[bin]]
-name = "jev-native"
+name = "decidra-native"
 path = "src/main.rs"
 
 [dependencies]

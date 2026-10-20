@@ -4,7 +4,8 @@ SHELL := /bin/bash
 .PHONY: build test test-native fmt clippy native-check smoke run check-config eval
 
 build:
-	$(CARGO) build --release --locked --features native
+	$(CARGO) build --release --locked -p decidra-native
+	$(CARGO) build --release --locked --features native -p decidra
 
 test:
 	$(CARGO) test --locked

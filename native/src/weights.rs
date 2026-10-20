@@ -49,8 +49,6 @@ pub enum LinearWeight {
         packed: CudaSlice<i32>,
         scale: CudaSlice<bf16>,
         zp: CudaSlice<i32>,
-        #[allow(dead_code)]
-        shape: CudaSlice<i64>,
     },
 }
 
@@ -232,7 +230,6 @@ impl<'a> WeightProvider<'a> {
             let packed = self.store.i32(&packed_name)?;
             let scale = self.store.bf16(&format!("{module}.weight_scale"))?;
             let zp = self.store.i32(&format!("{module}.weight_zero_point"))?;
-            let shape_dev = self.store.i64(&format!("{module}.weight_shape"))?;
             if packed.len() != out * packed_words {
                 bail!(
                     "{module}: packed has {} words, expected {}",
@@ -266,7 +263,7 @@ impl<'a> WeightProvider<'a> {
                 if (self.marlin_fp8 || use_int8) && group_size != 64 {
                     bail!("W4A8 transform requires group_size 64, got {group_size}");
                 }
-                let dbg = std::env::var("JEV_MARLIN_DEBUG").is_ok();
+                let dbg = std::env::var("DECIDRA_MARLIN_DEBUG").is_ok();
                 if dbg {
                     eprintln!("marlin repack {module}: out={out} in={in_}");
                 }
@@ -354,7 +351,6 @@ impl<'a> WeightProvider<'a> {
                 packed: self.stream.clone_htod(&packed)?,
                 scale: self.stream.clone_htod(&scale)?,
                 zp: self.stream.clone_htod(&zp)?,
-                shape: self.stream.clone_htod(&shape_dev)?,
             });
         }
         let wname = format!("{module}.weight");

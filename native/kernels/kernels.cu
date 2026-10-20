@@ -1,4 +1,4 @@
-// Native CUDA kernels for the JEV engine (W4A16 Qwen3.5-family forward).
+// Native CUDA kernels for Decidra (W4A16/W4A8 Qwen3.5-family forward).
 // Compiled as a single cubin for sm_89 by native/build.rs.
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>

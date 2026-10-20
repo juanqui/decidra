@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, bail};
-use jev_engine::{
+use decidra::{
     api::{self, AppState},
     backend::Backend,
     config::Config,
@@ -9,14 +9,14 @@ use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 const HELP: &str = "\
-jev-engine — JEV decision server (native CUDA backend)
+decidra — decision inference server (native CUDA backend)
 
 Usage:
-  jev-engine                 serve
-  jev-engine --check-config  load tokenizer/head/calibration, print a report, exit
-  jev-engine --native-check  load the native engine and run one tiny GPU forward
-  jev-engine --help
-  jev-engine --version
+  decidra                 serve
+  decidra --check-config  load tokenizer/head/calibration, print a report, exit
+  decidra --native-check  load the native engine and run one tiny GPU forward
+  decidra --help
+  decidra --version
 
 `serve` and `--native-check` require a binary built with `--features native`.
 Configuration is read from the environment; see README.md.
@@ -32,7 +32,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some("--version") | Some("-V") => {
-            println!("jev-engine {}", env!("CARGO_PKG_VERSION"));
+            println!("decidra {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         Some("--check-config") => check_config(),
@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
 
 fn init_tracing() {
     let filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("jev_engine=info"));
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("decidra=info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
@@ -64,12 +64,10 @@ fn check_config() -> Result<()> {
 }
 
 #[cfg(feature = "native")]
-fn load_native(
-    config: Config,
-) -> Result<std::sync::Arc<jev_engine::native_backend::NativeBackend>> {
+fn load_native(config: Config) -> Result<std::sync::Arc<decidra::native_backend::NativeBackend>> {
     use std::sync::Arc;
 
-    let backend = jev_engine::native_backend::NativeBackend::load(&config)
+    let backend = decidra::native_backend::NativeBackend::load(&config)
         .context("loading the native CUDA backend")?;
     Ok(Arc::new(backend))
 }
@@ -87,7 +85,7 @@ async fn native_check() -> Result<()> {
     let config = Config::from_env()?;
     let metadata = api::load_metadata(&config)?;
     let ids = metadata.head.verbalizer_ids[metadata.head.noul[0]..metadata.head.noul[1]].to_vec();
-    let prompt_text = jev_engine::prompt::text_prompt(
+    let prompt_text = decidra::prompt::text_prompt(
         "noul",
         "native check",
         "Is the engine ready?",
@@ -152,7 +150,7 @@ async fn serve() -> Result<()> {
         max_options = state.load_report.max_options,
         signing = state.config.signing_enabled(),
         metrics = state.config.metrics_enabled,
-        "starting jev-engine"
+        "starting decidra"
     );
 
     let listener = TcpListener::bind(state.config.bind_addr)

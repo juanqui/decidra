@@ -436,10 +436,10 @@ def _parse_options(args: argparse.Namespace) -> list[str] | None:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Call a JEV /v1/decide backend")
+    parser = argparse.ArgumentParser(description="Call a Decidra /v1/decide backend")
     parser.add_argument(
         "--url",
-        default=os.environ.get("JEV_DECIDE_URL", "http://127.0.0.1:8501"),
+        default=os.environ.get("DECIDRA_DECIDE_URL", "http://127.0.0.1:8501"),
         help="backend base URL (default: %(default)s)",
     )
     parser.add_argument("--kind", choices=["noul", "score", "choice"], default="noul")

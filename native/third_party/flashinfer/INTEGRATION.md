@@ -20,12 +20,12 @@ No CUTLASS, CUB, TVM-FFI, Python, PyTorch, or ATen is used. The `.so` links
 
 `native/build.rs` compiles `fi_prefill.cu` into
 `OUT_DIR/libfi_prefill.so` with `-arch=sm_89` and sets
-`JEV_FI_PREFILL_SO`. It uses `JEV_NVCC`, native `nvcc`, or the
-`JEV_CUDA_IMAGE` docker toolchain (same fallback as the cubins). Example:
+`DECIDRA_FI_PREFILL_SO`. It uses `DECIDRA_NVCC`, native `nvcc`, or the
+`DECIDRA_CUDA_IMAGE` docker toolchain (same fallback as the cubins). Example:
 
 ```bash
-JEV_CUDA_IMAGE=vllm/vllm-openai:v0.31.0 \
-  cargo build --release -p jev-native
+DECIDRA_CUDA_IMAGE=vllm/vllm-openai:v0.31.0 \
+  cargo build --release -p decidra-native
 ```
 
 The build fails if the FlashInfer library cannot be produced.
@@ -38,10 +38,10 @@ engine logs and keeps the native attention kernels. The wrapper is used only
 when all of these hold:
 
 - full-attention layer (the call sites are already the full-attention path),
-- `seq >= JEV_FLASHINFER_MIN_SEQ` (default **1024**),
+- `seq >= DECIDRA_FLASHINFER_MIN_SEQ` (default **1024**),
 - `head_dim == 256`, `n_heads == 24`, `n_kv == 4`,
 - batch size 1 (the FFI is single-request; batched prefill falls back),
-- `JEV_FLASHINFER_ATTENTION` is not `0`.
+- `DECIDRA_FLASHINFER_ATTENTION` is not `0`.
 
 Fallback: the existing tiled `attention_tc_bf16_d256` kernel (or the warp kernel
 when selected) is used unchanged otherwise.
@@ -49,34 +49,34 @@ when selected) is used unchanged otherwise.
 Environment:
 
 ```bash
-JEV_FLASHINFER_ATTENTION=0   # disable (default 1 if the .so loads)
-JEV_FLASHINFER_MIN_SEQ=1024  # threshold; measure 512/1024/2048
+DECIDRA_FLASHINFER_ATTENTION=0   # disable (default 1 if the .so loads)
+DECIDRA_FLASHINFER_MIN_SEQ=1024  # threshold; measure 512/1024/2048
 ```
 
 ## Validation / benchmark commands
 
 ```bash
-BIN=target/release/jev-native
+BIN=target/release/decidra-native
 MODEL=/srv/models/jev-awq/awq-w4a16-v2
 DATA=benchdata
 
 # full 16K forward, FI off/on
-JEV_FLASHINFER_ATTENTION=0 JEV_PROFILE=1 $BIN batch --model $MODEL \
+DECIDRA_FLASHINFER_ATTENTION=0 DECIDRA_PROFILE=1 $BIN batch --model $MODEL \
   --tokens $DATA/long_16k.json --repeat 3 --head-ids 3721,1802 \
   --marlin --preload --out out16_off.json
-JEV_FLASHINFER_ATTENTION=1 JEV_PROFILE=1 $BIN batch --model $MODEL \
+DECIDRA_FLASHINFER_ATTENTION=1 DECIDRA_PROFILE=1 $BIN batch --model $MODEL \
   --tokens $DATA/long_16k.json --repeat 3 --head-ids 3721,1802 \
   --marlin --preload --out out16_on.json
 
 # full-attention layer 3 output, 4K, FI off/on
-JEV_FLASHINFER_ATTENTION=0 $BIN layer --model $MODEL --tokens $DATA/long_4k.json \
+DECIDRA_FLASHINFER_ATTENTION=0 $BIN layer --model $MODEL --tokens $DATA/long_4k.json \
   --layer 3 --stage layer --marlin --preload --out layer4k_off.f32
-JEV_FLASHINFER_ATTENTION=1 $BIN layer --model $MODEL --tokens $DATA/long_4k.json \
+DECIDRA_FLASHINFER_ATTENTION=1 $BIN layer --model $MODEL --tokens $DATA/long_4k.json \
   --layer 3 --stage layer --marlin --preload --out layer4k_on.f32
 $BIN compare --ref layer4k_off.f32 --got layer4k_on.f32
 
 # suite28 (short prompts fall back; confirms no regression)
-JEV_FLASHINFER_ATTENTION=1 $BIN batch --model $MODEL \
+DECIDRA_FLASHINFER_ATTENTION=1 $BIN batch --model $MODEL \
   --tokens $DATA/suite_tokens.json --head-ids-json $DATA/suite_heads.json \
   --repeat 1 --marlin --preload --out suite_on.json
 ```

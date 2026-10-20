@@ -2,7 +2,7 @@
 //!
 //! Typical server use:
 //! ```ignore
-//! let engine = jev_native::Engine::new(model_dir)?;
+//! let engine = decidra_native::Engine::new(model_dir)?;
 //! engine.preload_all()?;                 // ~12.4 GiB packed weights resident
 //! let hidden = engine.forward_last_hidden(&tokens)?;
 //! let logits = engine.decision_logits(&tokens, &[3721, 1802])?;

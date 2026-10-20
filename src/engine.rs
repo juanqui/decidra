@@ -138,12 +138,12 @@ impl DecisionEngine {
     ) -> Result<DecideOutcome, EngineError> {
         validate_state(state).map_err(EngineError::Internal)?;
         let effective = strategy.effective();
-        metrics::histogram!("jev_decide_options").record(options.len() as f64);
+        metrics::histogram!("decidra_decide_options").record(options.len() as f64);
         let (probabilities, usage) = self
             .distribution(kind, state, question, options, effective)
             .await?;
         metrics::counter!(
-            "jev_decide_total",
+            "decidra_decide_total",
             "kind" => kind.as_str(),
             "strategy" => effective.as_str()
         )
@@ -245,8 +245,8 @@ impl DecisionEngine {
             .zip(logits.iter().map(|value| *value as f64))
             .collect();
         let prompt_tokens = self.backend.prompt_tokens(&text);
-        metrics::histogram!("jev_decide_pass_options").record(options.len() as f64);
-        metrics::counter!("jev_backend_prompt_tokens_total").increment(prompt_tokens);
+        metrics::histogram!("decidra_decide_pass_options").record(options.len() as f64);
+        metrics::counter!("decidra_backend_prompt_tokens_total").increment(prompt_tokens);
 
         let fitted = self.fitted.as_ref().and_then(|map| map.get(kind.as_str()));
         let probabilities =

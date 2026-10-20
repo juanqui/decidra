@@ -11,6 +11,7 @@
 //! causal, NHD, head_dim 256, scale 0.0625.
 
 use std::ffi::{CString, c_char, c_int, c_void};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
@@ -33,6 +34,26 @@ unsafe extern "C" {
 }
 
 const RTLD_NOW: c_int = 2;
+const EMBEDDED_SO: &[u8] = include_bytes!(env!("DECIDRA_FI_PREFILL_SO"));
+
+/// Write the embedded prefill library to a private temp directory so `dlopen`
+/// can map it. The image then needs no kernel or `.so` files on disk.
+fn materialize() -> Option<PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .subsec_nanos();
+    let dir = std::env::temp_dir().join(format!("decidra-{}-{nanos}", std::process::id()));
+    std::fs::create_dir(&dir).ok()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let path = dir.join("libfi_prefill.so");
+    std::fs::write(&path, EMBEDDED_SO).ok()?;
+    Some(path)
+}
 
 pub struct FlashInfer {
     handle: *mut c_void,
@@ -44,21 +65,34 @@ unsafe impl Send for FlashInfer {}
 unsafe impl Sync for FlashInfer {}
 
 impl FlashInfer {
-    /// Load the library baked into the build. Returns `None` when the build did
-    /// not produce it or `dlopen` fails; callers then keep the native kernel.
+    /// Load the library embedded in the binary. Falls back to the build path
+    /// when the temp-file write fails (local development). Returns `None` if
+    /// `dlopen` fails; callers then keep the native kernel.
     pub fn load() -> Option<Arc<Self>> {
-        let path = env!("JEV_FI_PREFILL_SO");
-        let cpath = CString::new(path).ok()?;
+        let (path, cleanup) = match materialize() {
+            Some(path) => (path, true),
+            None => (PathBuf::from(env!("DECIDRA_FI_PREFILL_SO")), false),
+        };
+        let cpath = CString::new(path.to_string_lossy().as_bytes()).ok()?;
         unsafe {
             let handle = dlopen(cpath.as_ptr(), RTLD_NOW);
+            if cleanup {
+                let _ = std::fs::remove_file(&path);
+                if let Some(dir) = path.parent() {
+                    let _ = std::fs::remove_dir(dir);
+                }
+            }
             if handle.is_null() {
-                eprintln!("flashinfer: dlopen({path}) failed; using native attention");
+                eprintln!(
+                    "flashinfer: dlopen({}) failed; using native attention",
+                    path.display()
+                );
                 return None;
             }
             let sym = CString::new("fi_prefill_bf16").ok()?;
             let p = dlsym(handle, sym.as_ptr());
             if p.is_null() {
-                eprintln!("flashinfer: fi_prefill_bf16 missing in {path}");
+                eprintln!("flashinfer: fi_prefill_bf16 missing in {}", path.display());
                 dlclose(handle);
                 return None;
             }

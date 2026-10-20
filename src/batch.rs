@@ -1,6 +1,6 @@
 //! FIFO batching queue for the native backend.
 //!
-//! One dedicated thread owns `jev_native::Engine` and executes requests in
+//! One dedicated thread owns `decidra_native::Engine` and executes requests in
 //! batches. The worker blocks for the first request, then drains additional
 //! requests until the batch window expires, `MAX_BATCH` is reached, or the next
 //! request would exceed `MAX_BATCH_TOKENS`. A request larger than the token cap
@@ -105,7 +105,7 @@ impl BatchHandle {
         let (done_tx, done_rx) = mpsc::channel();
         let worker_shared = Arc::clone(&shared);
         let join = std::thread::Builder::new()
-            .name("jev-native-batch".to_owned())
+            .name("decidra-native-batch".to_owned())
             .spawn(move || run_worker(executor, options, worker_shared, done_tx))
             .expect("spawning the native batch worker");
         Self {
@@ -137,7 +137,7 @@ impl BatchHandle {
                 ));
             }
             state.pending.push_back(request);
-            metrics::gauge!("jev_native_batch_queue_depth").set(state.pending.len() as f64);
+            metrics::gauge!("decidra_native_batch_queue_depth").set(state.pending.len() as f64);
         }
         self.shared.ready.notify_one();
         Ok(receiver)
@@ -270,7 +270,7 @@ fn run_worker<E: BatchExecutor>(
             drop(state);
             break;
         };
-        metrics::gauge!("jev_native_batch_queue_depth").set(state.pending.len() as f64);
+        metrics::gauge!("decidra_native_batch_queue_depth").set(state.pending.len() as f64);
 
         // A request that arrives alone only needs a short grace period to pick
         // up a burst; a full window is for a queue that already has waiters.
@@ -326,7 +326,7 @@ fn run_worker<E: BatchExecutor>(
             candidate = state.pending.pop_front();
         }
 
-        metrics::gauge!("jev_native_batch_queue_depth").set(state.pending.len() as f64);
+        metrics::gauge!("decidra_native_batch_queue_depth").set(state.pending.len() as f64);
         drop(state);
 
         if batch.is_empty() {
@@ -337,9 +337,9 @@ fn run_worker<E: BatchExecutor>(
             .iter()
             .map(|request| request.enqueued_at.elapsed().as_secs_f64())
             .collect();
-        metrics::histogram!("jev_native_batch_size").record(batch.len() as f64);
+        metrics::histogram!("decidra_native_batch_size").record(batch.len() as f64);
         for wait in &waits {
-            metrics::histogram!("jev_native_batch_wait_seconds").record(*wait);
+            metrics::histogram!("decidra_native_batch_wait_seconds").record(*wait);
         }
 
         let tokens: Vec<&[u32]> = batch

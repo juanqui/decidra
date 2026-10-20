@@ -1,8 +1,8 @@
 //! Default-off W4A8-FP8 probe for one module.
 //!
 //! Run on GPU1:
-//! `JEV_MODEL=/srv/models/jev-awq/awq-w4a16-v2 cargo test --release \
-//!   -p jev-native --test marlin_fp8 -- --ignored --nocapture`
+//! `DECIDRA_MODEL=/srv/models/jev-awq/awq-w4a16-v2 cargo test --release \
+//!   -p decidra-native --test marlin_fp8 -- --ignored --nocapture`
 //!
 //! Compares the native FP8 transform/repack/kernel against W4A16 and the
 //! canonical AWQ/FP8 reference numbers for gate_proj, and times both kernels
@@ -10,7 +10,7 @@
 
 use std::path::Path;
 
-use jev_native::Engine;
+use decidra_native::Engine;
 
 fn input_for(rows: usize, k: usize) -> Vec<f32> {
     (0..rows * k)
@@ -21,7 +21,7 @@ fn input_for(rows: usize, k: usize) -> Vec<f32> {
 #[test]
 #[ignore = "requires the AWQ checkpoint and GPU1"]
 fn marlin_fp8_gate_proj_vs_w4a16() {
-    let model = std::env::var("JEV_MODEL")
+    let model = std::env::var("DECIDRA_MODEL")
         .unwrap_or_else(|_| "/srv/models/jev-awq/awq-w4a16-v2".to_string());
     let eng = Engine::new(Path::new(&model)).expect("engine");
     eng.set_marlin(true);

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tiny deterministic mock of the JEV decision API (no GPU, stdlib only).
+"""Tiny deterministic mock of the Decidra decision API (no GPU, stdlib only).
 
 It implements the same contract as ``decide_shim.py``:
 

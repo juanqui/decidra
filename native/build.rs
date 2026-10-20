@@ -5,13 +5,13 @@
 //!   - `marlin.cu`: the vendored Marlin W4A16 kernel + repack (third_party/)
 //!
 //! The host may not have nvcc. Resolution order:
-//!   1. `JEV_NVCC` (path to nvcc)
+//!   1. `DECIDRA_NVCC` (path to nvcc)
 //!   2. `nvcc` on PATH
-//!   3. `docker run` the CUDA image in `JEV_CUDA_IMAGE` (default
+//!   3. `docker run` the CUDA image in `DECIDRA_CUDA_IMAGE` (default
 //!      nvidia/cuda:13.1.1-devel-ubuntu24.04) purely as a build toolchain
 //!
-//! Cubin paths are passed to the crate through `JEV_KERNELS_CUBIN` and
-//! `JEV_MARLIN_CUBIN`.
+//! Cubin paths are passed to the crate through `DECIDRA_KERNELS_CUBIN` and
+//! `DECIDRA_MARLIN_CUBIN`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -58,8 +58,8 @@ const COMMON: &[&str] = &[
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    println!("cargo:rerun-if-env-changed=JEV_NVCC");
-    println!("cargo:rerun-if-env-changed=JEV_CUDA_IMAGE");
+    println!("cargo:rerun-if-env-changed=DECIDRA_NVCC");
+    println!("cargo:rerun-if-env-changed=DECIDRA_CUDA_IMAGE");
     println!("cargo:rerun-if-changed=kernels");
     println!("cargo:rerun-if-changed=third_party");
 
@@ -81,16 +81,16 @@ fn main() {
     }
 
     println!(
-        "cargo:rustc-env=JEV_KERNELS_CUBIN={}",
+        "cargo:rustc-env=DECIDRA_KERNELS_CUBIN={}",
         out_dir.join("kernels.cubin").display()
     );
     println!(
-        "cargo:rustc-env=JEV_MARLIN_CUBIN={}",
+        "cargo:rustc-env=DECIDRA_MARLIN_CUBIN={}",
         out_dir.join("marlin.cubin").display()
     );
 
     let fi_so = build_flashinfer(&manifest, &out_dir);
-    println!("cargo:rustc-env=JEV_FI_PREFILL_SO={}", fi_so.display());
+    println!("cargo:rustc-env=DECIDRA_FI_PREFILL_SO={}", fi_so.display());
     println!("cargo:rustc-link-lib=dl");
 }
 
@@ -129,7 +129,7 @@ fn build_flashinfer(manifest: &Path, out_dir: &Path) -> PathBuf {
     .iter()
     .map(|s| s.to_string())
     .collect();
-    if let Ok(nvcc) = env::var("JEV_NVCC") {
+    if let Ok(nvcc) = env::var("DECIDRA_NVCC") {
         run_native_cmd(Path::new(&nvcc), &args, manifest, FI_SRC, &so);
         return so;
     }
@@ -159,7 +159,7 @@ fn build(job: &Job, manifest: &Path, out_dir: &Path, cubin: &Path) {
     let mut args: Vec<String> = COMMON.iter().map(|s| s.to_string()).collect();
     args.extend(job.extra.iter().map(|s| s.to_string()));
 
-    if let Ok(nvcc) = env::var("JEV_NVCC") {
+    if let Ok(nvcc) = env::var("DECIDRA_NVCC") {
         run_native(Path::new(&nvcc), &args, manifest, job.src, cubin);
         return;
     }
@@ -170,7 +170,7 @@ fn build(job: &Job, manifest: &Path, out_dir: &Path, cubin: &Path) {
     if let Err(e) = run_docker(&args, manifest, out_dir, job, cubin) {
         panic!(
             "no nvcc found and docker toolchain failed: {e}. \
-             Install CUDA or set JEV_NVCC / JEV_CUDA_IMAGE."
+             Install CUDA or set DECIDRA_NVCC / DECIDRA_CUDA_IMAGE."
         );
     }
 }
@@ -208,7 +208,7 @@ fn run_docker_raw(
     src: &str,
     out_name: &str,
 ) -> Result<(), String> {
-    let image = env::var("JEV_CUDA_IMAGE")
+    let image = env::var("DECIDRA_CUDA_IMAGE")
         .unwrap_or_else(|_| "nvidia/cuda:13.1.1-devel-ubuntu24.04".into());
     let uid = Command::new("id")
         .arg("-u")

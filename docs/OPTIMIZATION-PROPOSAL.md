@@ -7,7 +7,7 @@
 > ideas below are kept as research history.
 
 Analysis only. No GPU runs and no kernel changes were made for this document. It
-synthesizes `/tmp/jev-native-opt/PLAN.md`, `/tmp/jev-kernel-research/REPORT.md`,
+synthesizes `/tmp/decidra-native-opt/PLAN.md`, `/tmp/jev-kernel-research/REPORT.md`,
 and the controlled results in [`VLLM-COMPARISON.md`](VLLM-COMPARISON.md).
 
 ## Executive answer

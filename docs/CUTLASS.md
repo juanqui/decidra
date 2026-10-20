@@ -32,7 +32,7 @@ Diagnostics:
 - **Registers**: group 236 vs per-token 233 at tmb=4 (driver
   `CU_FUNC_ATTRIBUTE_NUM_REGS`). Both are one CTA/SM at 256 threads. The +3
   registers are not an occupancy cliff.
-- **Quantizer**: full vs `JEV_SKIP_QUANT` differs by <0.01 ms/op. Scale writes
+- **Quantizer**: full vs `DECIDRA_SKIP_QUANT` differs by <0.01 ms/op. Scale writes
   are not the cost, in either layout.
 - **Blocked scale layout** (`[64-row tile][group][64]`, contiguous 64-row
   loads): bit-identical and correct, but slower in both staging and direct

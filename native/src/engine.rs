@@ -141,7 +141,7 @@ struct Prof {
 impl Prof {
     fn new() -> Self {
         Self {
-            enabled: std::env::var("JEV_PROFILE").is_ok(),
+            enabled: std::env::var("DECIDRA_PROFILE").is_ok(),
             entries: Mutex::new(Vec::new()),
         }
     }
@@ -149,7 +149,7 @@ impl Prof {
 
 /// Host-side time spent inside each `timed!` region. CUDA event timing also
 /// includes host enqueue gaps, so this separates launch/alloc overhead from
-/// GPU execution. Enabled by `JEV_CPU_PROFILE=1`; reported next to the GPU
+/// GPU execution. Enabled by `DECIDRA_CPU_PROFILE=1`; reported next to the GPU
 /// table at the end of a forward.
 struct CpuProf {
     enabled: bool,
@@ -159,7 +159,7 @@ struct CpuProf {
 impl CpuProf {
     fn new() -> Self {
         Self {
-            enabled: std::env::var("JEV_CPU_PROFILE").is_ok(),
+            enabled: std::env::var("DECIDRA_CPU_PROFILE").is_ok(),
             entries: Mutex::new(std::collections::HashMap::new()),
         }
     }
@@ -204,7 +204,7 @@ impl CpuProf {
     }
 }
 
-/// Accumulated `gdn_chunked_tc_prof` phase counters (`JEV_GDN_PROF=1`).
+/// Accumulated `gdn_chunked_tc_prof` phase counters (`DECIDRA_GDN_PROF=1`).
 #[derive(Default)]
 struct GdnProf {
     cycles: [u64; 10],
@@ -218,20 +218,20 @@ const GDN_PHASES: [&str; 10] = [
 
 fn gemm_debug() -> bool {
     static DEBUG: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("JEV_GEMM_DEBUG").is_ok());
+        std::sync::LazyLock::new(|| std::env::var("DECIDRA_GEMM_DEBUG").is_ok());
     *DEBUG
 }
 
 fn gemm_debug_sync() -> bool {
     static DEBUG: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("JEV_GEMM_DEBUG_SYNC").is_ok());
+        std::sync::LazyLock::new(|| std::env::var("DECIDRA_GEMM_DEBUG_SYNC").is_ok());
     *DEBUG
 }
 
-/// `JEV_MARLIN_CHUNK`: 0 = one launch for the whole M.
+/// `DECIDRA_MARLIN_CHUNK`: 0 = one launch for the whole M.
 fn marlin_chunk() -> usize {
     static CHUNK: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
-        std::env::var("JEV_MARLIN_CHUNK")
+        std::env::var("DECIDRA_MARLIN_CHUNK")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0)
@@ -242,7 +242,7 @@ fn marlin_chunk() -> usize {
 /// Diagnostic: replicate one row-wide scale to every K group.
 fn int8_group_uniform() -> bool {
     static UNIFORM: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var_os("JEV_INT8_GROUP_UNIFORM").is_some());
+        std::sync::LazyLock::new(|| std::env::var_os("DECIDRA_INT8_GROUP_UNIFORM").is_some());
     *UNIFORM
 }
 
@@ -448,10 +448,10 @@ impl Engine {
         let kernels = Kernels::load(&gpu)?;
         let flashinfer = crate::flashinfer::FlashInfer::load();
         let flashinfer_enabled = flashinfer.is_some()
-            && std::env::var("JEV_FLASHINFER_ATTENTION")
+            && std::env::var("DECIDRA_FLASHINFER_ATTENTION")
                 .map(|v| v != "0")
                 .unwrap_or(true);
-        let flashinfer_min_seq = std::env::var("JEV_FLASHINFER_MIN_SEQ")
+        let flashinfer_min_seq = std::env::var("DECIDRA_FLASHINFER_MIN_SEQ")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1024usize);
@@ -2321,7 +2321,7 @@ impl Engine {
         let chunk_min = self.gdn_chunked_min_seq.load(Ordering::Relaxed);
         if self.gdn_chunked_tc.load(Ordering::Relaxed) && seq >= chunk_min && dk == 128 && dv == 128
         {
-            if std::env::var("JEV_GDN_PROF").is_ok() {
+            if std::env::var("DECIDRA_GDN_PROF").is_ok() {
                 let blocks = (dv / kernels::GDN_CHUNK_VC) * nv;
                 let mut prof = self.gpu.stream.alloc_zeros::<u64>(blocks * 10)?;
                 timed!(
@@ -2602,7 +2602,7 @@ impl Engine {
         let dbg = gemm_debug();
         // Synchronizing here makes any benchmarks with the debug variable set
         // measure serialized launches. Timing requires the explicit
-        // JEV_GEMM_DEBUG_SYNC opt-in; JEV_GEMM_DEBUG only logs labels.
+        // DECIDRA_GEMM_DEBUG_SYNC opt-in; DECIDRA_GEMM_DEBUG only logs labels.
         let dbg_sync = gemm_debug_sync();
         let mark = |label: &str, t: std::time::Instant| {
             if dbg_sync {
@@ -3007,7 +3007,6 @@ impl Engine {
         let prov = self.provider()?;
         let w = prov.linear(module)?;
         let (n, k) = (w.out(), w.in_());
-        eprintln!("int8 a_global = {}", w.a_global());
         if input.len() != rows * k {
             bail!("input has {} values, expected {}", input.len(), rows * k);
         }

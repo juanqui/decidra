@@ -1,7 +1,7 @@
 # Independent evaluation harness
 
 Self-contained Python 3 harness for the `/v1/decide` protocol. It exercises a running
-`jev-engine` over HTTP; it never imports the model, starts/stops a serving process, or
+`decidra` over HTTP; it never imports the model, starts/stops a serving process, or
 touches a GPU. The only local server it starts is a deterministic stdlib mock.
 
 The runtime under test is the in-process native CUDA backend. There is no direct
@@ -59,7 +59,7 @@ No server or GPU is required.
 ## Against a running server
 
 ```bash
-# From the repository root; requires jev-engine on 127.0.0.1:8501.
+# From the repository root; requires decidra on 127.0.0.1:8501.
 ./scripts/run-eval.sh
 ```
 
@@ -72,9 +72,9 @@ The script runs:
 3. The historical production-v2 comparison, labeled as context only.
 4. The combined short/long benchmark.
 5. Functional checks (256 choices, `/v1/decisions`, image rejection).
-6. Optional signing when `JEV_EVAL_SIGNING_KEY` is set.
+6. Optional signing when `DECIDRA_EVAL_SIGNING_KEY` is set.
 
-Reports land in `eval/out/`. Override the target with `JEV_EVAL_RUST_URL`.
+Reports land in `eval/out/`. Override the target with `DECIDRA_EVAL_RUST_URL`.
 
 ## Batching sweep
 
@@ -82,8 +82,8 @@ Reports land in `eval/out/`. Override the target with `JEV_EVAL_RUST_URL`.
 concurrency level (default `1,2,4,8,16`). Prompts are unique per level, so the
 sweep does not measure a warm prefix cache. Each level reports requests/s,
 p50/p95/p99 latency, prompt tokens/s, and—when the server exposes `/metrics`—a
-per-level delta of the `jev_native_batch_size` histogram (count, mean, buckets)
-plus the peak observed `jev_native_batch_queue_depth` gauge.
+per-level delta of the `decidra_native_batch_size` histogram (count, mean, buckets)
+plus the peak observed `decidra_native_batch_queue_depth` gauge.
 
 ```bash
 # From the repository root; server already running on 127.0.0.1:8501.
@@ -91,9 +91,9 @@ plus the peak observed `jev_native_batch_queue_depth` gauge.
 # Writes eval/out/bench_batch.json
 ```
 
-Override the target and sweep with `JEV_SMOKE_URL`, `JEV_BATCH_OUT`,
-`JEV_BATCH_CONCURRENCY`, `JEV_BATCH_REQUESTS`, `JEV_BATCH_TOKENS`, and
-`JEV_BATCH_WARMUP`. Equivalent direct invocation:
+Override the target and sweep with `DECIDRA_SMOKE_URL`, `DECIDRA_BATCH_OUT`,
+`DECIDRA_BATCH_CONCURRENCY`, `DECIDRA_BATCH_REQUESTS`, `DECIDRA_BATCH_TOKENS`, and
+`DECIDRA_BATCH_WARMUP`. Equivalent direct invocation:
 
 ```bash
 cd eval

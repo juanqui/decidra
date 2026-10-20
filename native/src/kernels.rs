@@ -239,7 +239,7 @@ impl Kernels {
             },
             marlin_repack: {
                 let f = gpu.func_marlin(
-                    "_ZN6marlin29jev_gptq_marlin_repack_kernelILi256ELi4ELb0EEEvPKjPjii",
+                    "_ZN6marlin33decidra_gptq_marlin_repack_kernelILi256ELi4ELb0EEEvPKjPjii",
                 )?;
                 f.set_attribute(
                     CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -248,7 +248,7 @@ impl Kernels {
                 f
             },
             marlin_repack_a8: gpu.func_marlin(
-                "_ZN6marlin29jev_gptq_marlin_repack_kernelILi256ELi4ELb1EEEvPKjPjii",
+                "_ZN6marlin33decidra_gptq_marlin_repack_kernelILi256ELi4ELb1EEEvPKjPjii",
             )?,
             awq_fp8_transform: gpu.func("awq_fp8_transform_q4")?,
             marlin_transpose: gpu.func_marlin("_Z26transpose_packed_q4_kernelPKjPjii")?,
@@ -652,7 +652,7 @@ pub fn marlin_transpose(
 
 fn marlin_debug() -> bool {
     static DEBUG: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("JEV_MARLIN_DEBUG").is_ok());
+        std::sync::LazyLock::new(|| std::env::var("DECIDRA_MARLIN_DEBUG").is_ok());
     *DEBUG
 }
 
@@ -711,7 +711,7 @@ pub fn marlin_gemm(
     unsafe { l.launch(cfg) }?;
     if marlin_debug() {
         // Log only; a sync here would serialize any profiling run that has the
-        // debug variable set. Use JEV_PROFILE / events for timing.
+        // debug variable set. Use DECIDRA_PROFILE / events for timing.
         eprintln!("marlin gemm: m={m} n={n} k={k} off={row_off}");
     }
     Ok(())

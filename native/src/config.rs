@@ -125,6 +125,3 @@ fn get_usize(v: &Value, key: &str) -> Result<usize> {
         .map(|x| x as usize)
         .with_context(|| format!("config missing {key}"))
 }
-
-#[allow(dead_code)]
-fn _unused(_: &Value) {}

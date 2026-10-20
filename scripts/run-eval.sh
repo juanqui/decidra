@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Run the independent evaluation against an already-running jev-engine.
+# Run the independent evaluation against an already-running decidra.
 #
 # Requires:
-#   - jev-engine on JEV_EVAL_RUST_URL (default http://127.0.0.1:8501)
+#   - decidra on DECIDRA_EVAL_RUST_URL (default http://127.0.0.1:8501)
 #   - Python dependencies from eval/requirements.txt (dev tooling only)
 #
 # This script never starts or stops the server and never touches the GPU.
@@ -13,17 +13,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVAL="$ROOT/eval"
 PYTHON="${PYTHON:-python3}"
 
-RUST_URL="${JEV_EVAL_RUST_URL:-${JEV_SMOKE_URL:-http://127.0.0.1:8501}}"
-OUT="${JEV_EVAL_OUT:-$EVAL/out}"
-REQUESTS="${JEV_EVAL_REQUESTS:-128}"
-LONG_REQUESTS="${JEV_EVAL_LONG_REQUESTS:-8}"
-CONCURRENCY="${JEV_EVAL_CONCURRENCY:-1,4,8,12}"
-LONG_SIZES="${JEV_EVAL_LONG_SIZES:-3000,9000}"
-CHARS_PER_TOKEN="${JEV_EVAL_CHARS_PER_TOKEN:-3.38}"
-WARMUP="${JEV_EVAL_WARMUP:-5}"
-SKIP_BENCH="${JEV_EVAL_SKIP_BENCH:-0}"
-SKIP_FUNCTIONAL="${JEV_EVAL_SKIP_FUNCTIONAL:-0}"
-SIGNING_KEY="${JEV_EVAL_SIGNING_KEY:-}"
+RUST_URL="${DECIDRA_EVAL_RUST_URL:-${DECIDRA_SMOKE_URL:-http://127.0.0.1:8501}}"
+OUT="${DECIDRA_EVAL_OUT:-$EVAL/out}"
+REQUESTS="${DECIDRA_EVAL_REQUESTS:-128}"
+LONG_REQUESTS="${DECIDRA_EVAL_LONG_REQUESTS:-8}"
+CONCURRENCY="${DECIDRA_EVAL_CONCURRENCY:-1,4,8,12}"
+LONG_SIZES="${DECIDRA_EVAL_LONG_SIZES:-3000,9000}"
+CHARS_PER_TOKEN="${DECIDRA_EVAL_CHARS_PER_TOKEN:-3.38}"
+WARMUP="${DECIDRA_EVAL_WARMUP:-5}"
+SKIP_BENCH="${DECIDRA_EVAL_SKIP_BENCH:-0}"
+SKIP_FUNCTIONAL="${DECIDRA_EVAL_SKIP_FUNCTIONAL:-0}"
+SIGNING_KEY="${DECIDRA_EVAL_SIGNING_KEY:-}"
 
 RUST_URL="${RUST_URL%/}"
 mkdir -p "$OUT"
@@ -65,7 +65,7 @@ wait_health() {
   exit 1
 }
 
-wait_health jev-engine "$RUST_URL"
+wait_health decidra "$RUST_URL"
 
 cd "$EVAL"
 
@@ -111,7 +111,7 @@ if [[ "$SKIP_BENCH" != "1" ]]; then
     --warmup "$WARMUP" \
     --out "$OUT/bench_combined_rust.json"
 else
-  echo "skip benchmark (JEV_EVAL_SKIP_BENCH=1)"
+  echo "skip benchmark (DECIDRA_EVAL_SKIP_BENCH=1)"
 fi
 
 if [[ "$SKIP_FUNCTIONAL" != "1" ]]; then
@@ -121,7 +121,7 @@ if [[ "$SKIP_FUNCTIONAL" != "1" ]]; then
     --url "$RUST_URL" \
     --out "$OUT/functional_checks.json"
 else
-  echo "skip functional checks (JEV_EVAL_SKIP_FUNCTIONAL=1)"
+  echo "skip functional checks (DECIDRA_EVAL_SKIP_FUNCTIONAL=1)"
 fi
 
 if [[ -n "$SIGNING_KEY" ]]; then
@@ -133,7 +133,7 @@ if [[ -n "$SIGNING_KEY" ]]; then
     --out "$OUT/signing_check.json"
 else
   echo
-  echo "skip signing check (set JEV_EVAL_SIGNING_KEY for a server started with that key)"
+  echo "skip signing check (set DECIDRA_EVAL_SIGNING_KEY for a server started with that key)"
 fi
 
 echo

@@ -1,4 +1,4 @@
-//! Axum application: JEV decision endpoints, OpenAI-compatible decisions,
+//! Axum application: decision endpoints, OpenAI-compatible decisions,
 //! HMAC signing, and Prometheus metrics. The OpenAI routes execute the same
 //! native decision as `/v1/decide`; they do not generate free-form text.
 
@@ -227,7 +227,7 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
     let body = match (&state.config.metrics_enabled, &state.metrics) {
         (true, Some(handle)) => handle.render(),
         (true, None) => "# metrics recorder not installed\n".to_owned(),
-        (false, _) => "# metrics disabled by JEV_METRICS_ENABLED\n".to_owned(),
+        (false, _) => "# metrics disabled by DECIDRA_METRICS_ENABLED\n".to_owned(),
     };
     (
         [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
@@ -246,9 +246,6 @@ struct DecideRequest {
     options: Option<Vec<String>>,
     #[serde(default)]
     strategy: Strategy,
-    #[serde(default)]
-    #[allow(dead_code)]
-    model: Option<String>,
 }
 
 fn empty_state() -> Value {
@@ -340,14 +337,8 @@ async fn decide_value(state: &AppState, request: DecideRequest) -> Result<Value,
 #[derive(Debug, Deserialize)]
 struct DecisionsRequest {
     #[serde(default)]
-    #[allow(dead_code)]
-    model: Option<String>,
-    #[serde(default)]
     input: Value,
     questions: Vec<Value>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    safety_identifier: Option<String>,
 }
 
 async fn decisions(
@@ -394,7 +385,7 @@ async fn decisions(
                     .map_err(ApiError::from)?;
                 usage.add(outcome.usage);
                 let probability = outcome.probabilities.get(1).copied().unwrap_or(0.0);
-                metrics::counter!("jev_decisions_total", "kind" => "predicate").increment(1);
+                metrics::counter!("decidra_decisions_total", "kind" => "predicate").increment(1);
                 answers.push(json!({
                     "type": "predicate",
                     "name": name,
@@ -444,7 +435,7 @@ async fn decisions(
                     .zip(&outcome.probabilities)
                     .map(|(value, probability)| json!({"value": value, "probability": probability}))
                     .collect();
-                metrics::counter!("jev_decisions_total", "kind" => "choice").increment(1);
+                metrics::counter!("decidra_decisions_total", "kind" => "choice").increment(1);
                 answers.push(json!({
                     "type": "choice",
                     "name": name,
@@ -511,7 +502,7 @@ async fn decisions(
                         })
                     })
                     .collect();
-                metrics::counter!("jev_decisions_total", "kind" => "score").increment(1);
+                metrics::counter!("decidra_decisions_total", "kind" => "score").increment(1);
                 answers.push(json!({
                     "type": "score",
                     "name": name,
@@ -848,7 +839,7 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
         }
     }
 
-    metrics::counter!("jev_systemone_requests_total").increment(1);
+    metrics::counter!("decidra_systemone_requests_total").increment(1);
     let mut usage = Usage::default();
     let mut answers = serde_json::Map::with_capacity(plans.len());
     for plan in plans {
@@ -883,7 +874,7 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
             }
         };
         usage.add(pass_usage);
-        metrics::counter!("jev_systemone_questions_total", "kind" => plan.kind).increment(1);
+        metrics::counter!("decidra_systemone_questions_total", "kind" => plan.kind).increment(1);
 
         if kind == Kind::Noul {
             answers.insert(
@@ -1268,17 +1259,17 @@ async fn observe_http(State(_state): State<AppState>, request: Request, next: Ne
     let method = request.method().as_str().to_owned();
     let path = request.uri().path().to_owned();
     let started = Instant::now();
-    metrics::gauge!("jev_http_requests_in_flight").increment(1.0);
+    metrics::gauge!("decidra_http_requests_in_flight").increment(1.0);
     let response = next.run(request).await;
-    metrics::gauge!("jev_http_requests_in_flight").decrement(1.0);
+    metrics::gauge!("decidra_http_requests_in_flight").decrement(1.0);
     metrics::counter!(
-        "jev_http_requests_total",
+        "decidra_http_requests_total",
         "method" => method,
         "path" => path.clone(),
         "status" => response.status().as_u16().to_string()
     )
     .increment(1);
-    metrics::histogram!("jev_http_request_duration_seconds", "path" => path)
+    metrics::histogram!("decidra_http_request_duration_seconds", "path" => path)
         .record(started.elapsed().as_secs_f64());
     response
 }

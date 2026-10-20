@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Verify JEV response signing (HMAC-SHA256 over the exact body).
+"""Verify Decidra response signing (HMAC-SHA256 over the exact body).
 
-Run against a server started with JEV_SIGNING_KEY=test-key. Checks that
+Run against a server started with DECIDRA_SIGNING_KEY=test-key. Checks that
 /v1/decide carries `x-jev-signature: sha256=<hex>` matching the raw bytes and
 that /health is not signed.
 """

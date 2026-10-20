@@ -5,24 +5,25 @@
 ```text
 GPU 1 ── native CUDA engine (in-process, packed AWQ W4A16 resident) ──┐
                                                                       │
-CPU   ── jev-engine HTTP server ── 0.0.0.0:8501 ── clients / proxy ───┘
+CPU   ── decidra HTTP server ── 0.0.0.0:8501 ── clients / proxy ───┘
 ```
 
-One process, one GPU. The axum server is CPU-side; inference runs through
-`jev_native::Engine` on GPU 1 and keeps packed weights resident. There is no external
-model server, Python, or PyTorch in the process.
+One process, one GPU. The server process owns the engine: the HTTP layer is
+async, inference runs through `decidra_native::Engine` on GPU 1 and keeps packed
+weights resident. There is no external model server, Python, or PyTorch in the
+process.
 
 ## Ports and devices
 
 | Resource | Default | Knobs |
 |---|---|---|
-| HTTP listen | `0.0.0.0:8080` (script: `0.0.0.0:8501`) | `JEV_BIND_ADDR` |
+| HTTP listen | `0.0.0.0:8080` (script: `0.0.0.0:8501`) | `DECIDRA_BIND_ADDR` |
 | GPU | GPU 1 | `CUDA_VISIBLE_DEVICES=1` before process start |
-| Checkpoint | `/srv/models/jev-awq/awq-w4a16-v2` | `JEV_NATIVE_MODEL`, `JEV_CHECKPOINT` |
-| cuBLAS | loader path | `JEV_CUDA_LIBS` prepended to `LD_LIBRARY_PATH` |
+| Checkpoint | `/srv/models/jev-awq/awq-w4a16-v2` | `DECIDRA_NATIVE_MODEL`, `DECIDRA_CHECKPOINT` |
+| cuBLAS | loader path | `DECIDRA_CUDA_LIBS` prepended to `LD_LIBRARY_PATH` |
 
 Device selection is process-level: the native engine opens ordinal 0 of the visible set,
-so `CUDA_VISIBLE_DEVICES=1` is the supported way to pin GPU 1. `JEV_NATIVE_DEVICE` is not
+so `CUDA_VISIBLE_DEVICES=1` is the supported way to pin GPU 1. `DECIDRA_NATIVE_DEVICE` is not
 read.
 
 Port `8501` is chosen so the existing Python front on `8500` and its production backend on
@@ -54,13 +55,13 @@ Build:
 
 - Stable Rust (edition 2024; see `rust-toolchain.toml`).
 - `nvcc` for the native kernels, or Docker so `native/build.rs` can compile them in a
-  container. Override with `JEV_NVCC=/path/to/nvcc` or
-  `JEV_CUDA_IMAGE=nvidia/cuda:13.1.1-devel-ubuntu24.04`.
+  container. Override with `DECIDRA_NVCC=/path/to/nvcc` or
+  `DECIDRA_CUDA_IMAGE=nvidia/cuda:13.1.1-devel-ubuntu24.04`.
 
 Runtime:
 
 - NVIDIA driver exposing `libcuda.so.1`.
-- `libcublas.so.13` and `libcublasLt.so.13`. Set `JEV_CUDA_LIBS` if they are not on the
+- `libcublas.so.13` and `libcublasLt.so.13`. Set `DECIDRA_CUDA_LIBS` if they are not on the
   loader path.
 - RTX 4090 / sm_89.
 - ~13.1 GiB free VRAM for Marlin's resident repacked weights plus workspace; peak is
@@ -85,25 +86,25 @@ cargo test
 cargo build --release --features native
 
 # Validate tokenizer/head/calibration without loading the engine.
-./target/release/jev-engine --check-config
+./target/release/decidra --check-config
 
 # One real forward on GPU 1, then exit.
-CUDA_VISIBLE_DEVICES=1 JEV_CUDA_LIBS=/opt/cuda-libs \
-  ./target/release/jev-engine --native-check
+CUDA_VISIBLE_DEVICES=1 DECIDRA_CUDA_LIBS=/opt/cuda-libs \
+  ./target/release/decidra --native-check
 
 # Serve.
 CUDA_VISIBLE_DEVICES=1 \
-JEV_CUDA_LIBS=/opt/cuda-libs \
-JEV_NATIVE_MODEL=/srv/models/jev-awq/awq-w4a16-v2 \
-JEV_CHECKPOINT=/srv/models/jev-awq/awq-w4a16-v2 \
-JEV_BIND_ADDR=0.0.0.0:8501 \
-JEV_SIGNING_KEY="$(cat /run/secrets/jev-signing-key)" \
-./target/release/jev-engine
+DECIDRA_CUDA_LIBS=/opt/cuda-libs \
+DECIDRA_NATIVE_MODEL=/srv/models/jev-awq/awq-w4a16-v2 \
+DECIDRA_CHECKPOINT=/srv/models/jev-awq/awq-w4a16-v2 \
+DECIDRA_BIND_ADDR=0.0.0.0:8501 \
+DECIDRA_SIGNING_KEY="$(cat /run/secrets/jev-signing-key)" \
+./target/release/decidra
 ```
 
-`scripts/run-native.sh` performs the build (unless `JEV_SKIP_BUILD=1`), sets
+`scripts/run-native.sh` performs the build (unless `DECIDRA_SKIP_BUILD=1`), sets
 `CUDA_VISIBLE_DEVICES=1`, and execs the binary. It sets `LD_LIBRARY_PATH` only when
-`JEV_CUDA_LIBS` is non-empty.
+`DECIDRA_CUDA_LIBS` is non-empty.
 
 Startup loads the tokenizer/head/calibration, validates the A-P verbalizer parity, opens
 the native checkpoint, and preloads/re-packs the decoder layers. Readiness requires all of
@@ -113,79 +114,81 @@ those steps to succeed; there is no partial serving.
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `JEV_BIND_ADDR` | `0.0.0.0:8080` | HTTP listen address. |
-| `JEV_MODEL` | `jev-awq` | Model id in `/v1/models`. |
-| `JEV_CHECKPOINT` | `/srv/models/jev-awq/awq-w4a16-v2` | Tokenizer/head/calibration artifact. |
-| `JEV_NATIVE_MODEL` | `$JEV_CHECKPOINT` | Checkpoint opened by the native engine. |
-| `JEV_NATIVE_CACHE` | `true` | Keep packed decoder weights resident. |
-| `JEV_NATIVE_MARLIN` | `true` | Repack to the Marlin W4A16 layout during preload and use Marlin. |
-| `JEV_NATIVE_FUSED_W4A16` | `true` | Fallback-only hybrid fused policy; ignored when Marlin is on. |
-| `JEV_NATIVE_BATCH` | `true` | Native request batcher. `false` means one request per forward and window 0. |
-| `JEV_NATIVE_MAX_BATCH` | `8` | Max requests per batch. Throughput saturates at batch 4; 8 lets a burst drain in one pass, while 12/16 add p50 without throughput. |
-| `JEV_NATIVE_BATCH_WINDOW_US` | `2000` | Batch window in microseconds (max `50000`). The 2 ms default keeps a lone request at ~62 ms p50; 5/10 ms fill wider batches but did not raise throughput. |
-| `JEV_NATIVE_MAX_BATCH_TOKENS` | `16384` | Max total prompt tokens per batch (min `512`); a larger single request runs alone. |
-| `JEV_NATIVE_GDN_CHUNKED` | `true` | Chunked TF32 WMMA GDN prefill for sequences `>= 512` tokens; shorter prompts keep the shared/split recurrence. `false` uses the legacy path. |
-| `JEV_DECISION_CACHE_SIZE` | `256` | Exact-decision logits cache entries (LRU, exact token/head-id key); `0` disables. Successful forwards only; exact prompts only, no prefix caching. |
-| `JEV_SIGNING_KEY` | unset | HMAC-SHA256 response signing. |
-| `JEV_METRICS_ENABLED` | `true` | Prometheus recorder. |
-| `JEV_CUDA_LIBS` | unset | Directory with `libcublas.so.13`/`libcublasLt.so.13`. |
+| `DECIDRA_BIND_ADDR` | `0.0.0.0:8080` | HTTP listen address. |
+| `DECIDRA_MODEL` | `jev-awq` | Model id in `/v1/models`. |
+| `DECIDRA_CHECKPOINT` | `/srv/models/jev-awq/awq-w4a16-v2` | Tokenizer/head/calibration artifact. |
+| `DECIDRA_NATIVE_MODEL` | `$DECIDRA_CHECKPOINT` | Checkpoint opened by the native engine. |
+| `DECIDRA_NATIVE_CACHE` | `true` | Keep packed decoder weights resident. |
+| `DECIDRA_NATIVE_MARLIN` | `true` | Repack to the Marlin W4A16 layout during preload and use Marlin. |
+| `DECIDRA_NATIVE_FUSED_W4A16` | `true` | Fallback-only hybrid fused policy; ignored when Marlin is on. |
+| `DECIDRA_NATIVE_BATCH` | `true` | Native request batcher. `false` means one request per forward and window 0. |
+| `DECIDRA_NATIVE_MAX_BATCH` | `8` | Max requests per batch. Throughput saturates at batch 4; 8 lets a burst drain in one pass, while 12/16 add p50 without throughput. |
+| `DECIDRA_NATIVE_BATCH_WINDOW_US` | `2000` | Batch window in microseconds (max `50000`). The 2 ms default keeps a lone request at ~62 ms p50; 5/10 ms fill wider batches but did not raise throughput. |
+| `DECIDRA_NATIVE_MAX_BATCH_TOKENS` | `16384` | Max total prompt tokens per batch (min `512`); a larger single request runs alone. |
+| `DECIDRA_NATIVE_GDN_CHUNKED` | `true` | Chunked TF32 WMMA GDN prefill for sequences `>= 512` tokens; shorter prompts keep the shared/split recurrence. `false` uses the legacy path. |
+| `DECIDRA_DECISION_CACHE_SIZE` | `256` | Exact-decision logits cache entries (LRU, exact token/head-id key); `0` disables. Successful forwards only; exact prompts only, no prefix caching. |
+| `DECIDRA_SIGNING_KEY` | unset | HMAC-SHA256 response signing. |
+| `DECIDRA_METRICS_ENABLED` | `true` | Prometheus recorder. |
+| `DECIDRA_CUDA_LIBS` | unset | Directory with `libcublas.so.13`/`libcublasLt.so.13`. |
 | `CUDA_VISIBLE_DEVICES` | `1` in scripts | GPU pin. |
-| `RUST_LOG` | `jev_engine=info` | Log filter. |
+| `RUST_LOG` | `decidra=info` | Log filter. |
 
 ## Docker
 
-The image builds the native kernels with `nvcc` from a CUDA devel image. The runtime image
-is not guaranteed to ship cuBLAS, so the build copies the real `libcublas.so.13` and
-`libcublasLt.so.13` (versioned files plus stable symlinks) from the devel builder into
-`/opt/jev/cudalibs/` and prepends that directory to `LD_LIBRARY_PATH`; it does not
-overwrite the base image's CUDA libraries or require `ldconfig`. Weights are mounted,
-never baked in; Marlin is the default (`JEV_NATIVE_FUSED_W4A16` is not set in the image).
+The image builds the native kernels with `nvcc` from a CUDA devel image. The
+runtime is Ubuntu 24.04 plus the server binary and the real `libcublas.so.13` /
+`libcublasLt.so.13` files (versioned files plus stable symlinks) copied from the
+devel builder into `/opt/decidra/cudalibs/`; the file also sets `LD_LIBRARY_PATH`.
+The CUDA driver comes from the host. Weights are mounted, never baked in; Marlin
+is the default (`DECIDRA_NATIVE_FUSED_W4A16` is not set in the image). Kernel
+cubins and the FlashInfer prefill library are embedded in the binary.
 
 ```bash
-docker build -t jev-engine:0.2.0 .
+docker build -t decidra:0.1.0 .
 
 docker run --rm \
   --gpus '"device=1"' \
+  --user "$(id -u):$(id -g)" \
   -p 8501:8080 \
-  -v /srv/models/jev-awq:/models:ro \
-  -e JEV_NATIVE_MODEL=/models/awq-w4a16-v2 \
-  -e JEV_CHECKPOINT=/models/awq-w4a16-v2 \
-  -e JEV_SIGNING_KEY \
-  jev-engine:0.2.0
+  -v /srv/models/jev-awq/awq-w4a16-v2:/models:ro \
+  -e DECIDRA_SIGNING_KEY \
+  decidra:0.1.0
 ```
+
+`--user` is needed because the checkpoint files are usually mode 600. The image
+defaults the checkpoint, native model, and tokenizer to `/models`.
 
 No-GPU image checks:
 
 ```bash
-docker run --rm jev-engine:0.2.0 --help
-docker run --rm -v /srv/models/jev-awq:/models:ro \
-  -e JEV_NATIVE_MODEL=/models/awq-w4a16-v2 \
-  -e JEV_CHECKPOINT=/models/awq-w4a16-v2 \
-  jev-engine:0.2.0 --check-config
-docker run --rm --entrypoint sh jev-engine:0.2.0 \
-  -c "ls -l /opt/jev/cudalibs && test -f /opt/jev/cudalibs/libcublas.so.13 && test -f /opt/jev/cudalibs/libcublasLt.so.13"
+docker run --rm decidra:0.1.0 --help
+docker run --rm --user "$(id -u):$(id -g)" \
+  -v /srv/models/jev-awq/awq-w4a16-v2:/models:ro \
+  decidra:0.1.0 --check-config
+docker run --rm --entrypoint sh decidra:0.1.0 \
+  -c "ls -l /opt/decidra/cudalibs && test -f /opt/decidra/cudalibs/libcublas.so.13 && test -f /opt/decidra/cudalibs/libcublasLt.so.13"
 ```
 
 To use the fallback path instead of Marlin, set
-`-e JEV_NATIVE_MARLIN=false -e JEV_NATIVE_FUSED_W4A16=true`.
+`-e DECIDRA_NATIVE_MARLIN=false -e DECIDRA_NATIVE_FUSED_W4A16=true`.
 
 Inside the container the runtime exposes the reserved device as ordinal 0, so do not set
 `CUDA_VISIBLE_DEVICES` yourself.
 
-Compose reserves GPU 1 and mounts the model directory read-only:
+Compose reserves GPU 1, mounts the model directory read-only, and matches the
+host UID for the model files:
 
 ```bash
 docker compose up -d --build
 docker compose logs -f
 ```
 
-The health check starts after a 300 s grace period because startup uploads the packed
-weights.
+The health check starts after a 180 s grace period.
 
 ## systemd
 
-See the unit example in the README. Keep `CUDA_VISIBLE_DEVICES=1` and `JEV_CUDA_LIBS` in
-the unit environment or an `EnvironmentFile`; keep `JEV_SIGNING_KEY` in a mode-0600 file.
+See the unit example in the README. Keep `CUDA_VISIBLE_DEVICES=1` and `DECIDRA_CUDA_LIBS` in
+the unit environment or an `EnvironmentFile`; keep `DECIDRA_SIGNING_KEY` in a mode-0600 file.
 `Restart=on-failure` is safe: each start re-preloads the checkpoint.
 
 ## Health and metrics
@@ -201,7 +204,7 @@ does not bind until the engine is ready.
 ## Shutdown
 
 SIGTERM/Ctrl-C triggers axum's graceful shutdown. In-flight decision passes finish; the
-process then exits and the CUDA context is released. `JEV_NATIVE_CACHE=false` is available
+process then exits and the CUDA context is released. `DECIDRA_NATIVE_CACHE=false` is available
 for debugging streaming mode but re-reads packed layers per forward and should not be used
 in production.
 
@@ -209,9 +212,9 @@ in production.
 
 | Symptom | Likely cause |
 |---|---|
-| `libcublas.so.13: cannot open shared object file` | Set `JEV_CUDA_LIBS` to the cuBLAS directory or add it to `ldconfig`. |
+| `libcublas.so.13: cannot open shared object file` | Set `DECIDRA_CUDA_LIBS` to the cuBLAS directory or add it to `ldconfig`. |
 | `CUDA driver version is insufficient` | Driver too old for the CUDA 13 engine build. |
-| Startup blocks for ~10 s with disk/GPU work | `JEV_NATIVE_CACHE=true` repacks/uploads ~13.1 GiB once; wait for the preload log line. |
+| Startup blocks for ~10 s with disk/GPU work | `DECIDRA_NATIVE_CACHE=true` repacks/uploads ~13.1 GiB once; wait for the preload log line. |
 | `/v1/decide` returns 502 | Native forward failed (check logs); no fallback backend exists. |
 | `/v1/decide` returns 400 for image states | Expected: native vision is not implemented. |
 | `/v1/chat/completions` returns 400 | Expected: the user message must be a JSON decision request (`{"kind","state","question","options"}`). |

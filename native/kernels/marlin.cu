@@ -417,7 +417,7 @@ template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.
 
 }
 
-extern "C" int jev_marlin_gemm_bf16(
+extern "C" int decidra_marlin_gemm_bf16(
     const void* A, const void* B, void* C, const void* b_s, const void* zp,
     int prob_m, int prob_n, int prob_k, int lda, int num_groups, int group_size,
     int sms, cudaStream_t stream) {
@@ -454,20 +454,10 @@ __global__ void transpose_packed_q4_kernel(const uint32_t* __restrict__ src,
   }
 }
 
-extern "C" int jev_marlin_transpose_q4(const void* src, void* dst, int rows,
-                                       int cols, cudaStream_t stream) {
-  dim3 block(32, 8);
-  dim3 grid((rows + 31) / 32, (cols + 31) / 32);
-  transpose_packed_q4_kernel<<<grid, block, 0, stream>>>(
-      reinterpret_cast<const uint32_t*>(src), reinterpret_cast<uint32_t*>(dst),
-      rows, cols);
-  return 0;
-}
-
 namespace marlin {
 
 template <int const num_threads, int const num_bits, bool is_a_8bit>
-__global__ void jev_gptq_marlin_repack_kernel(
+__global__ void decidra_gptq_marlin_repack_kernel(
     uint32_t const* __restrict__ b_q_weight_ptr, uint32_t* __restrict__ out_ptr,
     int size_k, int size_n) {
   constexpr int pack_factor = 32 / num_bits;
@@ -590,24 +580,24 @@ __global__ void jev_gptq_marlin_repack_kernel(
   }
 }
 
-extern "C" int jev_marlin_repack_q4_a8(const void* gptq, void* out, int size_k,
+extern "C" int decidra_marlin_repack_q4_a8(const void* gptq, void* out, int size_k,
                                        int size_n, int sms, cudaStream_t stream) {
   constexpr int shmem = repack_stages * (tile_k_size / 8) * (tile_n_size / 4) * 16;
-  cudaFuncSetAttribute(jev_gptq_marlin_repack_kernel<repack_threads, 4, true>,
+  cudaFuncSetAttribute(decidra_gptq_marlin_repack_kernel<repack_threads, 4, true>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
-  jev_gptq_marlin_repack_kernel<repack_threads, 4, true>
+  decidra_gptq_marlin_repack_kernel<repack_threads, 4, true>
       <<<sms, repack_threads, shmem, stream>>>(
           reinterpret_cast<const uint32_t*>(gptq),
           reinterpret_cast<uint32_t*>(out), size_k, size_n);
   return 0;
 }
 
-extern "C" int jev_marlin_repack_q4(const void* gptq, void* out, int size_k,
+extern "C" int decidra_marlin_repack_q4(const void* gptq, void* out, int size_k,
                                     int size_n, int sms, cudaStream_t stream) {
   constexpr int shmem = repack_stages * (tile_k_size / 8) * (tile_n_size / 4) * 16;
-  cudaFuncSetAttribute(jev_gptq_marlin_repack_kernel<repack_threads, 4, false>,
+  cudaFuncSetAttribute(decidra_gptq_marlin_repack_kernel<repack_threads, 4, false>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
-  jev_gptq_marlin_repack_kernel<repack_threads, 4, false>
+  decidra_gptq_marlin_repack_kernel<repack_threads, 4, false>
       <<<sms, repack_threads, shmem, stream>>>(
           reinterpret_cast<const uint32_t*>(gptq),
           reinterpret_cast<uint32_t*>(out), size_k, size_n);

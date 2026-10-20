@@ -1,15 +1,15 @@
-# jev-engine API specification
+# decidra API specification
 
 This document is the contract implemented by `src/`. It ports the behavior of
 `/srv/models/jev-awq/decide_shim.py` for the `JEV-27B-VL` AWQ W4A16 artifact, served by
-the in-process native CUDA engine (`jev-native`) as `jev-awq`. Where this document and the
+the in-process native CUDA engine (`decidra-native`) as `jev-awq`. Where this document and the
 Python shim differ, the difference is called out explicitly.
 
 ## 1. Conventions
 
 - All request and response bodies are UTF-8 JSON.
 - Model ids: the client-facing name is `autotrust/JEV-27B-VL`; `/v1/models` also lists
-  `autotrust/JEV-27B` and the configured id (`JEV_MODEL`, default `jev-awq`).
+  `autotrust/JEV-27B` and the configured id (`DECIDRA_MODEL`, default `jev-awq`).
 - The wire protocol string is always `jev27-bare-v1`.
 - Probabilities are floats in `[0, 1]` and sum to 1 up to floating-point error.
 - `state` is a string, a JSON object, or an array of content parts.
@@ -115,7 +115,7 @@ values are clamped from below at `-1e9`:
 scaled[i] = (max(logprob(token_i), -1e9) + bias_i) / T_kind
 ```
 
-If `JEV_CALIBRATION_FITTED` is configured and contains `kind`, the shim's transform is
+If `DECIDRA_CALIBRATION_FITTED` is configured and contains `kind`, the shim's transform is
 applied to raw head logits:
 
 ```text
@@ -140,7 +140,7 @@ native implementation:
 
 1. Tokenizes `prompt` with the existing `tokenizers` tokenizer and
    `add_special_tokens=false`.
-2. Calls `jev_native::Engine::decision_logits(tokens, ids)` on one blocking worker.
+2. Calls `decidra_native::Engine::decision_logits(tokens, ids)` on one blocking worker.
 3. Returns raw `f32` logits at the last position, positionally aligned with `ids`.
 
 The engine keeps all packed decoder weights resident after `preload_all()`; a request does
@@ -389,7 +389,7 @@ sequentially.
 }
 ```
 
-- `model` comes from `JEV_SERVED_IDENTITY` (default
+- `model` comes from `DECIDRA_SERVED_IDENTITY` (default
   `autotrust/JEV-27B-VL@ba3f0d58+awq-w4a16`).
 - `answers` preserves question insertion order.
 - `choice` uses the lowest-index tie-break and reports per-key probabilities.
@@ -432,7 +432,7 @@ user text is a **400**. These routes are not signed.
 
 ## 10. Signing
 
-If `JEV_SIGNING_KEY` is non-empty:
+If `DECIDRA_SIGNING_KEY` is non-empty:
 
 - Paths starting with `/v1/decide` or `/v1/decisions` are signed, including error responses
   and `/v1/decide/info`.
@@ -502,9 +502,9 @@ recorder is not installed.
 | Ties in `choice_index` | Lowest index. |
 | Fitted bias shorter than options | Missing entries `0.0`; no panic. |
 | Empty probability vector | Internal 500 (should be unreachable). |
-| Request body larger than `JEV_MAX_BODY_BYTES` | 413 from axum. |
-| `JEV_TOKENIZER`/head mismatch | Process refuses to start. |
-| `JEV_CALIBRATION_FITTED` path absent | Warning; fitted calibration disabled. |
+| Request body larger than `DECIDRA_MAX_BODY_BYTES` | 413 from axum. |
+| `DECIDRA_TOKENIZER`/head mismatch | Process refuses to start. |
+| `DECIDRA_CALIBRATION_FITTED` path absent | Warning; fitted calibration disabled. |
 
 ## 13. Parity notes
 

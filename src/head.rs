@@ -250,7 +250,7 @@ pub fn load(
         Some(path) => {
             tracing::warn!(
                 path = %path.display(),
-                "JEV_CALIBRATION_FITTED does not exist; fitted calibration disabled"
+                "DECIDRA_CALIBRATION_FITTED does not exist; fitted calibration disabled"
             );
             (None, None)
         }

@@ -29,7 +29,7 @@ All A/Bs in-session on the shipped kernel set (clock drift makes cross-session
   1.69e-3). Reverted: the 1.9% does not justify a 6.6% gate margin.
 - **All-linear INT8** (include o/v/k): 4K 823.2 vs 831.4 ms, 16K 3629.3 vs
   3670.2 ms (**1.0-1.1%**). Gate passes but MAE margin is thinner; remains the
-  documented opt-in `JEV_NATIVE_INT8_EXCLUDE=none`.
+  documented opt-in `DECIDRA_NATIVE_INT8_EXCLUDE=none`.
 - **GDN phase profile (4K, per chunk cycles)**: solve 36%, state 13%, vnew 12%,
   QS 12%, QK+mask 10%, out 4%, loads 3%. The chunk-parallel FLA split must add
   the 128x128 transition `decay*I - K^T W` per chunk (~12 GFLOP/layer) plus
@@ -43,7 +43,7 @@ All A/Bs in-session on the shipped kernel set (clock drift makes cross-session
 - **Blocked-transposed group scales** (`[tile][group][64 rows]`, so each stage
   loads 64 contiguous rows): bit-identical logits at 4K and 16K, but **15%
   slower** in-session (up 2.577 vs 2.135 ms/op, down 2.522 vs 2.126, in_qkv
-  1.436 vs 1.259). A temporary `JEV_SKIP_QUANT` probe showed the quantizer
+  1.436 vs 1.259). A temporary `DECIDRA_SKIP_QUANT` probe showed the quantizer
   costs <0.01 ms/op (full vs skip identical), so the regression is inside the
   Marlin kernel (register/occupancy from the extra address math), not the load
   pattern. Reverted; the strided `[row][group]` staging remains.
@@ -95,8 +95,8 @@ Shipped default is now **mixed W4A8-INT8 with per-module scale granularity**:
 - W4A16 outside those layers: `self_attn.o_proj`, `self_attn.v_proj`,
   `self_attn.k_proj`
 
-`JEV_NATIVE_INT8_GROUP_SCALE=true`, `JEV_NATIVE_INT8_GROUP_EXCLUDE=mlp.gate_proj`,
-`JEV_NATIVE_INT8_EXCLUDE=self_attn.o_proj,self_attn.v_proj,self_attn.k_proj`.
+`DECIDRA_NATIVE_INT8_GROUP_SCALE=true`, `DECIDRA_NATIVE_INT8_GROUP_EXCLUDE=mlp.gate_proj`,
+`DECIDRA_NATIVE_INT8_EXCLUDE=self_attn.o_proj,self_attn.v_proj,self_attn.k_proj`.
 
 Quality (`eval/suite.py` vs CPU AWQ golden): **28/28, KL 3.095e-5, MAE 8.642e-4,
 max 7.511e-3** — all strict gates pass.
@@ -157,13 +157,13 @@ the shipped default.
 - **INT8 activation scratch reuse**: one `xq`/scales buffer pair per engine instead of two
   `cuMemAllocAsync` + memset per INT8 GEMM (400 GEMMs/forward at short).
 - **Marlin launch-path caching**: device attributes and `cudaFuncSetAttribute` are queried
-  once per thread instead of every GEMM; `JEV_MARLIN_CHUNK`, `JEV_GEMM_DEBUG*` and
-  `JEV_MARLIN_DEBUG` are cached (`LazyLock`) instead of read per GEMM.
+  once per thread instead of every GEMM; `DECIDRA_MARLIN_CHUNK`, `DECIDRA_GEMM_DEBUG*` and
+  `DECIDRA_MARLIN_DEBUG` are cached (`LazyLock`) instead of read per GEMM.
 - **Resident GPU embedding table** (2.37 GiB): rows are gathered on-device with a
   16-byte-vector kernel, bit-identical to the host gather. 4K 938.8 -> 915.8 ms
   (-2.5%), 16K 4096 -> 4004 ms (-2.2%), short min 40.8 -> 37.2 ms. The host gather
   (parallel, up to 8 threads) remains the fallback when disabled.
-- **CLI benchmark parity**: `jev-native layer/batch` now enables chunked+TC GDN by
+- **CLI benchmark parity**: `decidra-native layer/batch` now enables chunked+TC GDN by
   default (the server already did); `--legacy-gdn` disables all chunked paths. Earlier CLI
   numbers measured the scalar f32 GDN by mistake.
 - **OpenAI-compatible decision routes** for LiteLLM: `/v1/chat/completions` and
@@ -171,8 +171,8 @@ the shipped default.
   the compact decision JSON (`chat.completion` / `text_completion`), with SSE streaming
   and `stream_options.include_usage`. Non-JSON text is 400. Tests added (47 unit + 10
   integration green).
-- Diagnostics: `JEV_CPU_PROFILE` (host enqueue/alloc timing), `JEV_GDN_PROF` (chunked GDN
-  phase clocks), and `JEV_INT8_GROUP_UNIFORM` (forced per-row scales; the group kernel
+- Diagnostics: `DECIDRA_CPU_PROFILE` (host enqueue/alloc timing), `DECIDRA_GDN_PROF` (chunked GDN
+  phase clocks), and `DECIDRA_INT8_GROUP_UNIFORM` (forced per-row scales; the group kernel
   must then match the per-token kernel — it does).
 
 ### Experiments (results)
@@ -204,7 +204,7 @@ the shipped default.
   `up/down/in_qkv/out/q`; clipping is not a substitute.
 - **All-linear group-64** (includes o/v/k): passes (28/28, MAE 9.692e-4, max 8.469e-3)
   but trades away most of the MAE margin for ~1.4% long-context speed. Kept opt-in via
-  `JEV_NATIVE_INT8_EXCLUDE=none`; the default keeps o/v/k on W4A16.
+  `DECIDRA_NATIVE_INT8_EXCLUDE=none`; the default keeps o/v/k on W4A16.
 - **GPU-resident embedding table** (2.37 GiB, device row gather): bit-identical logits,
   -2.5% at 4K and -2.2% at 16K; memory 16.85/18.10 -> 18.83/20.17 GiB. Upload first:
   a 2.4 GiB contiguous block can fail after 13.1 GiB of repacked weights fragment the
