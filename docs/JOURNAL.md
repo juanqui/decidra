@@ -1,4 +1,28 @@
+
 # Work journal
+
+## 2026-10-20 — session end
+
+Commits (oldest first): `eab402c` mixed per-module W4A8-INT8 with group-64 scales,
+`e7fb6e8` OpenAI-compatible decision routes for LiteLLM, `f0fb849` resident GPU
+embedding table, `94dfcb9` shared-memory group-scale staging, `2cfdb86` fused
+SiLU→down quantizer, `b42fbcc` lone-request batch window.
+
+Final verification on the shipped binary: suite **28/28, KL 3.095e-5, MAE
+8.642e-4, max 7.511e-3**; LiteLLM non-streaming + SSE streaming OK; 16K probe
+**3.843 s at 100% GPU / 435 W / 20.26 GiB**; `cargo test` 47 unit + 10
+integration; clippy `-D warnings` clean. GPU 1 left idle.
+
+Final server medians (3 runs, cache off): short c1/c2/c4/c8/c16 **25.62 /
+40.33 / 48.79 / 52.13 / 55.94 req/s**; long 4K/8K/16K **0.854 / 1.757 /
+3.838 s**. Versus vLLM 0.31.0: **1.36-1.99x** short, **1.44-1.52x** cold long;
+memory 18.83 GiB resident / 20.11 GiB peak vs 21.9 GiB; startup 9.2 s vs 145 s.
+
+Open leads for the next session: GDN chunk-parallel decomposition (14% of 4K),
+prefix caching for shared long prefixes (2x on a 4K shared prefix), CUDA graphs
+for sub-1K shapes (~5% of 4K wall is inter-kernel gaps), and a larger-M Marlin
+tile if the group epilogue can be pushed closer to the per-token rate.
+
 
 Autonomous overnight session. Newest entry first. Numbers are GPU 1 (RTX 4090,
 sm_89), cache disabled for unique-prompt benchmarks.
