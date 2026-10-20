@@ -25,6 +25,16 @@ All A/Bs in-session on the shipped kernel set (clock drift makes cross-session
   (8%) of host/launch time; at 4K ~9 ms (1.1%). CUDA graphs could recover most
   of it, but require pinned per-graph buffer arenas (the pool reuses addresses)
   and capture-safe FlashInfer/Marlin; a whole-forward static path, not a flag.
+- **Blocked-transposed group scales** (`[tile][group][64 rows]`, so each stage
+  loads 64 contiguous rows): bit-identical logits at 4K and 16K, but **15%
+  slower** in-session (up 2.577 vs 2.135 ms/op, down 2.522 vs 2.126, in_qkv
+  1.436 vs 1.259). A temporary `JEV_SKIP_QUANT` probe showed the quantizer
+  costs <0.01 ms/op (full vs skip identical), so the regression is inside the
+  Marlin kernel (register/occupancy from the extra address math), not the load
+  pattern. Reverted; the strided `[row][group]` staging remains.
+- Methodology note: GPU clocks drift 5-7% across sessions (same config 4K
+  812-854 ms). Same-binary/same-session A/Bs are the only trustworthy deltas;
+  the all-linear 1% and the blocked-layout 15% were measured that way.
 - **Remaining real bets**: a CUTLASS-style group-INT8 GEMM (target 400+ TOPS vs
   330; 8-12% end-to-end) and rotation/SmoothQuant-style activation transforms
   so per-token INT8 (463 TOPS) can replace group-64 (up to 15-25% GEMM time,
