@@ -55,15 +55,17 @@ per-row activation scale in the epilogue. Two granularities are compiled:
   scale per row per 64-element K group, f32 accumulation per group, applied together
   with the weight group scale. This is what lets `up_proj`, `down_proj`,
   `in_proj_qkv`, `out_proj`, `q_proj` and GDN `z/b/a` run INT8 without failing the
-  quality gate. It costs ~35-50% more than the per-token epilogue on the same module.
+  quality gate. It costs ~32-35% more than the per-token epilogue on the same module;
+  the shipped kernel uses a fused multiply-add in the group epilogue to trim that to
+  ~30% (4K `up` 2.14 vs 1.62 ms/op).
 
 The granularity is fixed per module at repack (`JEV_NATIVE_INT8_GROUP_SCALE`,
 `JEV_NATIVE_INT8_GROUP_EXCLUDE`). Default: `gate_proj` per-token; the expanded set
 group-64; `o_proj/v_proj/k_proj` stay W4A16 outside layers 56-63; layers 56-63 are
 all-linear INT8. Split-K correctness: a partial slice starts at group
 `slice_row * (thread_k_blocks / group_blocks)`; forgetting this offset corrupts every
-non-zero slice (caught by the 64-row vs 4K A/B). Quality: 28/28, KL 3.095e-5,
-MAE 8.642e-4, max Δ 7.511e-3.
+non-zero slice (caught by the 64-row vs 4K A/B). Quality: 28/28, KL 3.269e-5,
+MAE 7.166e-4, max Δ 1.027e-2.
 
 ### Marlin W4A16 (shipped default)
 
@@ -85,9 +87,9 @@ attention plus gated split-dk GDN and the mixed W4A8-INT8 linears make long cont
 
 | tokens | engine CLI (warm) | resident server | GPU util |
 |---|---:|---:|---:|
-| 4K (4,090) | **0.854 s** | **0.854 s** | 100% |
-| 8K (8,178) | — | **1.757 s** | 100% |
-| 16K (16,383) | **3.777 s** | **3.838 s** | 100% |
+| 4K (4,090) | **0.834 s** | **0.833 s** | 100% |
+| 8K (8,178) | — | **1.711 s** | 100% |
+| 16K (16,383) | **3.689 s** | **3.740 s** | 100% |
 | 32K (32,763) | not rerun | not rerun | — |
 
 Peak memory at 16K is **20.11 GiB** (including the 2.37 GiB resident embedding table)

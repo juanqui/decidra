@@ -44,24 +44,26 @@ Default config: `mlp.gate_proj` uses per-token INT8 scales; `in_proj_z/b/a`, `up
 `v_proj`, `k_proj` stay W4A16 outside layers 56-63; layers 56-63 are all-linear INT8.
 One resident server, exact-decision cache disabled.
 
-Quality (`eval/suite.py` vs CPU AWQ golden): **28/28, KL 3.095e-5, MAE 8.642e-4,
-max Δ 7.511e-3** — all strict gates pass, deterministic across three runs.
+Quality (`eval/suite.py` vs CPU AWQ golden): **28/28, KL 3.269e-5, MAE 7.166e-4,
+max Δ 1.027e-2** — all strict gates pass, deterministic across runs. The group
+epilogue uses a fused multiply-add, so the last-bit ordering differs from the
+pre-FMA kernel; the gate is the contract.
 
 | short, 16 unique ~73-token prompts | c1 | c2 | c4 | c8 | c16 |
 |---|---:|---:|---:|---:|---:|
-| req/s | 25.62 | 40.33 | 48.79 | 52.13 | 55.94 |
-| p50 | 39.5 ms | 49.6 ms | 76.5 ms | 132.2 ms | 168.8 ms |
-| GPU util | 93% | 91% | 93% | 96% | 98% |
+| req/s | 25.78 | 40.73 | 53.10 | 56.97 | 56.93 |
+| p50 | 39.2 ms | 49.1 ms | 74.4 ms | 123.2 ms | 173.1 ms |
+| GPU util | 95% | 95% | 96% | 96% | 97% |
 
 | long single request | 4K | 8K | 16K |
 |---|---:|---:|---:|
-| latency | **0.854 s** | **1.757 s** | **3.838 s** |
-| tok/s | 4,787 | 4,655 | 4,269 |
+| latency | **0.833 s** | **1.711 s** | **3.740 s** |
+| tok/s | 4,908 | 4,779 | 4,380 |
 | GPU util / power | 100% / 384-428 W | 100% / 422 W | 100% / 430 W |
 
 Resident memory is **18.83 GiB** (13.1 GiB weights + 2.37 GiB embedding table + INT8
 scratch) and 16K peaks at **20.11 GiB**, flat across repeated requests. Engine-only single forward (cache off):
-73 tok ~54 ms mean / 37.2 ms min, 4K 854 ms, 16K 3,777 ms. See
+73 tok ~48 ms mean / 37.5 ms min, 4K 834 ms, 16K 3,689 ms. See
 [`VLLM-COMPARISON.md`](VLLM-COMPARISON.md) for the same-GPU vLLM comparison.
 
 ## Server/API evidence
@@ -159,13 +161,16 @@ measurement files are kept only for drift context.
   **30.16 req/s / 2,169 tok/s** (p50 324 ms) versus 29.3-30.5 req/s (p50 388-442 ms).
   A batch of 8 is therefore **not** more efficient per token than 4 in this sweep;
   `MAX_BATCH=8` is retained for burst draining, and the saturation point is batch 4.
-- Batch correctness: batch-of-one is bit-identical to `decision_logits`. Batch>1 has
-  deterministic BF16/M-tiling composition noise (top-1 stable). With the shipped
-  mixed W4A8-INT8 config, the 28-row suite at **c8** vs the CPU golden is top-1
-  **28/28**, MAE **9.85e-4**, max **9.52e-3**; at **c16** it is 28/28, MAE
-  **1.274e-3**, max **1.098e-2**. The strict gate is defined at batch=1 (MAE
-  **8.64e-4**, max **7.51e-3**). W4A16 alone measured worse batched deltas (max
-  **1.78e-2**), so this is the shared batch GEMM path, not the INT8 selection.
+- Batch correctness: batch-of-one matches the CPU golden within the strict gate
+  (max **1.027e-2**, MAE **7.17e-4**); the fused-multiply-add group epilogue
+  changes last-bit ordering versus the pre-FMA kernel, so byte-identity is not
+  claimed. Batch>1 has deterministic BF16/M-tiling composition noise (top-1
+  stable). With the shipped mixed W4A8-INT8 config, the 28-row suite at **c8**
+  vs the CPU golden is top-1 **28/28**, MAE **7.23e-4**, max **1.305e-2**; at
+  **c16** it is 28/28, MAE **1.115e-3**, max **1.251e-2**. The strict gate is
+  defined at batch=1 (MAE **7.17e-4**, max **1.027e-2**). W4A16 alone measured
+  worse batched deltas (max **1.78e-2**), so the batched spread is the shared
+  batch GEMM path, not the INT8 selection.
   Two concurrent 4K requests differ from their single-run probabilities by at most
   **4.2e-5** with identical top-1.
 - Batch metrics observed during the sweep (`jev_native_batch_size` mean per level):
@@ -242,9 +247,10 @@ env): 1K 3.98 -> 2.21 ms; 4K 40.5 -> 22.6; 8K 148.5 -> 82.2; 16K 567 -> 315 ms
 4K 2045.37 -> 2026.26, 8K 4135.33 -> 4068.82, 16K 8557.68 -> 8263.24 ms
 (-294 ms, -3.4%). At 16K this is 0.294 s saved and satisfies the 0.2 s target.
 
-Quality: suite28 is bit-identical (FI unused below 1K). Current default
-(mixed per-module W4A8-INT8 + layers 56-63 all-linear + group-64 scales, full-M) at
-batch=1: 28/28, KL 3.095e-5, MAE **8.642e-4**, max **7.511e-3** — all strict gates pass.
+Quality: suite28 passes. Current default
+(mixed per-module W4A8-INT8 + layers 56-63 all-linear + group-64 scales + FMA
+epilogue, full-M) at batch=1: 28/28, KL 3.269e-5, MAE **7.166e-4**, max **1.027e-2**
+— all strict gates pass.
 4K/8K/16K probe logits: FI on vs
 golden [-0.0469,+0.0313], [+0.0156,-0.0313], [+0.0156,0.0], within the
 W4A16 envelope with unchanged top-1. Disable with
@@ -312,16 +318,16 @@ For a controlled same-GPU comparison against vLLM 0.31.0 (short concurrency swee
 long prefill, repeated exact prompts, startup, memory, KV cache, kernel stacks, and
 quantization probes), see [`VLLM-COMPARISON.md`](VLLM-COMPARISON.md). Final summary:
 with 73-token prompts the shipped native engine wins **every** concurrency:
-**25.62 / 40.33 / 48.79 / 52.13 / 55.94 req/s** at c1/2/4/8/16 (median of 3 runs)
+**25.78 / 40.73 / 53.10 / 56.97 / 56.93 req/s** at c1/2/4/8/16 (median of 3 runs)
 versus vLLM **18.81 / 20.24 / 29.32 / 34.52 / 35.17**, and cold long prefill by
-**44-52%** (4K 0.854 vs 1.302 s, 8K 1.757 vs 2.660, 16K 3.838 vs 5.533;
+**32-36%** (4K 0.833 vs 1.302 s, 8K 1.711 vs 2.660, 16K 3.740 vs 5.533;
 vLLM's earlier 5.052 s 16K number was nested-prefix-cache-assisted). Native
 still wins repeated exact prompts (exact cache), startup (**~9.2 s vs 145 s**),
 GPU memory (**18.83 GiB resident / 20.11 GiB at 16K vs 21.8 GiB**), and verified
 35,310-token context. W4A8-INT8 uses per-module scale granularity: `gate_proj` is
 per-token, the expanded set is group-64, and the residual attention writers stay
-W4A16. Current server suite at batch=1 is 28/28, KL 3.095e-5, **MAE 8.642e-4**,
-max 7.511e-3 — every strict gate passes. All-linear per-token INT8 fails
+W4A16. Current server suite at batch=1 is 28/28, KL 3.269e-5, **MAE 7.166e-4**,
+max 1.027e-2 — every strict gate passes. All-linear per-token INT8 fails
 (max 0.0482, top-1 0.9643); all-linear group-64 fails only max (0.01349) and is
 not the default. FP8 remains off. For the ranked, gated plan to close the
 remaining gaps, see [`OPTIMIZATION-PROPOSAL.md`](OPTIMIZATION-PROPOSAL.md).
@@ -344,9 +350,9 @@ Long-context latency (Marlin resident, mixed W4A8-INT8, chunked GDN, FlashInfer)
 
 | tokens | engine CLI (warm) | resident server | GPU util | peak GPU mem |
 |---|---:|---:|---:|---:|
-| 4K (4,090) | **0.854 s** | **0.854 s** | 100% | 18.83 GiB |
-| 8K (8,178) | — | **1.757 s** | 100% | 20.11 GiB |
-| 16K (16,383) | **3.777 s** | **3.838 s** | 100% | 20.11 GiB |
+| 4K (4,090) | **0.834 s** | **0.833 s** | 100% | 18.83 GiB |
+| 8K (8,178) | — | **1.711 s** | 100% | 20.11 GiB |
+| 16K (16,383) | **3.689 s** | **3.740 s** | 100% | 20.11 GiB |
 | 32K (32,763) | not rerun | not rerun | — | — |
 
 The pre-chunked W4A16 stack measured 2.12 s (4K), 4.23-4.32 s (8K), 8.62-8.97 s (16K)

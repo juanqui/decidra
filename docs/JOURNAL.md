@@ -5,6 +5,17 @@
 > Kernel-level CUTLASS / warp-specialization work is tracked separately in
 > `docs/CUTLASS.md` (measurements, design, checklist).
 
+## 2026-10-20 — FMA group epilogue shipped
+
+The group epilogue now uses `fmaf(c0, bs0*a_s, acc)` instead of
+`acc += c0*bs0*a_s`. Measured on the shipped binary: suite **28/28, KL 3.269e-5,
+MAE 7.166e-4, max 1.027e-2** (gate 0.011); batched c8 max 1.305e-2 / MAE
+7.23e-4, c16 max 1.251e-2 / MAE 1.115e-3, top-1 28/28. Server 4K/8K/16K
+**0.833 / 1.711 / 3.740 s** (from 0.854/1.757/3.838, ~2.5%); short c1-16
+**25.78 / 40.73 / 53.10 / 56.97 / 56.93 req/s** (c4/c8 ~9% better). The exact
+`+= c0*bs0*a_s` order was 1.9% slower and is the documented fallback. The
+pipelined scale-fetch and double-buffered-accumulator designs were attempted and
+rejected; see `docs/CUTLASS.md`.
 
 ## 2026-10-20 — post-goal experiment sweep
 

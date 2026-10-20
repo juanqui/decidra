@@ -1192,8 +1192,8 @@ __global__ void Marlin(
                     *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]));
                 float c1 = __int2float_rn(
                     *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]));
-                frag_c[i][j][0][g] += c0 * bs0 * a_s;
-                frag_c[i][j][1][g] += c1 * bs1 * a_s;
+                frag_c[i][j][0][g] = fmaf(c0, bs0 * a_s, frag_c[i][j][0][g]);
+                frag_c[i][j][1][g] = fmaf(c1, bs1 * a_s, frag_c[i][j][1][g]);
                 frag_c_tmp[i][j][0][g] = 0.0f;
                 frag_c_tmp[i][j][1][g] = 0.0f;
               }

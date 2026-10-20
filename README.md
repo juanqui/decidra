@@ -357,8 +357,8 @@ Single-forward native measurements on GPU 1 with resident packed weights
 Marlin preload is **10.1 s** (repack) and uses **13.1 GiB** resident; the fallback paths
 use 5.8 s / 12.7 GiB. Init is 0.2 s. At 36 tokens Marlin runs at 100% GPU utilization.
 Long-context latency with Marlin + mixed W4A8-INT8 + chunked GDN + FlashInfer:
-**4K 0.854 s**, **8K 1.757 s**, **16K 3.838 s** (resident server; engine CLI 4K
-0.854 s, 16K 3.777 s). Peak memory is **18.83 GiB** resident and **20.11 GiB at 16K**,
+**4K 0.833 s**, **8K 1.711 s**, **16K 3.740 s** (resident server; engine CLI 4K
+0.834 s, 16K 3.689 s). Peak memory is **18.83 GiB** resident and **20.11 GiB at 16K**,
 flat across repeated 16K requests; long prefill holds 100% GPU at ~420-430 W. The
 2.37 GiB embedding table is resident and rows are gathered on-device. The
 pre-chunked W4A16 stack measured 2.12-2.18 / 4.23-4.32 / 8.62-8.97 s. For
@@ -373,32 +373,29 @@ With `JEV_NATIVE_MARLIN=false`, the fallback hybrid policy uses fused only for
 default and ignores both fallback flags.
 
 Live API comparison against the **CPU AWQ golden** (`eval/data/awq-cpu-suite28.json`,
-28 rows, final gated build): top-1 **28/28**, mean KL **3.281e-5**, mean MAE
-**7.365e-4**, max delta **1.010e-2** (`r17`, score). The acceptance gates are
-`top1 1.0`, `max_kl 0.001`, `mean_mae 0.001`, `max_delta 0.011` — **PASS**. Per-kind
-MAE: choice 2.35e-4 / noul 1.237e-3 / score 1.441e-3. The historical production-v2
-baseline is context only: it itself differs from CPU golden by max 0.01377 / mean MAE
-0.00156. See `docs/RESULTS.md` for per-kind tables.
+28 rows, shipped FMA build): top-1 **28/28**, mean KL **3.269e-5**, mean MAE
+**7.166e-4**, max delta **1.027e-2** (`r20`). The acceptance gates are
+`top1 1.0`, `max_kl 0.001`, `mean_mae 0.001`, `max_delta 0.011` — **PASS**. The
+historical production-v2 baseline is context only: it itself differs from CPU golden
+by max 0.01377 / mean MAE 0.00156. See `docs/RESULTS.md` for per-kind tables.
 
-Short live benchmark, batched build (16 unique requests of ~71 prompt tokens/level;
-`scripts/bench-batch.sh`, median of 3 runs): c=1 **15.84 req/s**, p50 **61.9 ms**,
-p95 **75.8 ms**; c=2 **23.38 req/s**, p50 **83.2 ms**; c=4 **30.13 req/s**, p50
-**133.7 ms**, p95 **139.1 ms**, ~**2,133 tok/s**; c=8 **29.25-30.26 req/s**, p50
-**233-256 ms**; c=16 **29.28-30.47 req/s**, p50 **388-442 ms**, ~**2,107-2,192 tok/s**.
-Versus c=1, c=4 is **1.90x** throughput; c=1 is unchanged within noise. Throughput
-saturates near **30 req/s and ~2,100-2,150 tok/s at batch 4**: batches of 8 do not
-raise per-token throughput, and `MAX_BATCH` 12/16 only raise p50 (504-554 ms at c=16),
-so the default stays 8. A 5/10 ms window fills 8-wide batches at c=8 but did not beat
-2 ms on throughput and added ~3/8 ms to a lone request.
+Short live benchmark (16 unique requests of ~73 prompt tokens/level; median of 3
+runs): c=1 **25.8 req/s**, p50 **39.2 ms**; c=2 **40.7 req/s**, p50 **49.1 ms**;
+c=4 **53.1 req/s**, p50 **74.4 ms**; c=8 **57.0 req/s**, p50 **123.2 ms**;
+c=16 **56.9 req/s**, p50 **173.1 ms**, ~**4,209 tok/s**. Versus c=1, c=8 is **2.21x**
+throughput. Throughput saturates near **57 req/s at batch 8**; `MAX_BATCH` 12/16 only
+raise p50, so the default stays 8.
 
-Batch correctness: a batch of one is bit-identical to the single-call path. Batches of
-2+ carry deterministic BF16/M-tiling composition noise (top-1 stable). The 28-row suite
-at c8 is 28/28 vs the CPU golden with MAE **9.85e-4** / max **9.52e-3**; at c16
-28/28 with MAE **1.274e-3** / max **1.098e-2**. The strict gate is a batch=1 gate
-(MAE 8.64e-4 / max 7.51e-3); W4A16 alone measures worse batched deltas (1.78e-2).
+Batch correctness: a batch of one matches the CPU golden within the strict gate
+(max **1.027e-2**, MAE **7.17e-4**); the fused-multiply-add group epilogue changes
+last-bit ordering versus the pre-FMA kernel, so byte-identity is not claimed. Batches
+of 2+ carry deterministic BF16/M-tiling composition noise (top-1 stable). The 28-row
+suite at c8 is 28/28 with MAE **7.23e-4** / max **1.305e-2**; at c16 28/28 with MAE
+**1.115e-3** / max **1.251e-2**. The strict gate is a batch=1 gate (MAE 7.17e-4 /
+max 1.027e-2); W4A16 alone measures worse batched deltas (1.78e-2).
 
 Long context runs alone (it exceeds the 16,384-token batch cap). With the shipped
-mixed W4A8-INT8 path: **4K 0.854 s**, **8K 1.757 s**, **16K 3.838 s**, all choice
+mixed W4A8-INT8 path: **4K 0.833 s**, **8K 1.711 s**, **16K 3.740 s**, all choice
 `true`; the previous 35,310-token probe (16.67 s) remains the verified maximum on the
 24 GB GPU but was not rerun after the INT8 change. The pre-chunked path measured
 2.12-2.18 s / 4.23-4.32 s / 8.62-8.97 s / 20.15 s at those lengths. The 10-row
@@ -475,8 +472,8 @@ WantedBy=multi-user.target
 - One forward produces one decision read-out position. Latency is dominated by prefill;
   nothing is decoded. Marlin single-forward timings: **45.1 ms** (36 tokens),
   **73.0 ms** (76 tokens), **488 ms** (1024 tokens). Long context is GEMM-bound.
-  The current mixed W4A8-INT8 stack measures **4K 0.854 s**, **8K 1.757 s**,
-  **16K 3.838 s** and **16K 20.11 GiB peak**; the earlier chunked-GDN-only stack
+  The current mixed W4A8-INT8 stack measures **4K 0.833 s**, **8K 1.711 s**,
+  **16K 3.740 s** and **16K 20.11 GiB peak**; the earlier chunked-GDN-only stack
   measured 1.63 / 3.27 / 6.77 / 16.67 s at 4K/8K/16K/35K. For seq >= 12,288 the
   low-memory buffer-pool mode drops intermediates early, which keeps repeated 16K
   requests flat.

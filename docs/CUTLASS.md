@@ -75,15 +75,33 @@ Ceiling: the per-token template's 1.616 ms/op. A successful pipelined epilogue
 should land 1.75–1.85 ms/op, i.e. **8–15% on the five group GEMMs** and
 **4–7% end-to-end**, with the 28/28 suite bit-identical.
 
+## 2026-10-20 — shipped: FMA group epilogue; pipeline scale fetch rejected
+
+- **FMA epilogue shipped** (`fmaf(c0, bs0*a_s, acc)`): 4K `up` ~2.14 ms/op
+  (from 2.23), server 4K/8K/16K **0.833 / 1.711 / 3.740 s** (from
+  0.854/1.757/3.838). Suite **28/28, MAE 7.166e-4, max 1.027e-2, KL 3.269e-5**
+  (gate 0.011). Batched: c8 max 1.305e-2 / MAE 7.23e-4, c16 max 1.251e-2 /
+  MAE 1.115e-3, top-1 28/28. The exact `+= c0*bs0*a_s` order remains the
+  bit-identical option but was 1.9% slower.
+- **Pipelined scale fetch** (two shared halves, fill after the wait, fetch the
+  next stage after the fill, tmb≥2): bit-level wrong (4K logits delta
+  -0.203/+0.094) and only ~1% faster. The staging barrier is not the dominant
+  cost. Reverted.
+- **Double-buffered int32 accumulators**: `frag_c_tmp` is 64 registers at tmb=2
+  (not 32); 208+64=272 > 255, so tmb=2 does not fit. tmb=1 fits (191) but
+  quadruples B traffic. A producer/consumer epilogue needs shared partials;
+  `MR_SHARED` is already 101,376 B (99 KB), so it needs a smaller BN tile.
+
 ## Next checklist
 
-- [ ] Double-buffered accumulators at tmb=2; measure up/down/in_qkv.
-- [ ] If that wins, try tmb=4 with a shared partial buffer (BN=64 if needed).
-- [ ] Pipeline the scale fetch with `cp.async`; remove the staging barrier.
-- [ ] Re-run suite (28/28, MAE 8.642e-4, max 7.511e-3) after each step.
+- [x] FMA epilogue: +1.9% long, gate passes.
+- [x] Pipeline scale fetch: attempted, wrong and not faster; reverted.
+- [x] Double-buffered accumulators: does not fit at tmb=2; documented.
+- [ ] Producer/consumer epilogue with a BN=64 tile and shared partials.
 - [ ] Only then consider the full CUTLASS/CuTe SM80 collective port.
 
 ## Status
 
-All experiments above were reverted. HEAD remains the verified kernel
-(`ec1ace4` + `e9a49f3` docs); no uncommitted kernel changes.
+The FMA group epilogue is shipped (1.9% faster, gate passes). The exact-order
+kernel is the documented fallback; the deeper warp-specialized epilogue remains
+the BN=64 producer/consumer design above.
