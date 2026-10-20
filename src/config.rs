@@ -154,7 +154,8 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect();
-        let native_int8_all_layers = env_string("JEV_NATIVE_INT8_ALL_LAYERS").unwrap_or_default();
+        let native_int8_all_layers =
+            env_string("JEV_NATIVE_INT8_ALL_LAYERS").unwrap_or_else(|| "last:8".to_owned());
         let decision_cache_size =
             env_usize("JEV_DECISION_CACHE_SIZE")?.unwrap_or(DEFAULT_DECISION_CACHE_SIZE);
 

@@ -66,14 +66,16 @@ backend b). Strict gates: top-1 1.0, mean KL ≤1e-3, mean MAE ≤1e-3, max delt
 
 | comparison | top-1 | max Δ | mean MAE | mean KL | gate |
 |---|---:|---:|---:|---:|---|
-| native (selective INT8) vs CPU golden | **28/28** | **0.009633** | **0.001015** | 3.454e-5 | max/top-1 pass; **MAE misses 1e-3 by 1.5%** |
+| native (selective INT8, last:8 all-INT8, full-M) vs CPU golden | **28/28** | **0.007479** | **0.000691** | 2.371e-5 | **PASS** |
 | vLLM vs CPU golden | 28/28 | 0.013772 | 0.001551 | 8.509e-5 | max and MAE fail |
 | vLLM vs native live | 28/28 | 0.015007 | 0.001388 | 5.711e-5 | max/MAE fail if native is reference |
 
-The selective INT8 gate is therefore **not a clean pass at the current HEAD**:
-top-1 and max delta pass, MAE is **1.015e-3** — marginally above 1e-3. The
-earlier `9.606e-4` is not reproduced by two identical suite runs on this build.
-Native is still closer to the CPU golden than vLLM on both max delta and MAE.
+The gate-exact configuration is selective INT8 with layers 56-63 switched to
+all-linear INT8 (`JEV_NATIVE_INT8_ALL_LAYERS=last:8`, default), Marlin full-M
+launches and FlashInfer long attention. It passes every strict gate:
+top-1 28/28, max 7.479e-3, MAE 6.908e-4, KL 2.371e-5. Native is closer to the
+CPU golden than vLLM on both max delta and MAE. Final native full forward with
+this configuration: 1K 295 ms, 4K 1231 ms, 8K 2507 ms, 16K 5174 ms.
 
 ## Verdict
 
@@ -82,10 +84,9 @@ Native is still closer to the CPU golden than vLLM on both max delta and MAE.
 - **Long:** native beats vLLM by 6.8–8.2% on cold 4K/8K/16K. vLLM no longer
   wins long single-request prefill once its nested-prefix cache benefit is
   removed.
-- **Quality:** native 28/28, max Δ 0.00963, MAE 0.001015; vLLM 28/28,
-  max Δ 0.01377, MAE 0.00155. Native is closer to the CPU golden, but its
-  selective INT8 MAE is a marginal gate miss that should be reported, not
-  rounded to a pass.
+- **Quality:** native 28/28, max Δ 0.00748, MAE 0.000691, KL 2.37e-5 (PASS);
+  vLLM 28/28, max Δ 0.01377, MAE 0.00155. Native is closer to the CPU golden
+  and passes every gate with the last:8 layer-wise config.
 - vLLM still has the operational advantages of a mature server (continuous
   batching, CUDA graphs, prefix/KV caching) and lower startup/host-RSS costs,
   but on this exact single-GPU decision workload the shipped native engine is

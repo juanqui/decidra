@@ -421,6 +421,6 @@ Layer-wise expansion (all-linear INT8 for one layer subset, current selective
 set elsewhere): `first:N` and `alt:N` fail suite28 for N=8..32; the largest
 passing subset is **`last:8`** (layers 56-63): 28/28, KL 2.37e-5, MAE 6.91e-4,
 max 7.48e-3. On the 500-row holdout it agrees with the selective config on
-481/500 top-1; every flip is a 0.5/0.5 or <0.008-margin tie. Speed is
-negligible (16K 5181.9 -> 5177.7 ms, 1K unchanged), so it is **opt-in**
-(default empty).
+481/500 top-1; every flip is a 0.5/0.5 or <0.008-margin tie. This subset is
+the **server default** (`JEV_NATIVE_INT8_ALL_LAYERS=last:8`); it improves the
+suite margin and costs ~4 ms at 16K. Set it empty to disable.

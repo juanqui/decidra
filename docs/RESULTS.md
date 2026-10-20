@@ -210,9 +210,8 @@ env): 1K 3.98 -> 2.21 ms; 4K 40.5 -> 22.6; 8K 148.5 -> 82.2; 16K 567 -> 315 ms
 (-294 ms, -3.4%). At 16K this is 0.294 s saved and satisfies the 0.2 s target.
 
 Quality: suite28 is bit-identical (FI unused below 1K). Current default
-(selective INT8) at batch=1: 28/28, KL 3.454e-5, MAE **1.015e-3**, max
-9.633e-3. Top-1 and max delta pass; MAE is marginally above the 1e-3 gate
-(the earlier 9.606e-4 is not reproduced). 4K/8K/16K probe logits: FI on vs
+(selective INT8 + layers 56-63 all-linear, full-M) at batch=1: 28/28,
+KL 2.371e-5, MAE **6.908e-4**, max **7.479e-3** — all strict gates pass. 4K/8K/16K probe logits: FI on vs
 golden [-0.0469,+0.0313], [+0.0156,-0.0313], [+0.0156,0.0], within the
 W4A16 envelope with unchanged top-1. Disable with
 `JEV_FLASHINFER_ATTENTION=0`; `JEV_FLASHINFER_MIN_SEQ` sets the threshold.
