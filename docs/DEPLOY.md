@@ -19,7 +19,7 @@ process.
 |---|---|---|
 | HTTP listen | `0.0.0.0:8080` (script: `0.0.0.0:8501`) | `DECIDRA_BIND_ADDR` |
 | GPU | GPU 1 | `CUDA_VISIBLE_DEVICES=1` before process start |
-| Checkpoint | `/srv/models/jev-awq/awq-w4a16-v2` | `DECIDRA_NATIVE_MODEL`, `DECIDRA_CHECKPOINT` |
+| Checkpoint | `/srv/models/jev-awq/awq-w4a16-v2` (W4A16) | `DECIDRA_NATIVE_MODEL`, `DECIDRA_CHECKPOINT` |
 | cuBLAS | loader path | `DECIDRA_CUDA_LIBS` prepended to `LD_LIBRARY_PATH` |
 
 Device selection is process-level: the native engine opens ordinal 0 of the visible set,
@@ -132,6 +132,26 @@ those steps to succeed; there is no partial serving.
 | `DECIDRA_CUDA_LIBS` | unset | Directory with `libcublas.so.13`/`libcublasLt.so.13`. |
 | `CUDA_VISIBLE_DEVICES` | `1` in scripts | GPU pin. |
 | `RUST_LOG` | `decidra=info` | Log filter. |
+
+## W4A8 checkpoint
+
+The W4A8 artifact (`aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8`) uses group-128
+symmetric INT4, per-token INT8 activations, and a rank-32 PEFT LoRA. Run it
+with:
+
+```bash
+export DECIDRA_CHECKPOINT=/srv/models/jev-w4a8
+export DECIDRA_NATIVE_MODEL="$DECIDRA_CHECKPOINT"
+export DECIDRA_TOKENIZER="$DECIDRA_CHECKPOINT/tokenizer.json"
+export DECIDRA_LORA_ADAPTER="$DECIDRA_CHECKPOINT/adapter_vllm"
+export DECIDRA_NATIVE_INT8_EXCLUDE=none
+export DECIDRA_NATIVE_INT8_GROUP_SCALE=false
+export DECIDRA_NATIVE_GPU_EMBED=false      # 21.2 GiB peak; GPU table is 23.3 GiB
+```
+
+The adapter directory must contain `adapter_config.json` and
+`adapter_model.safetensors`. The engine applies the LoRA to every target linear
+and to the `lm_head`; the scale is `lora_alpha / r` from the adapter config.
 
 ## Docker
 

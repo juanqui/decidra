@@ -5,6 +5,23 @@
 > Kernel-level CUTLASS / warp-specialization work is tracked separately in
 > `docs/CUTLASS.md` (measurements, design, checklist).
 
+## 2026-10-20 — W4A8 group-128 checkpoint support
+
+- Loader accepts group 128 with the compressed-tensors offset zero point 8
+  (symmetric checkpoints omit the tensor); Marlin group-8 instantiations for the
+  per-token INT8 path and the W4A16 fallback.
+- PEFT rank-32 LoRA attached to every target linear and `lm_head`; adapter store,
+  `DECIDRA_LORA_ADAPTER`, and `(x A^T) B^T` deltas. `adapter_config.json`
+  writes `lora_alpha` as a float (64.0); parsing it as an integer silently made
+  the scale 1.0 instead of 2.0 — fixed.
+- Engine vs vLLM 0.31.0 with the same W4A8 artifact + adapter: top-1 28/28,
+  max delta 0.0304, MAE 0.00266, KL 2.20e-4.
+- Speed: short 2.2–2.6x vLLM; long 4K/8K/16K 0.903/1.846/4.159 s vs
+  1.386/2.308/4.813. Peak 21.2 GiB with the host embedding table (21.0 GiB
+  vLLM); the GPU table variant is 23.3 GiB and ~3% faster.
+- Docker image built from the same commit, run on GPU 1 with the W4A8 artifact:
+  healthy, suite 28/28, same engine-vs-vLLM deltas.
+
 ## 2026-10-20 — FMA group epilogue shipped
 
 The group epilogue now uses `fmaf(c0, bs0*a_s, acc)` instead of
