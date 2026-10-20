@@ -1,5 +1,35 @@
 
+
 # Work journal
+
+## 2026-10-20 — post-goal experiment sweep
+
+All A/Bs in-session on the shipped kernel set (clock drift makes cross-session
+4K numbers range 812-854 ms; compare only within a session).
+
+- **Group epilogue FMA**: two reassociations tested. `fmaf(c0, bs0*a_s, acc)`
+  is 1.9% faster (16K 3773 -> 3703 ms, up 2.227 -> 2.122 ms/op) and passes at
+  max delta **1.027e-2** / MAE 7.17e-4, but batched c8 rises to **1.30e-2**.
+  `fmaf(c0*bs0, a_s, acc)` is 2.3% faster yet **fails** (max 1.731e-2, MAE
+  1.69e-3). Reverted: the 1.9% does not justify a 6.6% gate margin.
+- **All-linear INT8** (include o/v/k): 4K 823.2 vs 831.4 ms, 16K 3629.3 vs
+  3670.2 ms (**1.0-1.1%**). Gate passes but MAE margin is thinner; remains the
+  documented opt-in `JEV_NATIVE_INT8_EXCLUDE=none`.
+- **GDN phase profile (4K, per chunk cycles)**: solve 36%, state 13%, vnew 12%,
+  QS 12%, QK+mask 10%, out 4%, loads 3%. The chunk-parallel FLA split must add
+  the 128x128 transition `decay*I - K^T W` per chunk (~12 GFLOP/layer) plus
+  ~1.5 GB/layer of state traffic, which cancels the 1.33x occupancy gain;
+  the existing fused-serial design is near the practical limit. A rewrite is
+  only justified with a warp-specialized kernel, not a naive split.
+- **Launch gap**: 73 tokens, event sum 38.3 ms vs forward min 41.5 ms -> ~3.2 ms
+  (8%) of host/launch time; at 4K ~9 ms (1.1%). CUDA graphs could recover most
+  of it, but require pinned per-graph buffer arenas (the pool reuses addresses)
+  and capture-safe FlashInfer/Marlin; a whole-forward static path, not a flag.
+- **Remaining real bets**: a CUTLASS-style group-INT8 GEMM (target 400+ TOPS vs
+  330; 8-12% end-to-end) and rotation/SmoothQuant-style activation transforms
+  so per-token INT8 (463 TOPS) can replace group-64 (up to 15-25% GEMM time,
+  but a checkpoint transformation). Both are multi-day projects.
+
 
 ## 2026-10-20 — session end
 
