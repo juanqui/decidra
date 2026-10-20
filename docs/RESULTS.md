@@ -205,12 +205,15 @@ FlashInfer 0.7.0.post1 (`native/third_party/flashinfer`, built into
 `libfi_prefill.so`); batched requests and shorter prompts keep the native
 tiled/warp kernels. Attention per forward, FI off -> on (same weights, clean
 env): 1K 3.98 -> 2.21 ms; 4K 40.5 -> 22.6; 8K 148.5 -> 82.2; 16K 567 -> 315 ms
-(1.80x). Full forward: 1K 347.2 -> 345.4 ms, 4K 1453.9 -> 1434.5, 8K
-2981.4 -> 2914.6, 16K 6249.8 -> 5998.6 ms (-251 ms, -4.0%).
+(1.80x). Isolated W4A16 integration A/B: full forward 1K 522.07 -> 517.13 ms,
+4K 2045.37 -> 2026.26, 8K 4135.33 -> 4068.82, 16K 8557.68 -> 8263.24 ms
+(-294 ms, -3.4%). At 16K this is 0.294 s saved and satisfies the 0.2 s target.
 
-Quality: suite28 is bit-identical (FI unused below 1K) and passes the gate
-(28/28, KL 3.456e-5, MAE 9.606e-4, max 9.633e-3). 4K/8K/16K probe logits:
-FI on vs golden [-0.0469,+0.0313], [+0.0156,-0.0313], [+0.0156,0.0], within the
+Quality: suite28 is bit-identical (FI unused below 1K). Current default
+(selective INT8) at batch=1: 28/28, KL 3.454e-5, MAE **1.015e-3**, max
+9.633e-3. Top-1 and max delta pass; MAE is marginally above the 1e-3 gate
+(the earlier 9.606e-4 is not reproduced). 4K/8K/16K probe logits: FI on vs
+golden [-0.0469,+0.0313], [+0.0156,-0.0313], [+0.0156,0.0], within the
 W4A16 envelope with unchanged top-1. Disable with
 `JEV_FLASHINFER_ATTENTION=0`; `JEV_FLASHINFER_MIN_SEQ` sets the threshold.
 
@@ -275,16 +278,21 @@ Metrics: `jev_native_batch_size`, `jev_native_batch_queue_depth`,
 For a controlled same-GPU comparison against vLLM 0.31.0 (short concurrency sweep,
 long prefill, repeated exact prompts, startup, memory, KV cache, kernel stacks, and
 quantization probes), see [`VLLM-COMPARISON.md`](VLLM-COMPARISON.md). Final summary:
-with 73-token prompts vLLM wins c1/c8/c16 (**1.21x/1.17x/1.22x rps**) and long
-prefill (**1.25-1.37x**); native wins c2 (**1.14x**), ties c4, and wins repeated
-exact prompts (exact cache), startup (**7.65 s vs 145 s**), GPU idle memory
-(**13.4 vs 21.8 GiB**), and verified 35,310-token context. W4A8-FP8/INT8 probes
-use selective INT8 by default: the residual-writer modules keep W4A16 and
-the server suite passes at batch=1 (28/28, KL 3.46e-5, MAE 9.61e-4, max
-9.63e-3), with 1K 382 -> 333 ms and c8/c16 33.0 -> 37.9/38.1 req/s. Held-out
+with 73-token prompts the shipped native engine now wins **every** concurrency:
+**24.28 / 32.81 / 39.24 / 41.47 / 41.73 req/s** at c1/2/4/8/16 versus vLLM
+**18.81 / 20.24 / 29.32 / 34.52 / 35.17**, and cold long prefill by
+**6.8-8.2%** (4K 1.219 vs 1.302 s, 8K 2.479 vs 2.660, 16K 5.113 vs 5.533;
+vLLM's earlier 5.052 s 16K number was nested-prefix-cache-assisted). Native
+still wins repeated exact prompts (exact cache), startup (**~8 s vs 145 s**),
+GPU idle memory (**13.4 vs 21.8 GiB**), and verified 35,310-token context.
+W4A8-FP8/INT8 probes use selective INT8 by default: the residual-writer modules
+keep W4A16. Current server suite at batch=1 is 28/28, KL 3.454e-5, **MAE
+1.015e-3**, max 9.633e-3: top-1 and max pass, MAE is a marginal 1.5% miss of
+the 1e-3 gate. Held-out
 500-row corpus vs W4A16: 488/500 top-1 (all 12 flips are 0.5/0.5 ties), MAE
 1.31e-3. Batched orders show the same small composition sensitivity as W4A16
-(c8: INT8 max 1.07e-2 vs W4A16 1.78e-2), so it is not INT8-specific.
+(c8: INT8 max 1.07e-2 vs W4A16 1.78e-2), so it is not INT8-specific. The
+1.015e-3 batch=1 MAE is the one gate item to fix before claiming a clean pass.
 All-linear INT8 does not pass (max 0.0589); FP8 remains off. For the
 ranked, gated plan to close the remaining gaps, see
 [`OPTIMIZATION-PROPOSAL.md`](OPTIMIZATION-PROPOSAL.md).
