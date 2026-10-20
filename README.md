@@ -16,57 +16,59 @@ GPU engine are one process. There is no Python at serving time.
 ## Supported models
 
 Decidra is built for specific decision checkpoints. It is not a general-purpose
-model runner. The JEV-27B-VL family currently has two different quantized
-artifacts, and **they are not interchangeable**:
+model runner. Two JEV-27B-VL quantized artifacts are supported:
 
 | artifact | weights | activations | decision head | status |
 |---|---|---|---|---|
-| [`aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8`](https://huggingface.co/aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8) | INT4, group **128**, symmetric | INT8 **per-token dynamic** (`CompressedTensorsWNA8Int`) | rank-32 **LoRA** on all linears + `lm_head` | **not supported yet** |
-| `awq-w4a16-v2` build (local checkpoint) | INT4, group **64**, asymmetric | engine applies INT8 at runtime (group-64 / per-token) | **merged** into the decoder; BF16 head | **supported — all numbers in this README** |
+| [`aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8`](https://huggingface.co/aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8) | INT4, group **128**, symmetric | INT8 **per-token dynamic** (`CompressedTensorsWNA8Int`) | rank-32 **LoRA** on all linears + `lm_head` | **supported** |
+| `awq-w4a16-v2` build (local checkpoint) | INT4, group **64**, asymmetric | engine applies INT8 at runtime (group-64 / per-token) | **merged** decoder + BF16 head | **supported** |
 | [`autotrust/JEV-27B-VL`](https://huggingface.co/autotrust/JEV-27B-VL) | BF16 base | — | LoRA / merged variants | source model; does not fit one 24 GB GPU |
 
-The engine's W4A8 path (INT4 weights + INT8 activations) is real, but it was
-validated on the **W4A16 group-64 merged artifact**, not on the published W4A8
-checkpoint. The published W4A8 checkpoint keeps a full-model rank-32 LoRA and
-uses group-128 symmetric weights; the current loader rejects group sizes other
-than 64 and has no LoRA path.
+### W4A8 checkpoint
 
-### Why the W4A8 checkpoint does not load
+This is the artifact at the link above. The engine loads the group-128
+symmetric INT4 weights (Marlin group-8 kernels, offset zero point 8), quantizes
+activations to INT8 per token, and applies the PEFT rank-32 LoRA from
+`adapter_vllm/` to every target linear and `lm_head`. The LoRA scale is read
+from `adapter_config.json` (`64/32 = 2.0`).
 
-- **Group size**: the loader requires group 64. The W4A8 artifact uses group
-  128 symmetric INT4. The Marlin kernel also needs group-8 instantiations.
-- **Activations**: the artifact declares INT8 per-token dynamic activations.
-  The engine has a per-token path, but it must be selected
-  (`DECIDRA_NATIVE_INT8_GROUP_SCALE=false`) and paired with group-128 weights.
-- **Decision head**: the W4A8 artifact keeps a rank-32 LoRA on all linear
-  modules and `lm_head` (`adapter_vllm/adapter_model.safetensors`). The engine
-  expects merged weights and a merged decision head. Loading the base weights
-  without the LoRA produces the wrong model.
-- **Golden**: the 28-row `eval/data/awq-cpu-suite28.json` baseline belongs to
-  the supported W4A16 artifact. A W4A8 run needs its own CPU golden and gates.
+```bash
+export DECIDRA_CHECKPOINT=/path/to/JEV-27B-VL-AWQ-INT4-W4A8
+export DECIDRA_NATIVE_MODEL="$DECIDRA_CHECKPOINT"
+export DECIDRA_TOKENIZER="$DECIDRA_CHECKPOINT/tokenizer.json"
+export DECIDRA_LORA_ADAPTER="$DECIDRA_CHECKPOINT/adapter_vllm"
+export DECIDRA_NATIVE_INT8_EXCLUDE=none
+export DECIDRA_NATIVE_INT8_GROUP_SCALE=false
+export DECIDRA_NATIVE_GPU_EMBED=false   # 21.2 GiB; drop for ~3% more speed (23.3 GiB)
+./target/release/decidra
+```
 
-### Port checklist for the W4A8 checkpoint
-
-1. Accept group-128 symmetric INT4 (no zero point) in the weights loader.
-2. Add Marlin group-8 instantiations and select them by weight group size.
-3. Use the existing per-token INT8 activation path (matching the artifact's
-   `strategy: token`, `num_bits: 8`).
-4. Apply the rank-32 LoRA deltas for every target linear and `lm_head`, or
-   provide a merged export.
-5. Build a W4A8-specific CPU golden and re-run the suite and benchmarks.
-
-The native backend serves **text decision requests**; the checkpoint's vision
-tower is not used. Other decision models need a backend and checkpoint port; the
-engine does not load them by configuration alone.
-
-Required checkpoint files for the **supported** artifact:
+Required files for this artifact:
 
 ```
-config.json          model architecture and quantization config (group 64)
+config.json          model architecture + group-128 symmetric W4A8 config
+tokenizer.json       tokenizer
+decision_head/       decision_head.json + calibration.json
+model.safetensors    compressed-tensors W4A8 text weights
+adapter_vllm/        adapter_config.json + adapter_model.safetensors (rank 32)
+```
+
+### W4A16 checkpoint
+
+The local `awq-w4a16-v2` build. It uses the engine's original runtime INT8
+activation path (group-64 / per-token); this is the artifact behind the
+**W4A16** tables in Performance and Quality below.
+
+```
+config.json          model architecture + group-64 asymmetric config
 tokenizer.json       tokenizer
 decision_head/       merged decision_head.json + calibration.json
 model*.safetensors   AWQ W4A16 weights
 ```
+
+The native backend serves **text decision requests**; the checkpoint's vision
+tower is not used. Other decision models need a backend and checkpoint port; the
+engine does not load them by configuration alone.
 
 ## Hardware
 
@@ -80,13 +82,12 @@ current Docker image will not run on SM120.
 
 ## Performance
 
-**Artifact:** every number below uses the supported **W4A16 group-64 merged**
-checkpoint with the engine's runtime INT8 activation path. These are **not**
-measurements of the published W4A8 checkpoint.
-
+**Artifacts:** the W4A16 tables use the group-64 merged checkpoint with the
+engine's runtime INT8 path. The W4A8 tables use the HF W4A8 checkpoint + LoRA.
 Same GPU, same prompts, one resident server, exact-decision cache disabled,
-median of 3 runs. vLLM 0.31.0 uses the same W4A16 checkpoint; prefix caching is
-disabled for the cold long-prompt comparison.
+median of 3 runs. vLLM 0.31.0 serves the same checkpoint in each comparison.
+
+### W4A16 checkpoint
 
 Short unique prompts (~73 tokens):
 
@@ -114,17 +115,41 @@ Memory and startup:
 | 16K prefill peak | **20.11 GiB** | ~21.9 GiB |
 | startup to ready | **9.2 s** | 145 s |
 
+### W4A8 checkpoint
+
+Engine uses the host embedding table (21.2 GiB peak). vLLM serves the same W4A8
+artifact and adapter with `--max-num-seqs 8` and fp8 KV.
+
+Short unique prompts (~73 tokens):
+
+| concurrency | Decidra req/s | vLLM req/s | Decidra p50 | vLLM p50 |
+|---:|---:|---:|---:|---:|
+| 1 | **24.2** | 11.05 | **41.6 ms** | 83.2 ms |
+| 2 | **38.3** | 14.76 | **52.4 ms** | 159.7 ms |
+| 4 | **53.6** | 22.50 | **73.9 ms** | 174.4 ms |
+| 8 | **56.8** | 25.91 | **122.6 ms** | 273.4 ms |
+| 16 | **56.6** | 22.82 | **188.0 ms** | 494.1 ms |
+
+Single cold long request:
+
+| prompt | Decidra | vLLM | speedup |
+|---|---:|---:|---:|
+| 4K (4,090 tokens) | **0.903 s** | 1.386 s | **1.53×** |
+| 8K (8,178 tokens) | **1.846 s** | 2.308 s | **1.25×** |
+| 16K (16,383 tokens) | **4.159 s** | 4.813 s | **1.16×** |
+
+Memory: **21.2 GiB** peak for the engine vs **21.0 GiB** for vLLM. The GPU
+embedding table variant is 23.3 GiB and about 3% faster on long prompts.
+
 Long prefill runs at 100% GPU utilization and 420–430 W. Short batching reaches
-95–99% utilization. The GPU is the limit at every measured point.
+90–96% utilization. The GPU is the limit at every measured point.
 
 Full method and per-request tables: [`docs/VLLM-COMPARISON.md`](docs/VLLM-COMPARISON.md).
 Kernel-level numbers: [`docs/KERNELS.md`](docs/KERNELS.md).
 
 ## Quality
 
-**Artifact:** the 28-row golden and all quality numbers below belong to the
-supported W4A16 group-64 merged checkpoint. They do not apply to the published
-W4A8 checkpoint.
+### W4A16 checkpoint
 
 28-row suite against the CPU AWQ golden (`eval/data/awq-cpu-suite28.json`),
 batch size 1:
@@ -139,6 +164,19 @@ Gates: top-1 `1.0`, mean KL ≤ `1e-3`, mean MAE ≤ `1e-3`, max Δ ≤ `0.011`.
 Batched requests have deterministic BF16/M-tiling composition noise. Top-1 was
 28/28 for the suite at c8 and c16; maximum deltas were `1.305e-2` (c8) and
 `1.251e-2` (c16). The strict gates apply at batch size 1.
+
+### W4A8 checkpoint
+
+28-row suite, engine vs vLLM 0.31.0, same W4A8 artifact and adapter:
+
+| comparison | top-1 | max Δ | mean MAE | mean KL |
+|---|---:|---:|---:|---:|
+| Decidra vs vLLM W4A8 | **28/28** | **0.0304** | **0.00266** | **2.20e-4** |
+
+The W4A16 CPU golden does not apply to this artifact. Both implementations use
+the same weights, per-token activation scheme, and LoRA; top-1 agrees on every
+row. The residual probability difference is engine-vs-vLLM numeric (activation
+scales, tile reduction order, and LoRA application order).
 
 ## Build from source
 
@@ -229,9 +267,9 @@ configured model id.
 
 The image contains the server, the embedded kernels, and cuBLAS/cuBLASLt. It does
 not contain the model, a CUDA toolkit, Python, or the FlashInfer source tree.
-The image is about **1.1 GB** on disk; cuBLASLt is the largest component. The
-image does not change checkpoint support: supply a supported checkpoint. The
-published W4A8 artifact is not supported yet.
+The image is about **1.1 GB** on disk; cuBLASLt is the largest component. Both
+supported checkpoints work; the W4A8 artifact needs its `adapter_vllm/` directory
+mounted and the environment below.
 
 Build:
 
@@ -257,6 +295,20 @@ readable by the runtime user.
 
 The host needs the NVIDIA driver and the NVIDIA Container Toolkit. The image
 starts as UID 10001, listens on `0.0.0.0:8080`, and has a `/health` healthcheck.
+
+For the W4A8 checkpoint, mount the artifact (which contains `adapter_vllm/`) and
+set the LoRA/quantization environment:
+
+```bash
+docker run --gpus '"device=1"' --rm -p 8080:8080 \
+  --user "$(id -u):$(id -g)" \
+  -v /path/to/JEV-27B-VL-AWQ-INT4-W4A8:/models:ro \
+  -e DECIDRA_LORA_ADAPTER=/models/adapter_vllm \
+  -e DECIDRA_NATIVE_INT8_EXCLUDE=none \
+  -e DECIDRA_NATIVE_INT8_GROUP_SCALE=false \
+  -e DECIDRA_NATIVE_GPU_EMBED=false \
+  decidra:0.1.0
+```
 
 ### GHCR
 
@@ -342,6 +394,7 @@ Booleans accept `true/false`, `1/0`, `yes/no`, `on/off`.
 | `DECIDRA_CALIBRATION` | checkpoint default | calibration file |
 | `DECIDRA_CALIBRATION_FITTED` | checkpoint default | fitted calibration file |
 | `DECIDRA_HF_SNAPSHOT` | host snapshot path | HF snapshot used for metadata |
+| `DECIDRA_LORA_ADAPTER` | unset | PEFT adapter directory or file; enables the W4A8 LoRA |
 
 ### Native engine
 

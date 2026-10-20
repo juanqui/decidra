@@ -51,6 +51,9 @@ pub struct Kernels {
     pub marlin_fp8_cfgs: Vec<CudaFunction>,
     pub marlin_int8_cfgs: Vec<CudaFunction>,
     pub marlin_int8_group_cfgs: Vec<CudaFunction>,
+    /// Group-128 weight configs: W4A16 and W4A8 per-token.
+    pub marlin_g128_cfgs: Vec<CudaFunction>,
+    pub marlin_int8_g128_cfgs: Vec<CudaFunction>,
     pub marlin_repack: CudaFunction,
     pub marlin_repack_a8: CudaFunction,
     pub awq_fp8_transform: CudaFunction,
@@ -225,6 +228,43 @@ impl Kernels {
                     "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi4ELb0ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
                     "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi4ELb0ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
                     "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi4ELb0ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                ];
+                let mut v = Vec::with_capacity(NAMES.len());
+                for name in NAMES {
+                    let f = gpu.func_marlin(name)?;
+                    f.set_attribute(
+                        CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        MR_SHARED,
+                    )?;
+                    v.push(f);
+                }
+                v
+            },
+            marlin_g128_cfgs: {
+                const NAMES: [&str; 5] = [
+                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb1ELi4ELi8ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb0ELi4ELi8ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi8ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi8ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi8ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                ];
+                let mut v = Vec::with_capacity(NAMES.len());
+                for name in NAMES {
+                    let f = gpu.func_marlin(name)?;
+                    f.set_attribute(
+                        CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        MR_SHARED,
+                    )?;
+                    v.push(f);
+                }
+                v
+            },
+            marlin_int8_g128_cfgs: {
+                const NAMES: [&str; 4] = [
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb0ELi4ELi8ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi8ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi8ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi8ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
                 ];
                 let mut v = Vec::with_capacity(NAMES.len());
                 for name in NAMES {

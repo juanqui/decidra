@@ -138,6 +138,50 @@ impl Store {
         self.map.get(name)
     }
 
+    /// Map a single `.safetensors` file (for example a LoRA adapter).
+    pub fn open_file(path: &Path) -> Result<Self> {
+        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        let hlen = u64::from_le_bytes(mmap[0..8].try_into().unwrap()) as usize;
+        let header: serde_json::Value = serde_json::from_slice(&mmap[8..8 + hlen])
+            .with_context(|| format!("parsing header of {}", path.display()))?;
+        let data_start = 8 + hlen;
+        let obj = header.as_object().context("header is not an object")?;
+        let mut map = HashMap::new();
+        for (name, info) in obj {
+            if name == "__metadata__" {
+                continue;
+            }
+            let dtype = DType::parse(info["dtype"].as_str().context("dtype")?)?;
+            let shape: Vec<usize> = info["shape"]
+                .as_array()
+                .context("shape")?
+                .iter()
+                .map(|x| x.as_u64().unwrap_or(0) as usize)
+                .collect();
+            let off = info["data_offsets"].as_array().context("data_offsets")?;
+            let start = data_start + off[0].as_u64().unwrap() as usize;
+            let end = data_start + off[1].as_u64().unwrap() as usize;
+            map.insert(
+                name.clone(),
+                TensorInfo {
+                    dtype,
+                    shape,
+                    shard: 0,
+                    start,
+                    end,
+                },
+            );
+        }
+        Ok(Self {
+            shards: vec![Shard {
+                _path: path.to_path_buf(),
+                mmap,
+            }],
+            map,
+        })
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.map.contains_key(name)
     }

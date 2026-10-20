@@ -1,9 +1,9 @@
 # Correctness and performance results
 
-> **Artifact:** all results use the supported **W4A16 group-64 merged**
-> checkpoint with the engine's runtime INT8 activation path. The published W4A8
-> checkpoint (`aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8`) is not supported yet; see
-> the README model-support matrix.
+> **Artifact:** all results below use the **W4A16 group-64 merged** checkpoint
+> with the engine's runtime INT8 activation path. The W4A8 checkpoint
+> (`aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8`) is also supported; see the README
+> W4A8 section for its quality and performance.
 
 All results below are for the native backend. Previous serving-stack measurements are
 superseded and are not part of this deployment.

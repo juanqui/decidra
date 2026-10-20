@@ -14,14 +14,23 @@ use half::bf16;
 
 use crate::tensor::Store;
 
+pub struct Lora {
+    /// A: [rank, in], BF16 row-major.
+    pub a: CudaSlice<bf16>,
+    /// B: [out, rank], BF16 row-major, pre-scaled by alpha/rank.
+    pub b: CudaSlice<bf16>,
+    pub rank: usize,
+}
+
 pub enum LinearWeight {
     /// Merged (unquantized) BF16 weight, row-major [out, in].
     Bf16 {
         out: usize,
         in_: usize,
         w: CudaSlice<bf16>,
+        lora: Option<Arc<Lora>>,
     },
-    /// Marlin W4A16 layout (repacked), asymmetric group 64.
+    /// Marlin W4A16 layout (repacked), asymmetric or symmetric group 64/128.
     Marlin {
         out: usize,
         in_: usize,
@@ -33,8 +42,11 @@ pub enum LinearWeight {
         /// Repacked for 8-bit activations (INT8 per-token quantized A).
         int8_a: bool,
         /// Use per-K-group (64) INT8 activation scales instead of one scale per
-        /// row. Requires `int8_a`.
+        /// row. Requires `int8_a` and 64-element weight groups.
         group_a: bool,
+        /// Weight quantization group size (64 or 128).
+        group_size: usize,
+        lora: Option<Arc<Lora>>,
     },
     /// compressed-tensors pack-quantized W4A16 (AWQ/GPTQ), asymmetric int4.
     /// `packed` is I32 [out, ceil(in/8)] with 8 signed nibbles per word along
@@ -49,6 +61,7 @@ pub enum LinearWeight {
         packed: CudaSlice<i32>,
         scale: CudaSlice<bf16>,
         zp: CudaSlice<i32>,
+        lora: Option<Arc<Lora>>,
     },
 }
 
@@ -73,6 +86,23 @@ impl LinearWeight {
         match self {
             LinearWeight::Marlin { group_a, .. } => *group_a,
             _ => false,
+        }
+    }
+
+    pub fn lora(&self) -> Option<&Arc<Lora>> {
+        match self {
+            LinearWeight::Bf16 { lora, .. }
+            | LinearWeight::Marlin { lora, .. }
+            | LinearWeight::PackedW4A16 { lora, .. } => lora.as_ref(),
+        }
+    }
+
+    /// Weight quantization group size (64 or 128); 0 for BF16.
+    pub fn group_size(&self) -> usize {
+        match self {
+            LinearWeight::Marlin { group_size, .. }
+            | LinearWeight::PackedW4A16 { group_size, .. } => *group_size,
+            LinearWeight::Bf16 { .. } => 0,
         }
     }
 
@@ -146,6 +176,10 @@ pub struct WeightProvider<'a> {
     /// Layer indices that use all-linear INT8 (sorted), overriding the
     /// per-module exclusion list inside those layers.
     pub int8_all_layers: Vec<usize>,
+    /// Optional LoRA adapter store (PEFT `base_model.model.<module>` keys).
+    pub lora_store: Option<&'a Store>,
+    /// LoRA scale, `lora_alpha / r`.
+    pub lora_scale: f32,
     stream: Arc<CudaStream>,
     gpu: &'a crate::cuda::Gpu,
     kernels: &'a crate::kernels::Kernels,
@@ -176,6 +210,8 @@ impl<'a> WeightProvider<'a> {
             int8_group_scale: false,
             int8_group_exclude: Vec::new(),
             int8_all_layers: Vec::new(),
+            lora_store: None,
+            lora_scale: 1.0,
             stream: gpu.stream.clone(),
             gpu,
             kernels,
@@ -206,6 +242,7 @@ impl<'a> WeightProvider<'a> {
     /// Packed compressed-tensors modules are detected by the presence of
     /// `<module>.weight_packed`; everything else is merged BF16.
     pub fn linear(&self, module: &str) -> Result<LinearWeight> {
+        let lora = self.lora_for(module)?;
         let packed_name = format!("{module}.weight_packed");
         if self.store.contains(&packed_name) {
             let shape = self.store.i64(&format!("{module}.weight_shape"))?;
@@ -222,14 +259,20 @@ impl<'a> WeightProvider<'a> {
                 bail!("{module}: in={in_} not divisible by groups={groups}");
             }
             let group_size = in_ / groups;
-            if group_size != 64 {
+            if group_size != 64 && group_size != 128 {
                 bail!("{module}: unsupported group size {group_size}");
             }
             let packed_words = in_.div_ceil(8);
             let zp_rows = out.div_ceil(8);
             let packed = self.store.i32(&packed_name)?;
             let scale = self.store.bf16(&format!("{module}.weight_scale"))?;
-            let zp = self.store.i32(&format!("{module}.weight_zero_point"))?;
+            // Symmetric int4 checkpoints omit the zero-point tensor; the
+            // compressed-tensors packing is offset by 8.
+            let zp = if self.store.contains(&format!("{module}.weight_zero_point")) {
+                self.store.i32(&format!("{module}.weight_zero_point"))?
+            } else {
+                vec![0x8888_8888u32 as i32; zp_rows * groups]
+            };
             if packed.len() != out * packed_words {
                 bail!(
                     "{module}: packed has {} words, expected {}",
@@ -254,14 +297,18 @@ impl<'a> WeightProvider<'a> {
                         .iter()
                         .any(|p| !p.is_empty() && module.contains(p)));
             let group_a = use_int8
+                && group_size == 64
                 && self.int8_group_scale
                 && !self
                     .int8_group_exclude
                     .iter()
                     .any(|p| !p.is_empty() && module.contains(p));
             if self.marlin && out % 64 == 0 && in_ % 64 == 0 {
-                if (self.marlin_fp8 || use_int8) && group_size != 64 {
-                    bail!("W4A8 transform requires group_size 64, got {group_size}");
+                if self.marlin_fp8 && group_size != 64 {
+                    bail!("FP8 transform requires group_size 64, got {group_size}");
+                }
+                if use_int8 && group_size != 64 && group_size != 128 {
+                    bail!("W4A8 transform requires group_size 64/128, got {group_size}");
                 }
                 let dbg = std::env::var("DECIDRA_MARLIN_DEBUG").is_ok();
                 if dbg {
@@ -342,6 +389,8 @@ impl<'a> WeightProvider<'a> {
                     a_global,
                     int8_a: use_int8,
                     group_a,
+                    group_size,
+                    lora: lora.clone(),
                 });
             }
             return Ok(LinearWeight::PackedW4A16 {
@@ -351,6 +400,7 @@ impl<'a> WeightProvider<'a> {
                 packed: self.stream.clone_htod(&packed)?,
                 scale: self.stream.clone_htod(&scale)?,
                 zp: self.stream.clone_htod(&zp)?,
+                lora: lora.clone(),
             });
         }
         let wname = format!("{module}.weight");
@@ -367,7 +417,43 @@ impl<'a> WeightProvider<'a> {
             out,
             in_,
             w: self.upload(&wname)?,
+            lora,
         })
+    }
+
+    /// Load a PEFT LoRA pair for `module` and upload it (B pre-scaled).
+    fn lora_for(&self, module: &str) -> Result<Option<Arc<Lora>>> {
+        let Some(store) = self.lora_store else {
+            return Ok(None);
+        };
+        let a_name = format!("base_model.model.{module}.lora_A.weight");
+        if !store.contains(&a_name) {
+            return Ok(None);
+        }
+        let b_name = format!("base_model.model.{module}.lora_B.weight");
+        let a_info = store
+            .info(&a_name)
+            .context("lora_A info")
+            .map(|i| i.shape.clone())?;
+        let b_info = store
+            .info(&b_name)
+            .context("lora_B info")
+            .map(|i| i.shape.clone())?;
+        if a_info.len() != 2 || b_info.len() != 2 {
+            bail!("{module}: LoRA tensors must be 2-D");
+        }
+        let rank = a_info[0];
+        let mut b = store.bf16(&b_name)?;
+        if self.lora_scale != 1.0 {
+            for v in &mut b {
+                *v = bf16::from_f32(v.to_f32() * self.lora_scale);
+            }
+        }
+        Ok(Some(Arc::new(Lora {
+            a: self.stream.clone_htod(&store.bf16(&a_name)?)?,
+            b: self.stream.clone_htod(&b)?,
+            rank,
+        })))
     }
 
     pub fn layer(&self, idx: usize, kind: crate::config::LayerType) -> Result<LayerWeights> {

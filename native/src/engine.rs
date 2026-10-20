@@ -15,7 +15,8 @@ use crate::cuda::Gpu;
 use crate::kernels::{self, Kernels};
 use crate::tensor::Store;
 use crate::weights::{
-    FullAttentionWeights, GdnWeights, LayerWeights, LinearWeight, MixerWeights, WeightProvider,
+    FullAttentionWeights, GdnWeights, LayerWeights, LinearWeight, Lora, MixerWeights,
+    WeightProvider,
 };
 
 struct PoolState {
@@ -299,6 +300,12 @@ impl Stage {
 /// context/stream, so it may be moved to a blocking worker thread (as the
 /// server does with `spawn_blocking`) but it is **not** intended for concurrent
 /// forwards. `decision_logits` stores per-call head ids; serialize calls.
+struct LoraHead {
+    /// A: [rank, hidden].
+    a: CudaSlice<bf16>,
+    rank: usize,
+}
+
 pub struct Engine {
     pub gpu: Gpu,
     pub cfg: Config,
@@ -322,6 +329,11 @@ pub struct Engine {
     /// Keep the embedding table resident on the GPU and gather rows on-device.
     gpu_embed: AtomicBool,
     embedding_table: Mutex<Option<CudaSlice<bf16>>>,
+    /// Optional PEFT adapter (mmap) and its alpha/rank scale.
+    lora_store: Option<Store>,
+    lora_scale: f32,
+    /// lm_head LoRA A [rank, hidden]; B rows are read from `lora_store`.
+    lora_head: Option<LoraHead>,
     /// Use the fused in-shared-memory dequant + tensor-core GEMM. The
     /// dequant-to-BF16 + cuBLAS path remains available as the reference.
     fused_w4a16: AtomicBool,
@@ -456,7 +468,7 @@ impl Engine {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1024usize);
         let weight_cache = Mutex::new(vec![None; cfg.num_hidden_layers]);
-        Ok(Self {
+        let mut engine = Self {
             gpu,
             cfg,
             store,
@@ -476,6 +488,9 @@ impl Engine {
             cache_weights: AtomicBool::new(true),
             gpu_embed: AtomicBool::new(false),
             embedding_table: Mutex::new(None),
+            lora_store: None,
+            lora_scale: 1.0,
+            lora_head: None,
             fused_w4a16: AtomicBool::new(false),
             fused_min_n: std::sync::atomic::AtomicUsize::new(5120),
             fused_max_m: std::sync::atomic::AtomicUsize::new(128),
@@ -505,7 +520,52 @@ impl Engine {
             gdn_chunked_min_seq: std::sync::atomic::AtomicUsize::new(64),
             conv_tiled: AtomicBool::new(true),
             gdn_split_min_seq: std::sync::atomic::AtomicUsize::new(512),
-        })
+        };
+        if let Ok(path) = std::env::var("DECIDRA_LORA_ADAPTER") {
+            if !path.is_empty() {
+                engine.set_lora(std::path::Path::new(&path))?;
+            }
+        }
+        Ok(engine)
+    }
+
+    /// Attach a PEFT LoRA adapter directory (or `adapter_model.safetensors`).
+    pub fn set_lora(&mut self, path: &std::path::Path) -> Result<()> {
+        let (model, dir) = if path.is_dir() {
+            (path.join("adapter_model.safetensors"), path.to_path_buf())
+        } else {
+            (
+                path.to_path_buf(),
+                path.parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .to_path_buf(),
+            )
+        };
+        let cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("adapter_config.json"))
+                .with_context(|| format!("reading adapter_config.json in {}", dir.display()))?,
+        )
+        .context("parsing adapter_config.json")?;
+        let rank = cfg
+            .get("r")
+            .and_then(|v| v.as_u64())
+            .context("adapter_config.json has no r")? as usize;
+        let alpha = cfg
+            .get("lora_alpha")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(rank as f64) as f32;
+        let store = Store::open_file(&model)?;
+        let a_name = "base_model.model.lm_head.lora_A.weight";
+        if !store.contains(a_name) {
+            bail!("LoRA adapter has no lm_head A tensor");
+        }
+        self.lora_scale = alpha / rank as f32;
+        self.lora_head = Some(LoraHead {
+            a: self.gpu.stream.clone_htod(&store.bf16(a_name)?)?,
+            rank,
+        });
+        self.lora_store = Some(store);
+        Ok(())
     }
 
     /// Load every decoder layer into persistent GPU buffers. This is the
@@ -741,6 +801,8 @@ impl Engine {
         p.int8_group_scale = self.int8_group_scale.load(Ordering::Relaxed);
         p.int8_group_exclude = self.int8_group_exclude.lock().unwrap().clone();
         p.int8_all_layers = self.int8_all_layers.lock().unwrap().clone();
+        p.lora_store = self.lora_store.as_ref();
+        p.lora_scale = self.lora_scale;
         Ok(p)
     }
 
@@ -1807,8 +1869,11 @@ impl Engine {
                 out: ids.len(),
                 in_: hidden,
                 w: wd,
+                lora: None,
             };
             let logits = timed!(self, "head", self.gemm(&h, total, &lw)?);
+            let mut logits = logits;
+            self.add_head_lora(&h, total, &ids, &mut logits)?;
             let vals = self.to_f32(&logits, total * ids.len())?;
             drop(logits);
             for &i in &items {
@@ -1944,7 +2009,12 @@ impl Engine {
         } = &w.down_proj
         {
             let (n, k) = (w.down_proj.out(), w.down_proj.in_());
-            if w.down_proj.int8_a() && w.down_proj.group_a() && k == inter && k % 64 == 0 {
+            if w.down_proj.int8_a()
+                && w.down_proj.group_a()
+                && w.down_proj.lora().is_none()
+                && k == inter
+                && k % 64 == 0
+            {
                 let groups = k / 64;
                 let need = seq * k;
                 let mut scratch = self.int8_scratch.lock().unwrap();
@@ -1981,7 +2051,16 @@ impl Engine {
                     self,
                     "gemm.down",
                     self.marlin_int8_launch(
-                        &s.x, &s.scales, qweight, scales, zeros, true, seq, n, k,
+                        &s.x,
+                        &s.scales,
+                        qweight,
+                        scales,
+                        zeros,
+                        true,
+                        w.down_proj.group_size(),
+                        seq,
+                        n,
+                        k,
                     )
                 );
             }
@@ -2537,6 +2616,7 @@ impl Engine {
         scales: &CudaSlice<bf16>,
         zeros: &CudaSlice<i32>,
         group_mode: bool,
+        weight_group: usize,
         rows: usize,
         n: usize,
         k: usize,
@@ -2568,6 +2648,8 @@ impl Engine {
             let idx = if pm <= 8 { 0 } else { tmb - 1 };
             let f = if group_mode {
                 &self.kernels.marlin_int8_group_cfgs[idx]
+            } else if weight_group == 128 {
+                &self.kernels.marlin_int8_g128_cfgs[idx]
             } else {
                 &self.kernels.marlin_int8_cfgs[idx]
             };
@@ -2595,6 +2677,103 @@ impl Engine {
     }
 
     pub fn gemm(&self, x: &CudaSlice<bf16>, rows: usize, w: &LinearWeight) -> Result<Buf> {
+        let mut c = self.gemm_core(x, rows, w)?;
+        if let Some(lora) = w.lora() {
+            self.add_lora(x, rows, w.in_(), w.out(), lora, &mut c)?;
+        }
+        Ok(c)
+    }
+
+    fn blas_gemm_bf16(
+        &self,
+        x: &CudaSlice<bf16>,
+        m: usize,
+        k: usize,
+        w: &CudaSlice<bf16>,
+        n: usize,
+        out: &mut CudaSlice<bf16>,
+    ) -> Result<()> {
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: bf16::from_f32(1.0),
+            lda: k as i32,
+            ldb: k as i32,
+            beta: bf16::from_f32(0.0),
+            ldc: n as i32,
+        };
+        unsafe {
+            self.gpu
+                .blas
+                .gemm(cfg, w, x, out)
+                .context("cublas lora gemm")?;
+        }
+        Ok(())
+    }
+
+    /// Add the low-rank adapter delta: `(x A^T) B^T` (B pre-scaled).
+    fn add_lora(
+        &self,
+        x: &CudaSlice<bf16>,
+        rows: usize,
+        k: usize,
+        n: usize,
+        lora: &Lora,
+        c: &mut Buf,
+    ) -> Result<()> {
+        let mut mid = self.alloc_bf16(rows * lora.rank)?;
+        self.blas_gemm_bf16(x, rows, k, &lora.a, lora.rank, &mut mid)?;
+        let mut delta = self.alloc_bf16(rows * n)?;
+        self.blas_gemm_bf16(&mid, rows, lora.rank, &lora.b, n, &mut delta)?;
+        let mut out = self.alloc_bf16(rows * n)?;
+        kernels::add(&self.gpu, &self.kernels.add, c, &delta, &mut out, rows * n)?;
+        *c = out;
+        Ok(())
+    }
+
+    /// Add the lm_head low-rank delta for the selected head ids.
+    fn add_head_lora(
+        &self,
+        h: &CudaSlice<bf16>,
+        rows: usize,
+        ids: &[u32],
+        logits: &mut Buf,
+    ) -> Result<()> {
+        let (Some(head), Some(store)) = (&self.lora_head, &self.lora_store) else {
+            return Ok(());
+        };
+        let rank = head.rank;
+        let hidden = self.cfg.hidden_size;
+        let mut mid = self.alloc_bf16(rows * rank)?;
+        self.blas_gemm_bf16(h, rows, hidden, &head.a, rank, &mut mid)?;
+        let mut b_host = vec![bf16::ZERO; ids.len() * rank];
+        let b_name = "base_model.model.lm_head.lora_B.weight";
+        for (i, &id) in ids.iter().enumerate() {
+            store.bf16_row(b_name, id as usize, &mut b_host[i * rank..(i + 1) * rank])?;
+        }
+        for v in &mut b_host {
+            *v = bf16::from_f32(v.to_f32() * self.lora_scale);
+        }
+        let b = self.gpu.stream.clone_htod(&b_host)?;
+        let mut delta = self.alloc_bf16(rows * ids.len())?;
+        self.blas_gemm_bf16(&mid, rows, rank, &b, ids.len(), &mut delta)?;
+        let mut out = self.alloc_bf16(rows * ids.len())?;
+        kernels::add(
+            &self.gpu,
+            &self.kernels.add,
+            logits,
+            &delta,
+            &mut out,
+            rows * ids.len(),
+        )?;
+        *logits = out;
+        Ok(())
+    }
+
+    fn gemm_core(&self, x: &CudaSlice<bf16>, rows: usize, w: &LinearWeight) -> Result<Buf> {
         let (n, k) = (w.out(), w.in_());
         if x.len() != rows * k {
             bail!("gemm input has {} values, expected {}", x.len(), rows * k);
@@ -2695,7 +2874,16 @@ impl Engine {
                     }
                     self.cpu_prof.end("i8.quant", __p);
                     return self.marlin_int8_launch(
-                        &s.x, &s.scales, qweight, scales, zeros, group_mode, rows, n, k,
+                        &s.x,
+                        &s.scales,
+                        qweight,
+                        scales,
+                        zeros,
+                        group_mode,
+                        w.group_size(),
+                        rows,
+                        n,
+                        k,
                     );
                 }
                 let __p = self.cpu_prof.begin();
@@ -2725,19 +2913,14 @@ impl Engine {
                     let pm = if par > 0 { par * 64 } else { rest };
                     let tmb = pm.div_ceil(16).min(4);
                     let idx = if pm <= 8 { 0 } else { tmb };
+                    let cfgs = if w.group_size() == 128 {
+                        &self.kernels.marlin_g128_cfgs
+                    } else {
+                        &self.kernels.marlin_cfgs
+                    };
                     kernels::marlin_gemm(
-                        &self.gpu,
-                        &self.kernels.marlin_cfgs[idx],
-                        x,
-                        qweight,
-                        &mut c,
-                        scales,
-                        zeros,
-                        locks,
-                        off,
-                        pm,
-                        n,
-                        k,
+                        &self.gpu, &cfgs[idx], x, qweight, &mut c, scales, zeros, locks, off, pm,
+                        n, k,
                     )?;
                     off += pm;
                     rest -= pm;
@@ -3214,8 +3397,10 @@ impl Engine {
             out: ids.len(),
             in_: hidden,
             w,
+            lora: None,
         };
-        let logits = timed!(self, "head", self.gemm(h, seq, &lw)?);
+        let mut logits = timed!(self, "head", self.gemm(h, seq, &lw)?);
+        self.add_head_lora(h, seq, ids, &mut logits)?;
         self.slice_out(&logits, seq, ids.len(), last_only)
     }
 
@@ -3231,6 +3416,13 @@ impl Engine {
             (seq, all)
         };
         let x = self.gpu.stream.clone_htod(&input)?;
+        let head_mid = if let Some(head) = &self.lora_head {
+            let mut mid = self.alloc_bf16(rows * head.rank)?;
+            self.blas_gemm_bf16(&x, rows, hidden, &head.a, head.rank, &mut mid)?;
+            Some(mid)
+        } else {
+            None
+        };
         let mut out: Vec<f32> = Vec::with_capacity(rows * vocab);
         for start in (0..vocab).step_by(CHUNK) {
             let n = CHUNK.min(vocab - start);
@@ -3247,8 +3439,38 @@ impl Engine {
                 out: n,
                 in_: hidden,
                 w,
+                lora: None,
             };
-            let c = timed!(self, "head", self.gemm(&x, rows, &lw)?);
+            let mut c = timed!(self, "head", self.gemm(&x, rows, &lw)?);
+            if let (Some(mid), Some(head), Some(store)) =
+                (&head_mid, &self.lora_head, &self.lora_store)
+            {
+                let rank = head.rank;
+                let mut b_host = vec![bf16::ZERO; n * rank];
+                for r in 0..n {
+                    store.bf16_row(
+                        "base_model.model.lm_head.lora_B.weight",
+                        start + r,
+                        &mut b_host[r * rank..(r + 1) * rank],
+                    )?;
+                }
+                for v in &mut b_host {
+                    *v = bf16::from_f32(v.to_f32() * self.lora_scale);
+                }
+                let b = self.gpu.stream.clone_htod(&b_host)?;
+                let mut delta = self.alloc_bf16(rows * n)?;
+                self.blas_gemm_bf16(mid, rows, rank, &b, n, &mut delta)?;
+                let mut next = self.alloc_bf16(rows * n)?;
+                kernels::add(
+                    &self.gpu,
+                    &self.kernels.add,
+                    &c,
+                    &delta,
+                    &mut next,
+                    rows * n,
+                )?;
+                c = next;
+            }
             out.extend(self.to_f32(&c, rows * n)?);
         }
         Ok(out)

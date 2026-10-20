@@ -400,6 +400,12 @@ template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFl
 template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 4, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
+// Group-128 W4A16 fallback (per-module exclusions on a g128 checkpoint).
+template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 1, 8, 8, true, 4, 8, false>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 1, 8, 8, false, 4, 8, false>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 4, false, 4, 8, false>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 4, false, 4, 8, false>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kBFloat16.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 4, 16, 4, false, 4, 8, false>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 1, 8, 8, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kFE4M3fn.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
@@ -408,6 +414,11 @@ template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.
 template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 4, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
+// Group-128 W4A8 (per-token INT8 activations; the engine's g128 configs).
+template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 1, 8, 8, false, 4, 8, false>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 4, false, 4, 8, false>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 4, false, 4, 8, false>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 4, 16, 4, false, 4, 8, false>(MARLIN_KERNEL_PARAMS);
 // Per-K-group INT8 activation scales (group 64), same tile configs.
 template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 1, 8, 8, false, 4, 4, false, true>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 4, false, 4, 4, false, true>(MARLIN_KERNEL_PARAMS);

@@ -1,8 +1,8 @@
 # decidra-native
 
-Native CUDA backend for Decidra. The supported checkpoint is the JEV-27B AWQ
-W4A16 **group-64 merged** build; the published W4A8 group-128/LoRA checkpoint is
-not supported yet (see the repository README). The runtime is Rust + custom CUDA
+Native CUDA backend for Decidra. Supports the JEV-27B AWQ W4A16 **group-64
+merged** build and the W4A8 **group-128 symmetric + per-token INT8 + rank-32
+LoRA** checkpoint (see the repository README for the exact environment). The runtime is Rust + custom CUDA
 kernels (+ cuBLAS for BF16 GEMM). It does not import or link an external
 inference runtime, PyTorch, or Python.
 
