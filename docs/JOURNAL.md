@@ -43,7 +43,7 @@ All A/Bs in-session on the shipped kernel set (clock drift makes cross-session
 - **Blocked-transposed group scales** (`[tile][group][64 rows]`, so each stage
   loads 64 contiguous rows): bit-identical logits at 4K and 16K, but **15%
   slower** in-session (up 2.577 vs 2.135 ms/op, down 2.522 vs 2.126, in_qkv
-  1.436 vs 1.259). A temporary `DECIDRA_SKIP_QUANT` probe showed the quantizer
+  1.436 vs 1.259). A temporary skip-quant probe (removed) showed the quantizer
   costs <0.01 ms/op (full vs skip identical), so the regression is inside the
   Marlin kernel (register/occupancy from the extra address math), not the load
   pattern. Reverted; the strided `[row][group]` staging remains.

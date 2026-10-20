@@ -3,6 +3,11 @@ name: docker
 on:
   push:
     branches: [master, main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "LICENSE*"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions:
