@@ -144,9 +144,14 @@ shipped server, and the default remains **W4A16**.
   activation quantization adds ~**2.6% normalized layer MAE** (vs ~0.21% for
   W4A16). Quality is a **no-go** for the strict decision gate. Default OFF.
 - **W4A8-INT8 Marlin** (`kS8 x kU4` + zero points): kernel works and gives
-  **2.6-2.76x** at M=1024/16384 (~457-486 TFLOPS). Layer error is lower than FP8
-  (~0.90-0.96% normalized MAE), but the **full-model suite fails: 26/28, max delta
-  0.657, MAE 0.060**. Default OFF.
+  **2.6-2.76x** at M=1024/16384 (~457-486 TFLOPS). The old full-model numbers
+  (26/28, max 0.657) were dominated by a launcher bug: the tail `pm` group offset
+  the activation pointer by `row_off` bytes instead of `row_off * k`, so every
+  non-multiple-of-64 row count computed its last group from the wrong tokens
+  (visible as the last request of an 8-request batch collapsing toward zero).
+  With that fixed the suite is **27/28, max delta 0.0589, MAE 0.00453**, still
+  outside the gate (top-1 1.0, max 0.011, MAE 0.001). Layer error is lower than
+  FP8 (~0.90-0.96% normalized MAE). Default OFF.
 - The shipped default stays **W4A16**: suite28 28/28, max delta 0.0101, MAE
   0.000736. A future W4A8 attempt needs a full calibration/quality project before it
   can be considered.

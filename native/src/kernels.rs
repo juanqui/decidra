@@ -809,7 +809,7 @@ pub fn marlin_gemm_int8(
     k: usize,
 ) -> Result<()> {
     let (a_base, _ra) = x.device_ptr(&gpu.stream);
-    let a_addr = a_base + row_off as u64;
+    let a_addr = a_base + (row_off * k) as u64;
     let (c_base, _r0) = out.device_ptr_mut(&gpu.stream);
     let c_addr = c_base + (row_off * n * 2) as u64;
     let (b, _r1) = qweight.device_ptr(&gpu.stream);
@@ -869,7 +869,7 @@ pub fn marlin_gemm_fp8(
     k: usize,
 ) -> Result<()> {
     let (a_base, _ra) = x.device_ptr(&gpu.stream);
-    let a_addr = a_base + row_off as u64;
+    let a_addr = a_base + (row_off * k) as u64;
     let (c_base, _r0) = out.device_ptr_mut(&gpu.stream);
     let c_addr = c_base + (row_off * n * 2) as u64;
     let (b, _r1) = qweight.device_ptr(&gpu.stream);
