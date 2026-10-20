@@ -47,7 +47,11 @@ fn autotrust_readout() {
         let logits = engine
             .decision_logits(&tokens, &codes)
             .expect("decision logits");
-        println!("{id}: {} codes, {} prompt tokens", codes.len(), tokens.len());
+        println!(
+            "{id}: {} codes, {} prompt tokens",
+            codes.len(),
+            tokens.len()
+        );
         results.push(serde_json::json!({"id": id, "logits": logits}));
     }
     std::fs::write(
