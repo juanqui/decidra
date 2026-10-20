@@ -163,6 +163,20 @@ shipped server, and the default remains **W4A16**.
   8x73 batch 222 -> 195 ms; all-linear INT8 would be 220 ms / 5.73 s but fails
   the gate. Server c1/c8/c16: **23.4 / 37.9 / 38.1 req/s** (W4A16: 22.9 / 33.0
   / 33.7).
+- Robustness (batch=1 suite gate passed above; three shuffled orders per
+  concurrency, scored against CPU golden): c=1 **28/28, max <=9.63e-3, MAE
+  <=9.61e-4**; c=2 max 7.39e-3..1.73e-2, MAE 1.09e-3..1.49e-3; c=4 max
+  <=9.52e-3, MAE <=1.01e-3; c=8 max <=1.07e-2, MAE <=9.89e-4. Two c=2 orders
+  and one c=4 order miss the gate by a small margin. **W4A16 shows the same
+  sensitivity** (c=2 MAE 1.02e-3, c=8 max 1.78e-2), so this is a property of
+  the batched numerical path, not of INT8: c=8 passes for INT8 and fails for
+  W4A16 in one order. A greedy expansion (enabling up/proj/q/k/v/o/in_qkv/out/
+  down one at a time, clips 1.0/0.995/0.99) found no additional module that
+  keeps the batch=1 gate; the current set is maximal.
+- Held-out corpus (`/srv/models/jev-awq/corpus/test.jsonl`, first 500 rows,
+  c=8, selective INT8 vs W4A16): **488/500 top-1**, KL 3.07e-5, MAE 1.31e-3,
+  max delta 1.29e-2. All 12 disagreements are exact 0.5/0.5 noul ties
+  (margin 1e-4), not confident flips.
 - Disable with `JEV_NATIVE_INT8=false`; the exclusion list, clip factor, and
   flags are `JEV_NATIVE_INT8_EXCLUDE` / `JEV_NATIVE_INT8_CLIP` (server) and
   `--int8-exclude` / `--int8-clip` (native CLI).

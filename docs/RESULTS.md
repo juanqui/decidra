@@ -235,9 +235,12 @@ prefill (**1.25-1.37x**); native wins c2 (**1.14x**), ties c4, and wins repeated
 exact prompts (exact cache), startup (**7.65 s vs 145 s**), GPU idle memory
 (**13.4 vs 21.8 GiB**), and verified 35,310-token context. W4A8-FP8/INT8 probes
 use selective INT8 by default: the residual-writer modules keep W4A16 and
-the server suite passes (28/28, KL 3.46e-5, MAE 9.61e-4, max 9.63e-3), with
-1K 382 -> 333 ms and c8/c16 33.0 -> 37.9 req/s. All-linear INT8 does not pass
-(max 0.0589); FP8 remains off. For the
+the server suite passes at batch=1 (28/28, KL 3.46e-5, MAE 9.61e-4, max
+9.63e-3), with 1K 382 -> 333 ms and c8/c16 33.0 -> 37.9/38.1 req/s. Held-out
+500-row corpus vs W4A16: 488/500 top-1 (all 12 flips are 0.5/0.5 ties), MAE
+1.31e-3. Batched orders show the same small composition sensitivity as W4A16
+(c8: INT8 max 1.07e-2 vs W4A16 1.78e-2), so it is not INT8-specific.
+All-linear INT8 does not pass (max 0.0589); FP8 remains off. For the
 ranked, gated plan to close the remaining gaps, see
 [`OPTIMIZATION-PROPOSAL.md`](OPTIMIZATION-PROPOSAL.md).
 

@@ -376,6 +376,10 @@ Server suite (batch=1, CPU AWQ golden): 28/28, KL 3.456e-5, MAE 9.61e-4, max
 delta 9.63e-3. 36-token golden head top-1 36/36 (max 0.125); 4K/8K/16K probes
 match the W4A16 deltas. Full forward: 1K 382 -> 333 ms, 16K 7.63 -> 6.94 s,
 8x73 batch 222 -> 195 ms. Server c1/c8/c16: 23.4 / 37.9 / 38.1 req/s.
+Held-out 500-row corpus vs W4A16: 488/500 top-1, MAE 1.31e-3, max 1.29e-2; the
+12 flips are exact 0.5/0.5 noul ties. Batched requests show the same small
+numerical sensitivity as W4A16 (c8: INT8 max 1.07e-2 vs W4A16 1.78e-2), so it
+is a property of the batched GEMM path, not of the INT8 selection.
 
 The environment knobs are `JEV_NATIVE_INT8` (server default true),
 `JEV_NATIVE_INT8_EXCLUDE` (comma-separated module substrings) and
