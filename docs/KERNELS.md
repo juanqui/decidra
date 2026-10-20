@@ -85,12 +85,12 @@ attention plus gated split-dk GDN and the mixed W4A8-INT8 linears make long cont
 
 | tokens | engine CLI (warm) | resident server | GPU util |
 |---|---:|---:|---:|
-| 4K (4,090) | **0.878 s** | **0.879 s** | 100% |
-| 8K (8,178) | — | **1.805 s** | 100% |
-| 16K (16,383) | **3.921 s** | **3.921 s** | 100% |
+| 4K (4,090) | **0.854 s** | **0.857 s** | 100% |
+| 8K (8,178) | — | **1.758 s** | 100% |
+| 16K (16,383) | **3.777 s** | **3.833 s** | 100% |
 | 32K (32,763) | not rerun | not rerun | — |
 
-Peak memory at 16K is **20.51 GiB** (including the 2.37 GiB resident embedding table)
+Peak memory at 16K is **20.11 GiB** (including the 2.37 GiB resident embedding table)
 and stays flat across repeated requests (low-memory pool from 12,288 tokens). The earlier W4A16-only stack measured 2.12 s (4K), 4.23-4.32 s
 (8K) and 8.62-8.97 s (16K); the current stack is 2.2-2.3x faster at every length.
 Attention is <1% at 1K and still small at 16K; the remaining time is dominated by the
@@ -104,7 +104,7 @@ the state dot products enough to shift a rare short-prompt logit. Suite row `r22
 
 For **seq >= 12,288** the engine enables a low-memory buffer-pool mode: dropped large
 tensors are released instead of retained, and large MLP/attention/GDN intermediates are
-freed as soon as they are consumed. This keeps repeated 16K requests flat at **20.51 GiB**
+freed as soon as they are consumed. This keeps repeated 16K requests flat at **20.11 GiB**
 and is what makes **32K fit and run on 24 GB** (19.09 GiB peak, ~4.4 GiB headroom).
 
 Long-context correctness against CPU AWQ/SDPA probes (Marlin + tiled FA2 + split GDN):

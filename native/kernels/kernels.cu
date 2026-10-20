@@ -93,6 +93,57 @@ extern "C" __global__ void embed_gather_bf16(
   for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
 }
 
+// SiLU(gate) * up, rounded through BF16, then quantized per K group. This is
+// the down-projection input: it matches silu_mul_bf16 followed by the group
+// quantizer, but removes the intermediate BF16 write and read.
+extern "C" __global__ void quant_int8_group_silu_bf16(
+    const bf16* __restrict__ gate, const bf16* __restrict__ up,
+    int8_t* __restrict__ out, float* __restrict__ scales, int rows, int k,
+    int group, float global_scale, float clip) {
+  int row = blockIdx.x;
+  if (row >= rows) return;
+  const bf16* gr = gate + (size_t)row * k;
+  const bf16* ur = up + (size_t)row * k;
+  int8_t* orow = out + (size_t)row * k;
+  int groups = (k + group - 1) / group;
+  int warp = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int nwarps = blockDim.x >> 5;
+  for (int g = warp; g < groups; g += nwarps) {
+    int base = g * group;
+    int n = min(group, k - base);
+    float v0 = 0.f, v1 = 0.f;
+    if (lane < n) {
+      float gv = bf2f(gr[base + lane]);
+      float s = rb(gv / (1.f + expf(-gv)));
+      v0 = bf2f(f2bf(s * bf2f(ur[base + lane])));
+    }
+    if (lane + 32 < n) {
+      int i = lane + 32;
+      float gv = bf2f(gr[base + i]);
+      float s = rb(gv / (1.f + expf(-gv)));
+      v1 = bf2f(f2bf(s * bf2f(ur[base + i])));
+    }
+    float m = fmaxf(fabsf(v0), fabsf(v1));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+    float scale = fmaxf(m * clip, 1e-10f) / 127.f;
+    if (lane == 0) scales[(size_t)row * groups + g] = scale * global_scale;
+    if (lane < n) {
+      int q = (int)roundf(v0 / scale);
+      q = max(-127, min(127, q));
+      orow[base + lane] = (int8_t)q;
+    }
+    if (lane + 32 < n) {
+      int i = lane + 32;
+      int q = (int)roundf(v1 / scale);
+      q = max(-127, min(127, q));
+      orow[base + i] = (int8_t)q;
+    }
+  }
+}
+
 // Per-token symmetric INT8 quantization of bf16 activations (full-model path).
 extern "C" __global__ void quant_int8_per_token_bf16(
     const bf16* __restrict__ x, int8_t* __restrict__ out,

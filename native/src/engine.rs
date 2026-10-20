@@ -1933,6 +1933,59 @@ impl Engine {
         let inter = self.cfg.intermediate_size;
         let gate = timed!(self, "gemm.gate", self.gemm(h, seq, &w.gate_proj)?);
         let up = timed!(self, "gemm.up", self.gemm(h, seq, &w.up_proj)?);
+        // When the down projection consumes INT8 group-quantized input, fuse
+        // SiLU(gate)*up into the quantizer: no intermediate BF16 tensor and no
+        // separate elementwise launch.
+        if let LinearWeight::Marlin {
+            qweight,
+            scales,
+            zeros,
+            ..
+        } = &w.down_proj
+        {
+            let (n, k) = (w.down_proj.out(), w.down_proj.in_());
+            if w.down_proj.int8_a() && w.down_proj.group_a() && k == inter && k % 64 == 0 {
+                let groups = k / 64;
+                let need = seq * k;
+                let mut scratch = self.int8_scratch.lock().unwrap();
+                if scratch
+                    .as_ref()
+                    .map_or(true, |s| s.x.len() < need || s.scales.len() < seq * groups)
+                {
+                    *scratch = Some(Int8Scratch {
+                        x: self.gpu.stream.alloc_zeros::<i8>(need)?,
+                        scales: self.gpu.stream.alloc_zeros::<f32>(seq * groups)?,
+                    });
+                }
+                let s = scratch.as_mut().unwrap();
+                timed!(
+                    self,
+                    "mlp.act",
+                    kernels::quant_int8_group_silu_bf16(
+                        &self.gpu,
+                        &self.kernels.quant_int8_group_silu_bf16,
+                        &gate,
+                        &up,
+                        &mut s.x,
+                        &mut s.scales,
+                        seq,
+                        k,
+                        64,
+                        w.down_proj.a_global(),
+                        self.int8_clip(),
+                    )?
+                );
+                drop(gate);
+                drop(up);
+                return timed!(
+                    self,
+                    "gemm.down",
+                    self.marlin_int8_launch(
+                        &s.x, &s.scales, qweight, scales, zeros, true, seq, n, k,
+                    )
+                );
+            }
+        }
         let mut act = self.alloc_bf16(seq * inter)?;
         timed!(
             self,
@@ -2472,6 +2525,75 @@ impl Engine {
     }
 
     /// C = x @ W^T for row-major bf16 buffers (cuBLAS column-major trick).
+    /// Launch the Marlin INT8 tile group(s) for an already-quantized activation
+    /// matrix. Split out so the fused SiLU-quant MLP path shares the exact
+    /// launch/chunking logic.
+    #[allow(clippy::too_many_arguments)]
+    fn marlin_int8_launch(
+        &self,
+        xq: &CudaSlice<i8>,
+        a_scales: &CudaSlice<f32>,
+        qweight: &CudaSlice<i32>,
+        scales: &CudaSlice<bf16>,
+        zeros: &CudaSlice<i32>,
+        group_mode: bool,
+        rows: usize,
+        n: usize,
+        k: usize,
+    ) -> Result<Buf> {
+        let __p = self.cpu_prof.begin();
+        let mut c = self.alloc_bf16(rows * n)?;
+        self.cpu_prof.end("i8.c", __p);
+        {
+            let mut g = self.marlin_locks.lock().unwrap();
+            if g.is_none() {
+                *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
+            }
+        }
+        let locks_guard = self.marlin_locks.lock().unwrap();
+        let locks = locks_guard.as_ref().expect("locks initialized");
+        let mut off = 0usize;
+        let mut rest = rows;
+        let chunk = marlin_chunk();
+        let max_par = if chunk == 0 {
+            usize::MAX
+        } else {
+            (chunk / 64).max(1)
+        };
+        let __p = self.cpu_prof.begin();
+        while rest > 0 {
+            let par = (rest / 64).min(max_par);
+            let pm = if par > 0 { par * 64 } else { rest };
+            let tmb = pm.div_ceil(16).min(4);
+            let idx = if pm <= 8 { 0 } else { tmb - 1 };
+            let f = if group_mode {
+                &self.kernels.marlin_int8_group_cfgs[idx]
+            } else {
+                &self.kernels.marlin_int8_cfgs[idx]
+            };
+            kernels::marlin_gemm_int8(
+                &self.gpu,
+                f,
+                xq,
+                qweight,
+                &mut c,
+                scales,
+                zeros,
+                a_scales,
+                locks,
+                off,
+                pm,
+                n,
+                k,
+                if group_mode { 64 } else { 0 },
+            )?;
+            off += pm;
+            rest -= pm;
+        }
+        self.cpu_prof.end("i8.launch", __p);
+        Ok(c)
+    }
+
     pub fn gemm(&self, x: &CudaSlice<bf16>, rows: usize, w: &LinearWeight) -> Result<Buf> {
         let (n, k) = (w.out(), w.in_());
         if x.len() != rows * k {
@@ -2572,57 +2694,9 @@ impl Engine {
                         )?;
                     }
                     self.cpu_prof.end("i8.quant", __p);
-                    let __p = self.cpu_prof.begin();
-                    let mut c = self.alloc_bf16(rows * n)?;
-                    self.cpu_prof.end("i8.c", __p);
-                    {
-                        let mut g = self.marlin_locks.lock().unwrap();
-                        if g.is_none() {
-                            *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
-                        }
-                    }
-                    let locks_guard = self.marlin_locks.lock().unwrap();
-                    let locks = locks_guard.as_ref().expect("locks initialized");
-                    let mut off = 0usize;
-                    let mut rest = rows;
-                    let chunk = marlin_chunk();
-                    let max_par = if chunk == 0 {
-                        usize::MAX
-                    } else {
-                        (chunk / 64).max(1)
-                    };
-                    let __p = self.cpu_prof.begin();
-                    while rest > 0 {
-                        let par = (rest / 64).min(max_par);
-                        let pm = if par > 0 { par * 64 } else { rest };
-                        let tmb = pm.div_ceil(16).min(4);
-                        let idx = if pm <= 8 { 0 } else { tmb - 1 };
-                        let f = if group_mode {
-                            &self.kernels.marlin_int8_group_cfgs[idx]
-                        } else {
-                            &self.kernels.marlin_int8_cfgs[idx]
-                        };
-                        kernels::marlin_gemm_int8(
-                            &self.gpu,
-                            f,
-                            &s.x,
-                            qweight,
-                            &mut c,
-                            scales,
-                            zeros,
-                            &s.scales,
-                            locks,
-                            off,
-                            pm,
-                            n,
-                            k,
-                            if group_mode { 64 } else { 0 },
-                        )?;
-                        off += pm;
-                        rest -= pm;
-                    }
-                    self.cpu_prof.end("i8.launch", __p);
-                    return Ok(c);
+                    return self.marlin_int8_launch(
+                        &s.x, &s.scales, qweight, scales, zeros, group_mode, rows, n, k,
+                    );
                 }
                 let __p = self.cpu_prof.begin();
                 let mut c = self.alloc_bf16(rows * n)?;

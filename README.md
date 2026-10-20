@@ -357,8 +357,8 @@ Single-forward native measurements on GPU 1 with resident packed weights
 Marlin preload is **10.1 s** (repack) and uses **13.1 GiB** resident; the fallback paths
 use 5.8 s / 12.7 GiB. Init is 0.2 s. At 36 tokens Marlin runs at 100% GPU utilization.
 Long-context latency with Marlin + mixed W4A8-INT8 + chunked GDN + FlashInfer:
-**4K 0.879 s**, **8K 1.805 s**, **16K 3.921 s** (resident server; engine CLI 4K
-0.878 s, 16K 3.921 s). Peak memory is **18.83 GiB** resident and **20.51 GiB at 16K**,
+**4K 0.857 s**, **8K 1.758 s**, **16K 3.833 s** (resident server; engine CLI 4K
+0.854 s, 16K 3.777 s). Peak memory is **18.83 GiB** resident and **20.11 GiB at 16K**,
 flat across repeated 16K requests; long prefill holds 100% GPU at ~420-430 W. The
 2.37 GiB embedding table is resident and rows are gathered on-device. The
 pre-chunked W4A16 stack measured 2.12-2.18 / 4.23-4.32 / 8.62-8.97 s. For
@@ -392,17 +392,18 @@ so the default stays 8. A 5/10 ms window fills 8-wide batches at c=8 but did not
 2 ms on throughput and added ~3/8 ms to a lone request.
 
 Batch correctness: a batch of one is bit-identical to the single-call path. Batches of
-2+ carry deterministic BF16/M-tiling noise; two concurrent 4K requests differed from
-their single-request probabilities by at most **4.2e-5** with identical top-1, and the
-28-row suite max delta is **1.010e-2**, inside the 0.011 gate.
+2+ carry deterministic BF16/M-tiling composition noise (top-1 stable). The 28-row suite
+at c8 is 28/28 vs the CPU golden with MAE **9.85e-4** / max **9.52e-3**; at c16
+28/28 with MAE **1.274e-3** / max **1.098e-2**. The strict gate is a batch=1 gate
+(MAE 8.64e-4 / max 7.51e-3); W4A16 alone measures worse batched deltas (1.78e-2).
 
 Long context runs alone (it exceeds the 16,384-token batch cap). With the shipped
-mixed W4A8-INT8 path: **4K 0.879 s**, **8K 1.805 s**, **16K 3.921 s**, all choice
+mixed W4A8-INT8 path: **4K 0.857 s**, **8K 1.758 s**, **16K 3.833 s**, all choice
 `true`; the previous 35,310-token probe (16.67 s) remains the verified maximum on the
 24 GB GPU but was not rerun after the INT8 change. The pre-chunked path measured
 2.12-2.18 s / 4.23-4.32 s / 8.62-8.97 s / 20.15 s at those lengths. The 10-row
 long-context suite is **10/10 top-1**, and repeated 16K runs stay at 4.15 s and
-**20.51 GiB** with no timeout/OOM.
+**20.11 GiB** with no timeout/OOM.
 
 Exact-decision cache (256 entries, default): unique prompts are unchanged (suite28
 28/28 and c1/c4/c8 identical within noise). Repeating one exact prompt 16x at c=1
@@ -474,8 +475,8 @@ WantedBy=multi-user.target
 - One forward produces one decision read-out position. Latency is dominated by prefill;
   nothing is decoded. Marlin single-forward timings: **45.1 ms** (36 tokens),
   **73.0 ms** (76 tokens), **488 ms** (1024 tokens). Long context is GEMM-bound.
-  The current mixed W4A8-INT8 stack measures **4K 0.879 s**, **8K 1.805 s**,
-  **16K 3.921 s** and **16K 20.51 GiB peak**; the earlier chunked-GDN-only stack
+  The current mixed W4A8-INT8 stack measures **4K 0.857 s**, **8K 1.758 s**,
+  **16K 3.833 s** and **16K 20.11 GiB peak**; the earlier chunked-GDN-only stack
   measured 1.63 / 3.27 / 6.77 / 16.67 s at 4K/8K/16K/35K. For seq >= 12,288 the
   low-memory buffer-pool mode drops intermediates early, which keeps repeated 16K
   requests flat.

@@ -98,6 +98,11 @@ the shipped default.
 
 ### Experiments (results)
 
+- **Fused SiLU into the down quantizer**: `silu(gate)*up` is computed in the INT8
+  group quantizer for `down_proj`, removing the separate BF16 elementwise tensor and
+  kernel. Bit-identical logits; down 2.390 -> 2.154 ms/op at 4K, engine 4K 879 ->
+  854 ms, 16K 3.921 -> 3.777 s. Server 4K/8K/16K 0.879/1.805/3.921 ->
+  0.857/1.758/3.833 s; suite unchanged (8.642e-4 / 7.511e-3).
 - **Group-scale staging in shared memory**: each K stage stages the block's 64
   activation scales once (reusing the unused per-row scale reservation in the dynamic
   buffer) instead of 8 global loads per thread per group. Group GEMMs 5-6.5% faster
@@ -121,6 +126,18 @@ the shipped default.
   -2.5% at 4K and -2.2% at 16K; memory 16.85/18.10 -> 18.83/20.17 GiB. Upload first:
   a 2.4 GiB contiguous block can fail after 13.1 GiB of repacked weights fragment the
   pool.
+
+### Batched quality and soak (final config)
+
+- 28-row suite, concurrent requests (server batch path), vs CPU golden:
+  **c8** top-1 28/28, MAE 9.85e-4, max 9.52e-3; **c16** top-1 28/28, MAE
+  1.274e-3, max 1.098e-2. The strict gate is defined at batch=1 (8.64e-4 /
+  7.51e-3); the batched deltas are the documented BF16/M-tiling composition noise
+  (W4A16 alone is worse at 1.78e-2). Top-1 is stable at every concurrency.
+- Mixed soak: 200 suite requests at c16 (39.3 req/s on the mixed suite workload,
+  0 errors, 259/259 ok in metrics) followed by 4K/8K/16K probes (0.881/1.804/
+  3.929 s, 100% GPU). GPU memory 16.5 -> 17.1 GiB after the short soak and
+  21.1 GiB at the 8K/16K peak, flat afterwards; no leak.
 
 ### Measured saturation (expanded group config, server)
 
