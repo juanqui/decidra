@@ -1,6 +1,6 @@
 # decidra-native
 
-Native CUDA inference engine for the JEV-27B checkpoint. The runtime is Rust +
+Native CUDA backend for Decidra (JEV-27B AWQ W4A16 checkpoint). The runtime is Rust +
 custom CUDA kernels (+ cuBLAS for BF16 GEMM). It does not import or link an
 external inference runtime, PyTorch, or Python.
 

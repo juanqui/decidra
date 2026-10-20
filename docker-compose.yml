@@ -9,6 +9,8 @@
 #
 # GPU 0 is not used by this stack.
 
+name: decidra
+
 services:
   decidra:
     build:

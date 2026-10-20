@@ -224,7 +224,9 @@ starts as UID 10001, listens on `0.0.0.0:8080`, and has a `/health` healthcheck.
 
 ### GHCR
 
-The private image is published to GitHub Container Registry:
+The private image is published to GitHub Container Registry. The workflow
+[`.github/workflows/docker.yml`](.github/workflows/docker.yml) builds and pushes
+`0.1.0`, `latest`, and the commit SHA on every push to `master`.
 
 ```bash
 docker login ghcr.io

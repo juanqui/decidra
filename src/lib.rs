@@ -1,4 +1,4 @@
-//! JEV decision server for the `JEV-27B-VL` AWQ W4A16 artifact.
+//! Decidra decision server for the `JEV-27B-VL` AWQ W4A16 artifact.
 //!
 //! The HTTP/API layer, tokenization, prompt construction, decision-head math,
 //! concurrency control, signing, and metrics live here. Inference runs in the
