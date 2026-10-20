@@ -2,6 +2,10 @@
 
 # Work journal
 
+> Kernel-level CUTLASS / warp-specialization work is tracked separately in
+> `docs/CUTLASS.md` (measurements, design, checklist).
+
+
 ## 2026-10-20 — post-goal experiment sweep
 
 All A/Bs in-session on the shipped kernel set (clock drift makes cross-session
