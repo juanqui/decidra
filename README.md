@@ -16,29 +16,55 @@ GPU engine are one process. There is no Python at serving time.
 ## Supported models
 
 Decidra is built for specific decision checkpoints. It is not a general-purpose
-model runner. The current native backend supports this architecture and
-checkpoint layout:
+model runner. The JEV-27B-VL family currently has two different quantized
+artifacts, and **they are not interchangeable**:
 
-| model | checkpoint | architecture |
-|---|---|---|
-| [`autotrust/JEV-27B-VL`](https://huggingface.co/autotrust/JEV-27B-VL) | AWQ W4A16, group 64, compressed-tensors | 27B Qwen3.5-VL text stack; 64 layers (48 GDN linear-attention + 16 full-attention); 16K context; BF16 decision head |
+| artifact | weights | activations | decision head | status |
+|---|---|---|---|---|
+| [`aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8`](https://huggingface.co/aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8) | INT4, group **128**, symmetric | INT8 **per-token dynamic** (`CompressedTensorsWNA8Int`) | rank-32 **LoRA** on all linears + `lm_head` | **not supported yet** |
+| `awq-w4a16-v2` build (local checkpoint) | INT4, group **64**, asymmetric | engine applies INT8 at runtime (group-64 / per-token) | **merged** into the decoder; BF16 head | **supported — all numbers in this README** |
+| [`autotrust/JEV-27B-VL`](https://huggingface.co/autotrust/JEV-27B-VL) | BF16 base | — | LoRA / merged variants | source model; does not fit one 24 GB GPU |
 
-The base model is public at the link above. The engine runs the **AWQ W4A16
-group-64 build** of that model. The quantized artifact is distributed separately
-from the base weights; its model card and `recipe.yaml` are inside the checkpoint
-directory used by the engine.
+The engine's W4A8 path (INT4 weights + INT8 activations) is real, but it was
+validated on the **W4A16 group-64 merged artifact**, not on the published W4A8
+checkpoint. The published W4A8 checkpoint keeps a full-model rank-32 LoRA and
+uses group-128 symmetric weights; the current loader rejects group sizes other
+than 64 and has no LoRA path.
 
-The native backend serves **text decision requests** from this checkpoint. The
-checkpoint's vision tower is not used. Other decision models need a backend and
-checkpoint port; the engine does not load them by configuration alone. More
-models are planned.
+### Why the W4A8 checkpoint does not load
 
-Required checkpoint files:
+- **Group size**: the loader requires group 64. The W4A8 artifact uses group
+  128 symmetric INT4. The Marlin kernel also needs group-8 instantiations.
+- **Activations**: the artifact declares INT8 per-token dynamic activations.
+  The engine has a per-token path, but it must be selected
+  (`DECIDRA_NATIVE_INT8_GROUP_SCALE=false`) and paired with group-128 weights.
+- **Decision head**: the W4A8 artifact keeps a rank-32 LoRA on all linear
+  modules and `lm_head` (`adapter_vllm/adapter_model.safetensors`). The engine
+  expects merged weights and a merged decision head. Loading the base weights
+  without the LoRA produces the wrong model.
+- **Golden**: the 28-row `eval/data/awq-cpu-suite28.json` baseline belongs to
+  the supported W4A16 artifact. A W4A8 run needs its own CPU golden and gates.
+
+### Port checklist for the W4A8 checkpoint
+
+1. Accept group-128 symmetric INT4 (no zero point) in the weights loader.
+2. Add Marlin group-8 instantiations and select them by weight group size.
+3. Use the existing per-token INT8 activation path (matching the artifact's
+   `strategy: token`, `num_bits: 8`).
+4. Apply the rank-32 LoRA deltas for every target linear and `lm_head`, or
+   provide a merged export.
+5. Build a W4A8-specific CPU golden and re-run the suite and benchmarks.
+
+The native backend serves **text decision requests**; the checkpoint's vision
+tower is not used. Other decision models need a backend and checkpoint port; the
+engine does not load them by configuration alone.
+
+Required checkpoint files for the **supported** artifact:
 
 ```
-config.json          model architecture and quantization config
+config.json          model architecture and quantization config (group 64)
 tokenizer.json       tokenizer
-decision_head/       decision_head.json + calibration.json
+decision_head/       merged decision_head.json + calibration.json
 model*.safetensors   AWQ W4A16 weights
 ```
 
@@ -54,8 +80,12 @@ current Docker image will not run on SM120.
 
 ## Performance
 
+**Artifact:** every number below uses the supported **W4A16 group-64 merged**
+checkpoint with the engine's runtime INT8 activation path. These are **not**
+measurements of the published W4A8 checkpoint.
+
 Same GPU, same prompts, one resident server, exact-decision cache disabled,
-median of 3 runs. vLLM 0.31.0 uses the same AWQ checkpoint; prefix caching is
+median of 3 runs. vLLM 0.31.0 uses the same W4A16 checkpoint; prefix caching is
 disabled for the cold long-prompt comparison.
 
 Short unique prompts (~73 tokens):
@@ -91,6 +121,10 @@ Full method and per-request tables: [`docs/VLLM-COMPARISON.md`](docs/VLLM-COMPAR
 Kernel-level numbers: [`docs/KERNELS.md`](docs/KERNELS.md).
 
 ## Quality
+
+**Artifact:** the 28-row golden and all quality numbers below belong to the
+supported W4A16 group-64 merged checkpoint. They do not apply to the published
+W4A8 checkpoint.
 
 28-row suite against the CPU AWQ golden (`eval/data/awq-cpu-suite28.json`),
 batch size 1:
@@ -195,7 +229,9 @@ configured model id.
 
 The image contains the server, the embedded kernels, and cuBLAS/cuBLASLt. It does
 not contain the model, a CUDA toolkit, Python, or the FlashInfer source tree.
-The image is about **1.1 GB** on disk; cuBLASLt is the largest component.
+The image is about **1.1 GB** on disk; cuBLASLt is the largest component. The
+image does not change checkpoint support: supply a supported checkpoint. The
+published W4A8 artifact is not supported yet.
 
 Build:
 

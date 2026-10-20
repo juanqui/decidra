@@ -1,5 +1,10 @@
 # Native engine vs vLLM 0.31.0 (final, shipped build)
 
+> **Artifact:** all numbers use the supported **W4A16 group-64 merged**
+> checkpoint with the engine's runtime INT8 activation path — not the published
+> W4A8 checkpoint (`aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8`), which the current
+> engine does not load. See the README model-support matrix.
+
 Controlled single-GPU comparison after the final native shipping commits. Both stacks
 loaded the same `/srv/models/jev-awq/awq-w4a16-v2` AWQ artifact and decision head on
 GPU 1 only.
