@@ -1,20 +1,21 @@
 # Native engine vs vLLM 0.31.0 (final, shipped build)
 
-Controlled single-GPU comparison after the final native shipping commits:
-FlashInfer prefill (`78b68cb`), layer-wise INT8 opt-in (`b43ddbc`), full-M Marlin
-default (`722ed8e`), and selective INT8 default. Both stacks loaded the same
-`/srv/models/jev-awq/awq-w4a16-v2` AWQ artifact and decision head on GPU 1 only.
+Controlled single-GPU comparison after the final native shipping commits. Both stacks
+loaded the same `/srv/models/jev-awq/awq-w4a16-v2` AWQ artifact and decision head on
+GPU 1 only.
 
 ## Methodology
 
 - **GPU**: GPU 1, RTX 4090 24 GB; GPU 0 was not used. Clocks ~2,910 MHz SM /
-  11,451 MHz memory; power 280–410 W depending on load.
-- **Native**: current HEAD `722ed8e`, release binary with `--features native`.
-  Defaults: `JEV_NATIVE_MARLIN=true`, `JEV_NATIVE_INT8=true` (selective default
-  exclusion list), `JEV_NATIVE_GDN_CHUNKED=true`, FlashInfer attention enabled
-  (`JEV_FLASHINFER_MIN_SEQ=1024`), `JEV_NATIVE_MAX_BATCH=8`,
-  `JEV_NATIVE_BATCH_WINDOW_US=2000`, `JEV_NATIVE_MAX_BATCH_TOKENS=16384`.
-  `JEV_DECISION_CACHE_SIZE=0` so unique prompts are actually uncached.
+  11,451 MHz memory; power 280–440 W depending on load.
+- **Native**: release binary with `--features native`. Defaults:
+  `JEV_NATIVE_MARLIN=true`, `JEV_NATIVE_INT8=true`,
+  `JEV_NATIVE_INT8_GROUP_SCALE=true` (group-64 activation scales; `mlp.gate_proj`
+  stays on the faster per-token epilogue), `JEV_NATIVE_GDN_CHUNKED=true`,
+  FlashInfer attention enabled (`JEV_FLASHINFER_MIN_SEQ=1024`),
+  `JEV_NATIVE_MAX_BATCH=8`, `JEV_NATIVE_BATCH_WINDOW_US=2000`,
+  `JEV_NATIVE_MAX_BATCH_TOKENS=16384`. `JEV_DECISION_CACHE_SIZE=0` so unique
+  prompts are actually uncached. One resident server; all levels run back to back.
 - **vLLM**: `vllm/vllm-openai:v0.31.0` (vLLM 0.31.0, Torch 2.13.0+cu130,
   CUDA 13.0), exact A_ref flags `--logprobs-mode processed_logprobs
   --max-model-len 16384 --enable-prefix-caching --mamba-cache-mode align
@@ -35,35 +36,34 @@ default (`722ed8e`), and selective INT8 default. Both stacks loaded the same
 
 | c | native rps | vLLM rps | native p50 / p95 | vLLM p50 / p95 | native tok/s | vLLM tok/s |
 |---:|---:|---:|---|---|---:|---:|
-| 1 | **23.40** | 18.81 | **40.4 / 52.4 ms** | 53.06 / 54.08 ms | **1,656** | 1,373 |
-| 2 | **31.68** | 20.24 | **60.8 / 76.6 ms** | 98.20 / 103.24 ms | **2,243** | 1,478 |
-| 4 | **38.02** | 29.32 | **104.2 / 118.4 ms** | 135.10 / 138.67 ms | **2,692** | 2,140 |
-| 8 | **38.25** | 34.52 | **206.2 / 250.1 ms** | 229.98 / 231.08 ms | **2,706** | 2,522 |
-| 16 | **39.44** | 35.17 | **301.5 / 398.9 ms** | 304.75 / 454.23 ms | **2,837** | 2,600 |
+| 1 | **24.65** | 18.81 | **41.0 / 44.6 ms** | 53.06 / 54.08 ms | **1,806** | 1,373 |
+| 2 | **38.45** | 20.24 | **52.9 / 55.2 ms** | 98.20 / 103.24 ms | **2,808** | 1,478 |
+| 4 | **49.42** | 29.32 | **80.3 / 81.6 ms** | 135.10 / 138.67 ms | **3,608** | 2,140 |
+| 8 | **49.49** | 34.52 | **146.3 / 175.5 ms** | 229.98 / 231.08 ms | **3,616** | 2,522 |
+| 16 | **53.42** | 35.17 | **216.3 / 292.7 ms** | 304.75 / 454.23 ms | **3,949** | 2,600 |
 
-Native is ahead at every concurrency: **1.24× / 1.56× / 1.30× / 1.11× /
-1.12×** req/s. These are the final native medians at HEAD `909c524` with the
-default config (selective INT8 + layers 56-63 all-linear + Marlin full-M +
-FlashInfer), 3 runs, cache disabled. c16 native still uses a second wave
-(p95 399 ms), but vLLM's `max_num_seqs=8` second wave is worse (p95 454 ms).
+Native is ahead at every concurrency: **1.31× / 1.90× / 1.69× / 1.43× /
+1.52×** req/s. These are the final native medians with the shipped default
+config (mixed per-module W4A8-INT8 + layers 56-63 all-linear + Marlin full-M +
+FlashInfer), 3 runs, cache disabled. At c16 the GPU is 80–99% utilized
+(342–372 W); long prefill is 100% (420–430 W).
 
 ## Long single request (cold, exact native prompts, median of 3)
 
 | prompt | native latency | native tok/s | vLLM cold latency | vLLM tok/s | native speedup |
 |---|---:|---:|---:|---:|---:|
-| 4K (4,072 tok) | **1.174 s** | **3,469** | 1.302 s | 3,142 | **1.109×** |
-| 8K (8,169 tok) | **2.378 s** | **3,435** | 2.660 s | 3,075 | **1.119×** |
-| 16K (16,300 tok) | **5.010 s** | **3,253** | 5.533 s | 2,962 | **1.104×** |
+| 4K (4,090 tok) | **0.937 s** | **4,366** | 1.302 s | 3,142 | **1.39×** |
+| 8K (8,178 tok) | **1.918 s** | **4,265** | 2.660 s | 3,075 | **1.39×** |
+| 16K (16,383 tok) | **4.151 s** | **3,947** | 5.533 s | 2,962 | **1.33×** |
 | 35.3K (35,310 tok) | not rerun | — | not runnable (16,384 cap) | — | — |
 
 All choices were `true`. With prefix caching bypassed, **native wins cold
-long prefill by 10.4–11.9%** (HEAD `909c524`, default config, 3 cold runs per
-size; the 16K median is 5.010 s at a 16,300-token prompt). A prompt above
-~16.4K tokens or repeated 16K requests in one server process can hit the
-pooled-buffer memory ceiling with FlashInfer; the measured cold 16K runs use a
-fresh server. The earlier vLLM
-5.052 s 16K number was cache-assisted by the nested 4K prompt; the cold 16K
-vLLM latency is 5.533 s.
+long prefill by 33–39%** (one resident server, 3 cold runs per size, 100% GPU
+utilization, 420–430 W). Six consecutive 16K requests stay at 4.15 s and
+**18.10 GiB peak**, so the earlier pooled-buffer memory ceiling at repeated 16K
+is fixed: the low-memory pool threshold now engages at 12,288 tokens. The
+earlier vLLM 5.052 s 16K number was cache-assisted by the nested 4K prompt; the
+cold 16K vLLM latency is 5.533 s.
 
 ## Quality
 
@@ -73,31 +73,41 @@ backend b). Strict gates: top-1 1.0, mean KL ≤1e-3, mean MAE ≤1e-3, max delt
 
 | comparison | top-1 | max Δ | mean MAE | mean KL | gate |
 |---|---:|---:|---:|---:|---|
-| native (selective INT8, last:8 all-INT8, full-M) vs CPU golden | **28/28** | **0.007479** | **0.000691** | 2.371e-5 | **PASS** |
+| native (mixed W4A8-INT8, last:8 all-INT8, full-M) vs CPU golden | **28/28** | **0.007511** | **0.000864** | 3.095e-5 | **PASS** |
 | vLLM vs CPU golden | 28/28 | 0.013772 | 0.001551 | 8.509e-5 | max and MAE fail |
 | vLLM vs native live | 28/28 | 0.015007 | 0.001388 | 5.711e-5 | max/MAE fail if native is reference |
 
-The gate-exact configuration is selective INT8 with layers 56-63 switched to
-all-linear INT8 (`JEV_NATIVE_INT8_ALL_LAYERS=last:8`, default), Marlin full-M
-launches and FlashInfer long attention. It passes every strict gate:
-top-1 28/28, max 7.479e-3, MAE 6.908e-4, KL 2.371e-5. Native is closer to the
-CPU golden than vLLM on both max delta and MAE. Final native full forward with
-this configuration: 1K 295 ms, 4K 1231 ms, 8K 2507 ms, 16K 5174 ms.
+The gate-exact configuration uses group-64 activation scales for the expanded INT8 set
+(`up_proj`, `down_proj`, `in_proj_qkv`, `out_proj`, `q_proj`, GDN `z/b/a`) and the faster
+per-token epilogue for `gate_proj`; layers 56-63 stay all-linear INT8. It passes every
+strict gate: top-1 28/28, max 7.511e-3, MAE 8.64e-4, KL 3.10e-5, deterministic across
+three runs. Native is closer to the CPU golden than vLLM on both max delta and MAE.
+Final native full forward with this configuration (engine CLI, cache off):
+73 tok ~56 ms mean / 37.6 ms min, 4K 924 ms, 16K 3,900 ms.
+
+## Memory and startup
+
+| metric | native | vLLM 0.31.0 |
+|---|---:|---:|
+| idle/resident GPU memory | **16.85 GiB** (13.1 GiB weights + scratch) | 21,909 MiB |
+| 16K prefill peak | **18.10 GiB** | ~21.9 GiB |
+| repeated 16K requests | flat 18.10 GiB (6 runs) | n/a (16K cap) |
+| startup to ready | **8.8 s** | 145 s |
 
 ## Verdict
 
-- **Short:** native beats vLLM at every concurrency, by 1.11–1.56× req/s and
-  1.1–1.6× lower p50; c16 also has lower p95 (399 vs 454 ms).
-- **Long:** native beats vLLM by 10.4–11.9% on cold 4K/8K/16K. vLLM no longer
-  wins long single-request prefill once its nested-prefix cache benefit is
-  removed.
-- **Quality:** native 28/28, max Δ 0.00748, MAE 0.000691, KL 2.37e-5 (PASS);
-  vLLM 28/28, max Δ 0.01377, MAE 0.00155. Native is closer to the CPU golden
-  and passes every gate with the last:8 layer-wise config.
+- **Short:** native beats vLLM at every concurrency, by 1.31–1.90× req/s and
+  1.3–1.9× lower p50; c16 also has lower p95 (293 vs 454 ms).
+- **Long:** native beats vLLM by 33–39% on cold 4K/8K/16K, at 100% GPU utilization.
+  vLLM no longer wins long single-request prefill once its nested-prefix cache
+  benefit is removed.
+- **Quality:** native 28/28, max Δ 0.00751, MAE 0.000864, KL 3.10e-5 (PASS);
+  vLLM 28/28, max Δ 0.01377, MAE 0.00155 (fails the max/MAE gates). Native is
+  closer to the CPU golden.
+- **Memory:** native is 5.1 GiB leaner at rest and 3.8 GiB leaner at 16K.
 - vLLM still has the operational advantages of a mature server (continuous
-  batching, CUDA graphs, prefix/KV caching) and lower startup/host-RSS costs,
-  but on this exact single-GPU decision workload the shipped native engine is
-  faster on both short and long paths.
+  batching, CUDA graphs, prefix/KV caching), but on this exact single-GPU decision
+  workload the shipped native engine is faster on every measured axis.
 
 ## Repeated exact prompt (historical, not rerun in this pass)
 
@@ -111,7 +121,7 @@ prefix block cannot cache a 58-token prompt. This comparison used
 
 | layer | native | vLLM 0.31.0 |
 |---|---|---|
-| linear | Marlin W4A16 + selective W4A8-INT8 | Marlin W4A16 |
+| linear | Marlin W4A16 + mixed W4A8-INT8 (per-token `gate_proj`, group-64 elsewhere) | Marlin W4A16 |
 | GDN | chunked TF32 WMMA prefill | Triton/FLA chunked |
 | attention | FlashInfer FA2 (≥1K single request), native tiled fallback | FlashInfer FA2-class |
 | batching | FIFO, 8 / 2 ms / 16,384 tokens; one-item batches use the single forward below 1,024 tokens and the batch API above | continuous, chunked prefill, max 8 |
@@ -119,5 +129,5 @@ prefix block cannot cache a 58-token prompt. This comparison used
 | KV | none; exact-decision cache (off in this run) | fp8 paged KV + prefix cache |
 | max context | 35,310 verified | 16,384 |
 
-Raw data: `/tmp/jev-final2/native/`, `/tmp/jev-final2/vllm/`; vLLM cold-long
-runs are in `vllm_long_salt.json`.
+Raw data: `/tmp/jev-final3/native/`; vLLM cold-long runs are in
+`/tmp/jev-final2/native/vllm_long_salt.json`.

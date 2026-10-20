@@ -31,6 +31,7 @@ pub struct Kernels {
     pub gdn_recurrent_split_batched: CudaFunction,
     pub gdn_chunked: CudaFunction,
     pub gdn_chunked_tc: CudaFunction,
+    pub gdn_chunked_tc_prof: CudaFunction,
     pub gdn_chunked_tc_batched: CudaFunction,
     pub conv1d_silu_batched: CudaFunction,
     pub conv1d_silu_tiled: CudaFunction,
@@ -39,6 +40,7 @@ pub struct Kernels {
     pub quant_fp8: CudaFunction,
     pub quant_int8: CudaFunction,
     pub quant_int8_bf16: CudaFunction,
+    pub quant_int8_group_bf16: CudaFunction,
     pub dequant_w4a16: CudaFunction,
     pub gemm_w4a16: CudaFunction,
     pub gemm_w4a16_m128: CudaFunction,
@@ -46,6 +48,7 @@ pub struct Kernels {
     pub marlin_cfgs: Vec<CudaFunction>,
     pub marlin_fp8_cfgs: Vec<CudaFunction>,
     pub marlin_int8_cfgs: Vec<CudaFunction>,
+    pub marlin_int8_group_cfgs: Vec<CudaFunction>,
     pub marlin_repack: CudaFunction,
     pub marlin_repack_a8: CudaFunction,
     pub awq_fp8_transform: CudaFunction,
@@ -132,6 +135,14 @@ impl Kernels {
                 )?;
                 f
             },
+            gdn_chunked_tc_prof: {
+                let f = gpu.func("gdn_chunked_tc_prof")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    90112,
+                )?;
+                f
+            },
             gdn_chunked_tc_batched: {
                 let f = gpu.func("gdn_chunked_tc_batched")?;
                 f.set_attribute(
@@ -147,14 +158,15 @@ impl Kernels {
             quant_fp8: gpu.func("quant_fp8_per_token_f32")?,
             quant_int8: gpu.func("quant_int8_per_token_f32")?,
             quant_int8_bf16: gpu.func("quant_int8_per_token_bf16")?,
+            quant_int8_group_bf16: gpu.func("quant_int8_group_bf16")?,
             dequant_w4a16: gpu.func("dequant_w4a16_bf16")?,
             marlin_cfgs: {
                 const NAMES: [&str; 5] = [
-                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb1ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
-                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
-                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
-                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
-                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb1ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909960ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
                 ];
                 let mut v = Vec::with_capacity(NAMES.len());
                 for name in NAMES {
@@ -169,10 +181,10 @@ impl Kernels {
             },
             marlin_fp8_cfgs: {
                 const NAMES: [&str; 4] = [
-                    "_ZN6marlin6MarlinILl2814749767172868ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
-                    "_ZN6marlin6MarlinILl2814749767172868ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
-                    "_ZN6marlin6MarlinILl2814749767172868ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
-                    "_ZN6marlin6MarlinILl2814749767172868ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl2814749767172868ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl2814749767172868ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl2814749767172868ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl2814749767172868ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
                 ];
                 let mut v = Vec::with_capacity(NAMES.len());
                 for name in NAMES {
@@ -187,10 +199,28 @@ impl Kernels {
             },
             marlin_int8_cfgs: {
                 const NAMES: [&str; 4] = [
-                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
-                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
-                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
-                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi4ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi4ELb0ELb0EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                ];
+                let mut v = Vec::with_capacity(NAMES.len());
+                for name in NAMES {
+                    let f = gpu.func_marlin(name)?;
+                    f.set_attribute(
+                        CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                        MR_SHARED,
+                    )?;
+                    v.push(f);
+                }
+                v
+            },
+            marlin_int8_group_cfgs: {
+                const NAMES: [&str; 4] = [
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi1ELi8ELi8ELb0ELi4ELi4ELb0ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi2ELi16ELi4ELb0ELi4ELi4ELb0ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi3ELi16ELi4ELb0ELi4ELi4ELb0ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
+                    "_ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi4ELb0ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi",
                 ];
                 let mut v = Vec::with_capacity(NAMES.len());
                 for name in NAMES {
@@ -616,6 +646,12 @@ pub fn marlin_transpose(
     Ok(())
 }
 
+fn marlin_debug() -> bool {
+    static DEBUG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("JEV_MARLIN_DEBUG").is_ok());
+    *DEBUG
+}
+
 /// Launch one Marlin tile group. `x` and `out` are the full buffers; the
 /// pointers are offset by `row_off` here.
 #[allow(clippy::too_many_arguments)]
@@ -669,7 +705,7 @@ pub fn marlin_gemm(
     l.arg(&f_reduce);
     l.arg(&MR_SHARED);
     unsafe { l.launch(cfg) }?;
-    if std::env::var("JEV_MARLIN_DEBUG").is_ok() {
+    if marlin_debug() {
         // Log only; a sync here would serialize any profiling run that has the
         // debug variable set. Use JEV_PROFILE / events for timing.
         eprintln!("marlin gemm: m={m} n={n} k={k} off={row_off}");
@@ -796,7 +832,43 @@ pub fn quant_int8_bf16(
     Ok(())
 }
 
-/// INT8-activation Marlin tile group (signed i8 A, f32 per-row scales).
+/// Per-token, per-K-group symmetric INT8 quantization of bf16 activations.
+#[allow(clippy::too_many_arguments)]
+pub fn quant_int8_group_bf16(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    out: &mut CudaSlice<i8>,
+    scales: &mut CudaSlice<f32>,
+    rows: usize,
+    k: usize,
+    group: usize,
+    global_scale: f32,
+    clip: f32,
+    uniform: bool,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (k_i, r_i, g_i) = (k as i32, rows as i32, group as i32);
+    let u_i = uniform as i32;
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(out);
+    l.arg(scales);
+    l.arg(&r_i);
+    l.arg(&k_i);
+    l.arg(&g_i);
+    l.arg(&global_scale);
+    l.arg(&clip);
+    l.arg(&u_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+/// INT8-activation Marlin tile group (signed i8 A, f32 per-row or per-group scales).
 #[allow(clippy::too_many_arguments)]
 pub fn marlin_gemm_int8(
     gpu: &Gpu,
@@ -812,6 +884,7 @@ pub fn marlin_gemm_int8(
     m: usize,
     n: usize,
     k: usize,
+    a_group_size: usize,
 ) -> Result<()> {
     let (a_base, _ra) = x.device_ptr(&gpu.stream);
     let a_addr = a_base + (row_off * k) as u64;
@@ -821,7 +894,12 @@ pub fn marlin_gemm_int8(
     let (s, _r2) = scales.device_ptr(&gpu.stream);
     let (z, _r3) = zp.device_ptr(&gpu.stream);
     let (as_, _r4) = a_scales.device_ptr(&gpu.stream);
-    let as_addr = as_ + (row_off * 4) as u64;
+    let a_row = if a_group_size > 0 {
+        k / a_group_size
+    } else {
+        1
+    };
+    let as_addr = as_ + (row_off * a_row * 4) as u64;
     let (l, _r5) = locks.device_ptr(&gpu.stream);
     let (b_addr, s_addr, z_addr, l_addr) = (b, s, z, l);
     let (m_i, n_i, k_i) = (m as i32, n as i32, k as i32);
@@ -1400,6 +1478,84 @@ where
     ST: DevicePtrMut<f32>,
     O: DevicePtrMut<bf16>,
 {
+    gdn_chunked_impl(
+        gpu, f, q, k, v, g, beta, state, out, seq, heads, dk, dv, None,
+    )
+}
+
+/// Same launch as [`gdn_chunked`], using `gdn_chunked_tc_prof`: each block
+/// appends `clock64()` deltas for the 10 internal phases to `prof`
+/// (`[blocks, 10]`).
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_chunked_prof<Q, K, V, G, B, ST, O>(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    q: &Q,
+    k: &K,
+    v: &V,
+    g: &G,
+    beta: &B,
+    state: &mut ST,
+    out: &mut O,
+    prof: &mut CudaSlice<u64>,
+    seq: usize,
+    heads: usize,
+    dk: usize,
+    dv: usize,
+) -> Result<()>
+where
+    Q: DevicePtr<f32>,
+    K: DevicePtr<f32>,
+    V: DevicePtr<f32>,
+    G: DevicePtr<f32>,
+    B: DevicePtr<f32>,
+    ST: DevicePtrMut<f32>,
+    O: DevicePtrMut<bf16>,
+{
+    gdn_chunked_impl(
+        gpu,
+        f,
+        q,
+        k,
+        v,
+        g,
+        beta,
+        state,
+        out,
+        seq,
+        heads,
+        dk,
+        dv,
+        Some(prof),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gdn_chunked_impl<Q, K, V, G, B, ST, O>(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    q: &Q,
+    k: &K,
+    v: &V,
+    g: &G,
+    beta: &B,
+    state: &mut ST,
+    out: &mut O,
+    seq: usize,
+    heads: usize,
+    dk: usize,
+    dv: usize,
+    prof: Option<&mut CudaSlice<u64>>,
+) -> Result<()>
+where
+    Q: DevicePtr<f32>,
+    K: DevicePtr<f32>,
+    V: DevicePtr<f32>,
+    G: DevicePtr<f32>,
+    B: DevicePtr<f32>,
+    ST: DevicePtrMut<f32>,
+    O: DevicePtrMut<bf16>,
+{
     if dk != 128 || dv != 128 {
         anyhow::bail!("chunked GDN kernel requires dk=dv=128, got dk={dk} dv={dv}");
     }
@@ -1428,6 +1584,10 @@ where
     let (bp, _rb) = beta.device_ptr(&gpu.stream);
     let (sp, _rs) = state.device_ptr_mut(&gpu.stream);
     let (op, _ro) = out.device_ptr_mut(&gpu.stream);
+    let prof_ptr = prof.map(|p| {
+        let (pp, _rp) = p.device_ptr_mut(&gpu.stream);
+        pp
+    });
     let mut l = gpu.stream.launch_builder(f);
     l.arg(&qp);
     l.arg(&kp);
@@ -1441,6 +1601,9 @@ where
     l.arg(&dk_i);
     l.arg(&dv_i);
     l.arg(&vc_i);
+    if let Some(pp) = prof_ptr.as_ref() {
+        l.arg(pp);
+    }
     unsafe { l.launch(cfg) }?;
     Ok(())
 }

@@ -223,16 +223,36 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
   const int4* zp_ptr = (const int4*)zp;
   int* locks = (int*)workspace;
 
-  int max_shared_mem = 0;
-  cudaDeviceGetAttribute(&max_shared_mem,
-                         cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+  // Device attributes and the per-kernel dynamic-shared-memory attribute are
+  // invariant across calls. Querying them in the launch path costs several
+  // microseconds per GEMM (there are hundreds per forward); cache them.
+  struct DevAttrs {
+    int max_shared_mem = 0;
+    int major = 0;
+    int minor = 0;
+  };
+  static thread_local DevAttrs attrs_cache[16];
+  static thread_local bool attrs_valid[16] = {};
+  DevAttrs attrs;
+  if (dev >= 0 && dev < 16 && attrs_valid[dev]) {
+    attrs = attrs_cache[dev];
+  } else {
+    cudaDeviceGetAttribute(&attrs.max_shared_mem,
+                           cudaDevAttrMaxSharedMemoryPerBlockOptin, dev);
+    cudaDeviceGetAttribute(&attrs.major, cudaDevAttrComputeCapabilityMajor,
+                           dev);
+    cudaDeviceGetAttribute(&attrs.minor, cudaDevAttrComputeCapabilityMinor,
+                           dev);
+    if (dev >= 0 && dev < 16) {
+      attrs_cache[dev] = attrs;
+      attrs_valid[dev] = true;
+    }
+  }
+  int max_shared_mem = attrs.max_shared_mem;
   STD_TORCH_CHECK(max_shared_mem > 0);
 
-  int major_capability, minor_capability;
-  cudaDeviceGetAttribute(&major_capability, cudaDevAttrComputeCapabilityMajor,
-                         dev);
-  cudaDeviceGetAttribute(&minor_capability, cudaDevAttrComputeCapabilityMinor,
-                         dev);
+  int major_capability = attrs.major;
+  int minor_capability = attrs.minor;
   STD_TORCH_CHECK(major_capability * 10 + minor_capability >= 75,
                   "marlin kernel only support Turing or newer GPUs.");
   int stages = 4;
@@ -344,8 +364,14 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
           ", num_threads = ", num_threads, ", num_bits = ", num_bits);
     }
 
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         max_shared_mem_new);
+    static thread_local const void* smem_kernel = nullptr;
+    static thread_local int smem_size = -1;
+    if (smem_kernel != (const void*)kernel || smem_size != max_shared_mem_new) {
+      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                           max_shared_mem_new);
+      smem_kernel = (const void*)kernel;
+      smem_size = max_shared_mem_new;
+    }
 
     bool part_use_atomic_add =
         use_atomic_add && div_ceil(prob_m_split, 64) * prob_n <= 2048;
@@ -382,6 +408,11 @@ template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.
 template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
 template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 4, 16, 4, false, 4, 4, false>(MARLIN_KERNEL_PARAMS);
+// Per-K-group INT8 activation scales (group 64), same tile configs.
+template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 1, 8, 8, false, 4, 4, false, true>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 2, 16, 4, false, 4, 4, false, true>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 3, 16, 4, false, 4, 4, false, true>(MARLIN_KERNEL_PARAMS);
+template __global__ void Marlin<vllm::kS8.id(), vllm::kU4.id(), vllm::kBFloat16.id(), vllm::kBFloat16.id(), 256, 4, 16, 4, false, 4, 4, false, true>(MARLIN_KERNEL_PARAMS);
 
 
 }

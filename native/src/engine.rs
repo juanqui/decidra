@@ -147,6 +147,113 @@ impl Prof {
     }
 }
 
+/// Host-side time spent inside each `timed!` region. CUDA event timing also
+/// includes host enqueue gaps, so this separates launch/alloc overhead from
+/// GPU execution. Enabled by `JEV_CPU_PROFILE=1`; reported next to the GPU
+/// table at the end of a forward.
+struct CpuProf {
+    enabled: bool,
+    entries: Mutex<std::collections::HashMap<&'static str, (f64, usize)>>,
+}
+
+impl CpuProf {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var("JEV_CPU_PROFILE").is_ok(),
+            entries: Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn begin(&self) -> Option<std::time::Instant> {
+        if self.enabled {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        }
+    }
+
+    fn end(&self, name: &'static str, start: Option<std::time::Instant>) {
+        let Some(start) = start else { return };
+        let us = start.elapsed().as_secs_f64() * 1e6;
+        let mut m = self.entries.lock().unwrap();
+        let e = m.entry(name).or_insert((0.0, 0));
+        e.0 += us;
+        e.1 += 1;
+    }
+
+    fn report(&self) {
+        if !self.enabled {
+            return;
+        }
+        let mut m = std::mem::take(&mut *self.entries.lock().unwrap());
+        let total: f64 = m.values().map(|v| v.0).sum();
+        if total <= 0.0 {
+            return;
+        }
+        let mut rows: Vec<_> = m.drain().collect();
+        rows.sort_by(|a, b| b.1.0.partial_cmp(&a.1.0).unwrap());
+        eprintln!("--- cpu profile (sum of regions {:.2} ms) ---", total / 1e3);
+        for (name, (us, n)) in rows {
+            eprintln!(
+                "{name:16} {:9.3} ms  {:6.2}%  n={n}  {:.1} us/op",
+                us / 1e3,
+                us / total * 100.0,
+                us / n as f64
+            );
+        }
+    }
+}
+
+/// Accumulated `gdn_chunked_tc_prof` phase counters (`JEV_GDN_PROF=1`).
+#[derive(Default)]
+struct GdnProf {
+    cycles: [u64; 10],
+    blocks: u64,
+    chunks: u64,
+}
+
+const GDN_PHASES: [&str; 10] = [
+    "load", "kk^t", "mask", "solve", "vnew", "qload", "qs", "qk+mask", "out", "state",
+];
+
+fn gemm_debug() -> bool {
+    static DEBUG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("JEV_GEMM_DEBUG").is_ok());
+    *DEBUG
+}
+
+fn gemm_debug_sync() -> bool {
+    static DEBUG: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("JEV_GEMM_DEBUG_SYNC").is_ok());
+    *DEBUG
+}
+
+/// `JEV_MARLIN_CHUNK`: 0 = one launch for the whole M.
+fn marlin_chunk() -> usize {
+    static CHUNK: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("JEV_MARLIN_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    *CHUNK
+}
+
+/// Diagnostic: replicate one row-wide scale to every K group.
+fn int8_group_uniform() -> bool {
+    static UNIFORM: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("JEV_INT8_GROUP_UNIFORM").is_some());
+    *UNIFORM
+}
+
+/// Reused per-token INT8 activation scratch. The worker is serialized, so one
+/// buffer pair serves every INT8 GEMM in a forward; the stream orders the next
+/// quantization after the previous Marlin kernel has consumed it.
+struct Int8Scratch {
+    x: CudaSlice<i8>,
+    scales: CudaSlice<f32>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct LogitsOpts {
     pub head_ids: Option<Vec<u32>>,
@@ -156,7 +263,9 @@ pub struct LogitsOpts {
 macro_rules! timed {
     ($self:expr, $name:expr, $e:expr) => {{
         let __t = $self.prof_begin($name);
+        let __c = $self.cpu_prof.begin();
         let __r = $e;
+        $self.cpu_prof.end($name, __c);
         $self.prof_end($name, __t);
         __r
     }};
@@ -226,15 +335,20 @@ pub struct Engine {
     marlin_fp8: AtomicBool,
     /// Experimental W4A8-INT8 repack/dispatch (default off).
     marlin_int8: AtomicBool,
-    /// Abs-max clipping factor for per-token INT8 activation scales
+    /// Abs-max clip factor for per-token INT8 activation scales
     /// (`--int8-clip`, default 1.0 = no clipping). F32 bits in an AtomicU32.
     int8_clip: std::sync::atomic::AtomicU32,
+    /// Use per-K-group INT8 activation scales in the Marlin W4A8 path.
+    int8_group_scale: AtomicBool,
+    /// Modules that keep per-token scales when group scales are enabled.
+    int8_group_exclude: Mutex<Vec<String>>,
     /// Module-name substrings kept on W4A16 activations under `marlin_int8`.
     int8_exclude: Mutex<Vec<String>>,
     /// Layers that use all-linear INT8 (overrides `int8_exclude` inside them).
     int8_all_layers: Mutex<Vec<usize>>,
     /// Marlin split-K barrier workspace (one int per SM), zeroed once.
     marlin_locks: Mutex<Option<CudaSlice<i32>>>,
+    int8_scratch: Mutex<Option<Int8Scratch>>,
     /// Warp-per-query attention (fast for long contexts); the original block
     /// kernel remains selectable.
     warp_attention: AtomicBool,
@@ -243,6 +357,8 @@ pub struct Engine {
     flashinfer_enabled: AtomicBool,
     flashinfer_min_seq: std::sync::atomic::AtomicUsize,
     prof: Prof,
+    cpu_prof: CpuProf,
+    gdn_prof: Mutex<GdnProf>,
     /// Use the shared-state GDN recurrence (default) and its value-column split.
     gdn_shared: AtomicBool,
     gdn_chunks: std::sync::atomic::AtomicUsize,
@@ -363,14 +479,19 @@ impl Engine {
             marlin_fp8: AtomicBool::new(false),
             marlin_int8: AtomicBool::new(false),
             int8_clip: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()),
+            int8_group_scale: AtomicBool::new(false),
+            int8_group_exclude: Mutex::new(Vec::new()),
             int8_exclude: Mutex::new(Vec::new()),
             int8_all_layers: Mutex::new(Vec::new()),
             marlin_locks: Mutex::new(None),
+            int8_scratch: Mutex::new(None),
             warp_attention: AtomicBool::new(true),
             flashinfer,
             flashinfer_enabled: AtomicBool::new(flashinfer_enabled),
             flashinfer_min_seq: std::sync::atomic::AtomicUsize::new(flashinfer_min_seq),
             prof: Prof::new(),
+            cpu_prof: CpuProf::new(),
+            gdn_prof: Mutex::new(GdnProf::default()),
             gdn_shared: AtomicBool::new(true),
             gdn_chunks: std::sync::atomic::AtomicUsize::new(2),
             gdn_split: AtomicBool::new(true),
@@ -486,6 +607,17 @@ impl Engine {
             .store(clip.clamp(0.01, 1.0).to_bits(), Ordering::Relaxed);
     }
 
+    /// Use per-K-group (64) INT8 activation scales in the Marlin W4A8 path.
+    pub fn set_int8_group_scale(&self, enabled: bool) {
+        self.int8_group_scale.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Modules that keep per-token INT8 scales when group scales are enabled.
+    /// Must be set before `preload_all`, because the choice is fixed at repack.
+    pub fn set_int8_group_exclude(&self, exclude: Vec<String>) {
+        *self.int8_group_exclude.lock().unwrap() = exclude;
+    }
+
     fn int8_clip(&self) -> f32 {
         f32::from_bits(self.int8_clip.load(Ordering::Relaxed))
     }
@@ -557,6 +689,18 @@ impl Engine {
     }
 
     fn prof_report(&self) {
+        self.cpu_prof.report();
+        {
+            let g = std::mem::take(&mut *self.gdn_prof.lock().unwrap());
+            if g.blocks > 0 && g.chunks > 0 {
+                let denom = (g.blocks * g.chunks) as f64;
+                eprintln!("--- gdn phase profile (avg cycles/chunk/block) ---");
+                for (p, name) in GDN_PHASES.iter().enumerate() {
+                    let c = g.cycles[p] as f64 / denom;
+                    eprintln!("{name:10} {c:9.0} cycles  {:6.1} us", c / 2.91e3);
+                }
+            }
+        }
         if !self.prof.enabled {
             return;
         }
@@ -589,6 +733,8 @@ impl Engine {
         p.marlin_fp8 = self.marlin_fp8.load(Ordering::Relaxed);
         p.marlin_int8 = self.marlin_int8.load(Ordering::Relaxed);
         p.int8_exclude = self.int8_exclude.lock().unwrap().clone();
+        p.int8_group_scale = self.int8_group_scale.load(Ordering::Relaxed);
+        p.int8_group_exclude = self.int8_group_exclude.lock().unwrap().clone();
         p.int8_all_layers = self.int8_all_layers.lock().unwrap().clone();
         Ok(p)
     }
@@ -717,16 +863,56 @@ impl Engine {
         let h = self.cfg.hidden_size;
         let name = self.provider()?.embedding();
         let mut host = vec![bf16::ZERO; tokens.len() * h];
-        for (t, &tok) in tokens.iter().enumerate() {
+        for &tok in tokens {
             if tok as usize >= self.cfg.vocab_size {
                 bail!(
                     "token id {tok} out of range (vocab {})",
                     self.cfg.vocab_size
                 );
             }
-            self.store
-                .bf16_row(&name, tok as usize, &mut host[t * h..(t + 1) * h])
-                .with_context(|| format!("embedding row {tok}"))?;
+        }
+        // The gather is host-side mmap traffic and is the only serial CPU step
+        // in a long prefill (23 ms at 4K, ~95 ms at 16K). Rows are independent,
+        // so split them across cores; errors are recorded once and re-raised
+        // after the scope.
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(8)
+            .min(tokens.len().max(1));
+        if workers > 1 && tokens.len() >= 64 {
+            let rows = tokens.len().div_ceil(workers);
+            let err = Mutex::new(None);
+            std::thread::scope(|s| {
+                for (ci, out) in host.chunks_mut(rows * h).enumerate() {
+                    let start = ci * rows;
+                    let n = out.len() / h;
+                    let store = &self.store;
+                    let name = name.as_str();
+                    let err = &err;
+                    s.spawn(move || {
+                        for t in 0..n {
+                            if let Err(e) = store.bf16_row(
+                                name,
+                                tokens[start + t] as usize,
+                                &mut out[t * h..(t + 1) * h],
+                            ) {
+                                *err.lock().unwrap() = Some(e);
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            if let Some(e) = err.into_inner().unwrap() {
+                return Err(e);
+            }
+        } else {
+            for (t, &tok) in tokens.iter().enumerate() {
+                self.store
+                    .bf16_row(&name, tok as usize, &mut host[t * h..(t + 1) * h])
+                    .with_context(|| format!("embedding row {tok}"))?;
+            }
         }
         let mut buf = self.alloc_bf16(tokens.len() * h)?;
         self.gpu.stream.memcpy_htod(&host, &mut *buf)?;
@@ -794,7 +980,7 @@ impl Engine {
                 self.cfg.num_hidden_layers
             );
         }
-        let low_mem = seq >= 24_576;
+        let low_mem = seq >= 12_288;
         let was_low = self.pool.low_mem.swap(low_mem, Ordering::Relaxed);
         let was_low_f32 = self.f32_pool.low_mem.swap(low_mem, Ordering::Relaxed);
         if low_mem && !was_low {
@@ -962,7 +1148,7 @@ impl Engine {
         let b = BatchInfo::new(&self.gpu, tokens)?;
         self.prof.entries.lock().unwrap().clear();
         let total = b.total;
-        let low_mem = total >= 24_576;
+        let low_mem = total >= 12_288;
         let was_low = self.pool.low_mem.swap(low_mem, Ordering::Relaxed);
         let was_low_f32 = self.f32_pool.low_mem.swap(low_mem, Ordering::Relaxed);
         if low_mem && !was_low {
@@ -2037,25 +2223,60 @@ impl Engine {
         let chunk_min = self.gdn_chunked_min_seq.load(Ordering::Relaxed);
         if self.gdn_chunked_tc.load(Ordering::Relaxed) && seq >= chunk_min && dk == 128 && dv == 128
         {
-            timed!(
-                self,
-                "gdn.recurrent",
-                kernels::gdn_chunked(
-                    &self.gpu,
-                    &self.kernels.gdn_chunked_tc,
-                    &*qf,
-                    &*kf,
-                    &*vf,
-                    &*g,
-                    &*beta,
-                    &mut *state,
-                    &mut *core,
-                    seq,
-                    nv,
-                    dk,
-                    dv,
-                )?
-            );
+            if std::env::var("JEV_GDN_PROF").is_ok() {
+                let blocks = (dv / kernels::GDN_CHUNK_VC) * nv;
+                let mut prof = self.gpu.stream.alloc_zeros::<u64>(blocks * 10)?;
+                timed!(
+                    self,
+                    "gdn.recurrent",
+                    kernels::gdn_chunked_prof(
+                        &self.gpu,
+                        &self.kernels.gdn_chunked_tc_prof,
+                        &*qf,
+                        &*kf,
+                        &*vf,
+                        &*g,
+                        &*beta,
+                        &mut *state,
+                        &mut *core,
+                        &mut prof,
+                        seq,
+                        nv,
+                        dk,
+                        dv,
+                    )?
+                );
+                self.gpu.synchronize()?;
+                let host: Vec<u64> = self.gpu.stream.clone_dtoh(&prof)?;
+                let mut acc = self.gdn_prof.lock().unwrap();
+                for b in 0..blocks {
+                    for p in 0..10 {
+                        acc.cycles[p] += host[b * 10 + p];
+                    }
+                }
+                acc.blocks += blocks as u64;
+                acc.chunks += seq.div_ceil(kernels::GDN_CHUNK_C) as u64;
+            } else {
+                timed!(
+                    self,
+                    "gdn.recurrent",
+                    kernels::gdn_chunked(
+                        &self.gpu,
+                        &self.kernels.gdn_chunked_tc,
+                        &*qf,
+                        &*kf,
+                        &*vf,
+                        &*g,
+                        &*beta,
+                        &mut *state,
+                        &mut *core,
+                        seq,
+                        nv,
+                        dk,
+                        dv,
+                    )?
+                );
+            }
         } else if self.gdn_chunked.load(Ordering::Relaxed) && seq >= chunk_min {
             timed!(
                 self,
@@ -2211,11 +2432,11 @@ impl Engine {
         if x.len() != rows * k {
             bail!("gemm input has {} values, expected {}", x.len(), rows * k);
         }
-        let dbg = std::env::var("JEV_GEMM_DEBUG").is_ok();
+        let dbg = gemm_debug();
         // Synchronizing here makes any benchmarks with the debug variable set
         // measure serialized launches. Timing requires the explicit
         // JEV_GEMM_DEBUG_SYNC opt-in; JEV_GEMM_DEBUG only logs labels.
-        let dbg_sync = std::env::var("JEV_GEMM_DEBUG_SYNC").is_ok();
+        let dbg_sync = gemm_debug_sync();
         let mark = |label: &str, t: std::time::Instant| {
             if dbg_sync {
                 let _ = self.gpu.synchronize();
@@ -2261,20 +2482,54 @@ impl Engine {
                 ..
             } => {
                 if w.int8_a() {
-                    let mut xq = self.gpu.stream.alloc_zeros::<i8>(rows * k)?;
-                    let mut as_ = self.gpu.stream.alloc_zeros::<f32>(rows)?;
-                    kernels::quant_int8_bf16(
-                        &self.gpu,
-                        &self.kernels.quant_int8_bf16,
-                        x,
-                        &mut xq,
-                        &mut as_,
-                        rows,
-                        k,
-                        w.a_global(),
-                        self.int8_clip(),
-                    )?;
+                    let __p = self.cpu_prof.begin();
+                    let need = rows * k;
+                    let group_mode = w.group_a() && k % 64 == 0;
+                    let groups = if group_mode { k / 64 } else { 1 };
+                    let mut scratch = self.int8_scratch.lock().unwrap();
+                    if scratch
+                        .as_ref()
+                        .map_or(true, |s| s.x.len() < need || s.scales.len() < rows * groups)
+                    {
+                        *scratch = Some(Int8Scratch {
+                            x: self.gpu.stream.alloc_zeros::<i8>(need)?,
+                            scales: self.gpu.stream.alloc_zeros::<f32>(rows * groups)?,
+                        });
+                    }
+                    let s = scratch.as_mut().unwrap();
+                    self.cpu_prof.end("i8.alloc", __p);
+                    let __p = self.cpu_prof.begin();
+                    if group_mode {
+                        kernels::quant_int8_group_bf16(
+                            &self.gpu,
+                            &self.kernels.quant_int8_group_bf16,
+                            x,
+                            &mut s.x,
+                            &mut s.scales,
+                            rows,
+                            k,
+                            64,
+                            w.a_global(),
+                            self.int8_clip(),
+                            int8_group_uniform(),
+                        )?;
+                    } else {
+                        kernels::quant_int8_bf16(
+                            &self.gpu,
+                            &self.kernels.quant_int8_bf16,
+                            x,
+                            &mut s.x,
+                            &mut s.scales,
+                            rows,
+                            k,
+                            w.a_global(),
+                            self.int8_clip(),
+                        )?;
+                    }
+                    self.cpu_prof.end("i8.quant", __p);
+                    let __p = self.cpu_prof.begin();
                     let mut c = self.alloc_bf16(rows * n)?;
+                    self.cpu_prof.end("i8.c", __p);
                     {
                         let mut g = self.marlin_locks.lock().unwrap();
                         if g.is_none() {
@@ -2285,31 +2540,48 @@ impl Engine {
                     let locks = locks_guard.as_ref().expect("locks initialized");
                     let mut off = 0usize;
                     let mut rest = rows;
-                    let chunk = std::env::var("JEV_MARLIN_CHUNK")
-                        .ok()
-                        .and_then(|v| v.parse::<usize>().ok())
-                        .unwrap_or(0);
+                    let chunk = marlin_chunk();
                     let max_par = if chunk == 0 {
                         usize::MAX
                     } else {
                         (chunk / 64).max(1)
                     };
+                    let __p = self.cpu_prof.begin();
                     while rest > 0 {
                         let par = (rest / 64).min(max_par);
                         let pm = if par > 0 { par * 64 } else { rest };
                         let tmb = pm.div_ceil(16).min(4);
                         let idx = if pm <= 8 { 0 } else { tmb - 1 };
-                        let f = &self.kernels.marlin_int8_cfgs[idx];
+                        let f = if group_mode {
+                            &self.kernels.marlin_int8_group_cfgs[idx]
+                        } else {
+                            &self.kernels.marlin_int8_cfgs[idx]
+                        };
                         kernels::marlin_gemm_int8(
-                            &self.gpu, f, &xq, qweight, &mut c, scales, zeros, &as_, locks, off,
-                            pm, n, k,
+                            &self.gpu,
+                            f,
+                            &s.x,
+                            qweight,
+                            &mut c,
+                            scales,
+                            zeros,
+                            &s.scales,
+                            locks,
+                            off,
+                            pm,
+                            n,
+                            k,
+                            if group_mode { 64 } else { 0 },
                         )?;
                         off += pm;
                         rest -= pm;
                     }
+                    self.cpu_prof.end("i8.launch", __p);
                     return Ok(c);
                 }
+                let __p = self.cpu_prof.begin();
                 let mut c = self.alloc_bf16(rows * n)?;
+                self.cpu_prof.end("w4.c", __p);
                 {
                     let mut g = self.marlin_locks.lock().unwrap();
                     if g.is_none() {
@@ -2322,15 +2594,13 @@ impl Engine {
                 let mut rest = rows;
                 // 0 = one launch for the whole M (the kernel's internal
                 // `parallel` loop); >0 caps each launch to that many rows.
-                let chunk = std::env::var("JEV_MARLIN_CHUNK")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
-                    .unwrap_or(0);
+                let chunk = marlin_chunk();
                 let max_par = if chunk == 0 {
                     usize::MAX
                 } else {
                     (chunk / 64).max(1)
                 };
+                let __p = self.cpu_prof.begin();
                 while rest > 0 {
                     let par = (rest / 64).min(max_par);
                     let pm = if par > 0 { par * 64 } else { rest };
@@ -2353,6 +2623,7 @@ impl Engine {
                     off += pm;
                     rest -= pm;
                 }
+                self.cpu_prof.end("w4.launch", __p);
                 Ok(c)
             }
             LinearWeight::PackedW4A16 {
@@ -2599,7 +2870,7 @@ impl Engine {
             let idx = if pm <= 8 { 0 } else { tmb - 1 };
             let f = &self.kernels.marlin_int8_cfgs[idx];
             kernels::marlin_gemm_int8(
-                &self.gpu, f, xq, qweight, c, scales, zeros, a_scales, locks, off, pm, n, k,
+                &self.gpu, f, xq, qweight, c, scales, zeros, a_scales, locks, off, pm, n, k, 0,
             )?;
             off += pm;
             rest -= pm;

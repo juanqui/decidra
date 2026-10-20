@@ -135,20 +135,20 @@ the native tiled/warp kernels. Disable with `JEV_FLASHINFER_ATTENTION=0`,
 change the threshold with `JEV_FLASHINFER_MIN_SEQ` (default 1024). See
 `native/third_party/flashinfer/INTEGRATION.md`.
 
-Long-context latency (Marlin weights, resident, SM89 RTX 4090):
+Long-context latency (Marlin weights, resident, SM89 RTX 4090, mixed W4A8-INT8):
 
-| tokens | tiled FA2 | warp (`--legacy-attention`) | peak GPU mem |
+| tokens | engine CLI (warm) | resident server | peak GPU mem |
 |---|---|---|---|
-| 1K | 0.486 s | 0.959 s | 13.1 GiB resident |
-| 4K | 2.12-2.18 s | 4.65 s | ~17.2 GiB |
-| 8K | 4.23-4.32 s | 9.88 s | ~17.6 GiB |
-| 16K | 8.62-8.85 s | 22.88 s | 18.9 GiB |
-| 32K (32,763 tok) | 18.6-19.0 s | - | 19.1 GiB |
+| 4K (4,090) | 0.924 s | 0.937 s | 16.85 GiB |
+| 8K (8,178) | — | 1.918 s | 18.05 GiB |
+| 16K (16,383) | 3.900 s | 4.151 s | 18.10 GiB |
+| 32K (32,763 tok) | not rerun | not rerun | — |
 
-The tiled attention and the split-dk GDN recurrence (below) together cut
-long-context latency ~2x versus the previous warp + shared-GDN stack. The
-remaining time is dominated by the W4A16 GEMMs; attention is <1% at 1K and
-still small at 16K.
+The pre-chunked W4A16 stack measured 2.12-2.18 s (4K), 4.23-4.32 s (8K) and
+8.62-8.85 s (16K); the current stack is ~2.2-2.3x faster. The remaining time is
+dominated by the Marlin GEMMs; attention is <1% at 1K and still small at 16K.
+Long prefill holds 100% GPU utilization at ~420-430 W; peak memory is flat
+across repeated 16K requests (low-memory pool from 12,288 tokens).
 
 Long-context quality gate against the CPU AWQ/SDPA probes
 (`/tmp/jev-native-ref/long-context/probes`, Marlin + tiled attention):
@@ -384,23 +384,36 @@ which is why the speedup there is 1.6x rather than 2x. Fusing the remaining
 RMSNorm/GDN/attention work and a pipelined 128-row tile with 2-CTA occupancy are
 the next steps toward the ~60 ms ideal.
 
-### Selective W4A8-INT8 status
+### W4A8-INT8 status (shipped, mixed scale granularity)
 
-The full model can run Marlin W4A8-INT8 (`kS8 x kU4`, per-token symmetric INT8
-activations) for a subset of linears. All-linear INT8 is fast (2.6-2.76x at
-large M) but misses the decision gate; the shipped default keeps the residual
-writers and their inputs on W4A16: `linear_attn.out_proj`, `mlp.down_proj`,
-`linear_attn.in_proj_qkv`, `self_attn.o_proj/q_proj/k_proj/v_proj`, and
-`mlp.up_proj`. GDN `in_proj_z/b/a` and the MLP gate run INT8.
+The model runs Marlin W4A8-INT8 (`kS8 x kU4`) on every linear except the residual
+attention writers `self_attn.o_proj/v_proj/k_proj` outside layers 56-63. Two activation
+scale granularities are compiled:
 
-Server suite (batch=1, CPU AWQ golden): 28/28, KL 3.456e-5, MAE 9.61e-4, max
-delta 9.63e-3. 36-token golden head top-1 36/36 (max 0.125); 4K/8K/16K probes
-match the W4A16 deltas. Full forward: 1K 382 -> 333 ms, 16K 7.63 -> 6.94 s,
-8x73 batch 222 -> 195 ms. Server c1/c8/c16: 23.4 / 37.9 / 38.1 req/s.
-Held-out 500-row corpus vs W4A16: 488/500 top-1, MAE 1.31e-3, max 1.29e-2; the
-12 flips are exact 0.5/0.5 noul ties. Batched requests show the same small
-numerical sensitivity as W4A16 (c8: INT8 max 1.07e-2 vs W4A16 1.78e-2), so it
-is a property of the batched GEMM path, not of the INT8 selection.
+- **per-token** (`quant_int8_per_token_bf16`): one scale per row, int32 accumulation.
+  Fastest. Used for `mlp.gate_proj`.
+- **per-K-group-64** (`quant_int8_group_bf16` + the `group_a_scale` Marlin variant): one
+  scale per row per 64 K elements, f32 accumulation per group. Used for GDN `z/b/a`,
+  `mlp.up_proj`, `mlp.down_proj`, `in_proj_qkv`, `out_proj`, `q_proj`, and the all-linear
+  layers 56-63. It costs ~35-50% versus the per-token epilogue but still runs 2.1-2.4x
+  faster than W4A16 on the same module.
+
+Server suite (batch=1, CPU AWQ golden): **28/28, KL 3.095e-5, MAE 8.642e-4, max
+7.511e-3** — every gate passes, deterministic across three runs. Engine forward:
+4K 924 ms, 16K 3.90 s (from 1231 ms / 5.17 s on the W4A16-only selective stack).
+Server: c1/c8/c16 **24.7 / 49.5 / 53.4 req/s**; long 4K/8K/16K **0.937 / 1.918 /
+4.151 s**, all at 100% GPU for long prompts.
+
+The environment knobs are `JEV_NATIVE_INT8` (default true),
+`JEV_NATIVE_INT8_EXCLUDE` (modules kept on W4A16),
+`JEV_NATIVE_INT8_ALL_LAYERS` (layer subset that runs all-linear INT8),
+`JEV_NATIVE_INT8_GROUP_SCALE` (default true),
+`JEV_NATIVE_INT8_GROUP_EXCLUDE` (modules kept on per-token scales) and
+`JEV_NATIVE_INT8_CLIP` (abs-max clip factor, default 1.0). The CLI equivalents
+are `--marlin-int8`, `--int8-exclude`, `--int8-all-layers`, `--int8-group-scale`,
+`--int8-group-exclude`, `--int8-clip`, and `--gdn-chunked-min-seq` for the GDN
+threshold. `--marlin-int8` without exclusions runs all-linear INT8 (group-64 by
+default in the CLI only if `--int8-group-scale` is passed).
 
 Marlin launches the whole M in one kernel by default (`JEV_MARLIN_CHUNK=0`,
 the kernel's internal `parallel` loop); `JEV_MARLIN_CHUNK=N` caps each launch

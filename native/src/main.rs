@@ -192,6 +192,9 @@ fn cmd_batch(args: &[String]) -> Result<()> {
     let rows: Vec<&[u32]> = token_sets.iter().map(Vec::as_slice).collect();
 
     let eng = Engine::new(&model)?;
+    // Benchmark parity with the server, which enables both chunked GDN paths.
+    eng.set_gdn_chunked(true);
+    eng.set_gdn_chunked_tc(true);
     if args.iter().any(|a| a == "--marlin") {
         eng.set_marlin(true);
     }
@@ -203,6 +206,18 @@ fn cmd_batch(args: &[String]) -> Result<()> {
         eng.set_int8_clip(
             v.parse()
                 .context("--int8-clip must be a number in (0, 1]")?,
+        );
+    }
+    if args.iter().any(|a| a == "--int8-group-scale") {
+        eng.set_int8_group_scale(true);
+    }
+    if let Some(v) = opt(args, "--int8-group-exclude") {
+        eng.set_int8_group_exclude(
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
         );
     }
     if let Some(v) = opt(args, "--int8-exclude") {
@@ -218,6 +233,8 @@ fn cmd_batch(args: &[String]) -> Result<()> {
         eng.set_int8_all_layers(v);
     }
     if args.iter().any(|a| a == "--legacy-gdn") {
+        eng.set_gdn_chunked(false);
+        eng.set_gdn_chunked_tc(false);
         eng.set_gdn_shared(false);
         eng.set_gdn_split(false);
     }
@@ -334,6 +351,18 @@ fn cmd_matmul(args: &[String]) -> Result<()> {
                 .context("--int8-clip must be a number in (0, 1]")?,
         );
     }
+    if args.iter().any(|a| a == "--int8-group-scale") {
+        eng.set_int8_group_scale(true);
+    }
+    if let Some(v) = opt(args, "--int8-group-exclude") {
+        eng.set_int8_group_exclude(
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
+    }
     if let Some(v) = opt(args, "--int8-exclude") {
         eng.set_int8_exclude(
             v.split(',')
@@ -354,6 +383,8 @@ fn cmd_matmul(args: &[String]) -> Result<()> {
         eng.set_marlin_int8(marlin_int8);
     }
     if args.iter().any(|a| a == "--legacy-gdn") {
+        eng.set_gdn_chunked(false);
+        eng.set_gdn_chunked_tc(false);
         eng.set_gdn_shared(false);
         eng.set_gdn_split(false);
     }
@@ -446,6 +477,9 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     let t0 = std::time::Instant::now();
     let eng = Engine::new(&model)?;
     let init_ms = t0.elapsed().as_secs_f64() * 1e3;
+    // Benchmark parity with the server, which enables both chunked GDN paths.
+    eng.set_gdn_chunked(true);
+    eng.set_gdn_chunked_tc(true);
     eng.set_logits_opts(head_ids.clone(), full_logits);
     if args.iter().any(|a| a == "--fused-w4a16") {
         eng.set_fused_w4a16(true);
@@ -472,6 +506,18 @@ fn cmd_layer(args: &[String]) -> Result<()> {
                 .context("--int8-clip must be a number in (0, 1]")?,
         );
     }
+    if args.iter().any(|a| a == "--int8-group-scale") {
+        eng.set_int8_group_scale(true);
+    }
+    if let Some(v) = opt(args, "--int8-group-exclude") {
+        eng.set_int8_group_exclude(
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
+    }
     if let Some(v) = opt(args, "--int8-exclude") {
         eng.set_int8_exclude(
             v.split(',')
@@ -485,6 +531,8 @@ fn cmd_layer(args: &[String]) -> Result<()> {
         eng.set_int8_all_layers(v);
     }
     if args.iter().any(|a| a == "--legacy-gdn") {
+        eng.set_gdn_chunked(false);
+        eng.set_gdn_chunked_tc(false);
         eng.set_gdn_shared(false);
         eng.set_gdn_split(false);
     }

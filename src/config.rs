@@ -22,10 +22,16 @@ pub const MAX_NATIVE_BATCH_WINDOW_US: u64 = 50_000;
 pub const DEFAULT_NATIVE_MAX_BATCH_TOKENS: usize = 16_384;
 pub const MIN_NATIVE_MAX_BATCH_TOKENS: usize = 512;
 pub const DEFAULT_SERVED_IDENTITY: &str = "autotrust/JEV-27B-VL@ba3f0d58+awq-w4a16";
-/// Module types kept on W4A16 when `JEV_NATIVE_INT8` is enabled. Verified at
-/// batch=1 (server suite): 28/28, max delta 9.63e-3, MAE 9.61e-4, KL
-/// 3.46e-5. The remaining INT8 modules are GDN z/b/a and the MLP gate.
-pub const DEFAULT_INT8_EXCLUDE: &str = "linear_attn.out_proj,mlp.down_proj,linear_attn.in_proj_qkv,self_attn.o_proj,self_attn.q_proj,mlp.up_proj,self_attn.v_proj,self_attn.k_proj";
+/// Module types kept on W4A16 when `JEV_NATIVE_INT8` is enabled. With
+/// `last:8` all-linear this leaves only the attention o/v/k projections on
+/// W4A16 outside layers 56-63. Verified at batch=1 with group-64 activation
+/// scales: 28/28, max delta 8.42e-3, MAE 7.80e-4, KL 2.27e-5.
+pub const DEFAULT_INT8_EXCLUDE: &str = "self_attn.o_proj,self_attn.v_proj,self_attn.k_proj";
+/// Modules that keep the faster per-token INT8 epilogue when group scales are
+/// enabled. `mlp.gate_proj` is the largest INT8 module and is accurate enough
+/// with one scale per row; keeping it on the int32 epilogue saves ~50 ms at 4K
+/// and leaves suite MAE at 8.64e-4 / max 7.51e-3.
+pub const DEFAULT_INT8_GROUP_EXCLUDE: &str = "mlp.gate_proj";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -72,6 +78,12 @@ pub struct Config {
     /// Abs-max clip factor for INT8 activation scales
     /// (`JEV_NATIVE_INT8_CLIP`, default 1.0 = off).
     pub native_int8_clip: f32,
+    /// Use per-K-group (64) INT8 activation scales in the W4A8 Marlin path
+    /// (`JEV_NATIVE_INT8_GROUP_SCALE`, default on).
+    pub native_int8_group_scale: bool,
+    /// Module-name substrings that keep per-token INT8 scales
+    /// (`JEV_NATIVE_INT8_GROUP_EXCLUDE`).
+    pub native_int8_group_exclude: Vec<String>,
     /// Module-name substrings kept on W4A16 (`JEV_NATIVE_INT8_EXCLUDE`).
     pub native_int8_exclude: Vec<String>,
     /// Layers that use all-linear INT8 (`JEV_NATIVE_INT8_ALL_LAYERS`).
@@ -147,6 +159,14 @@ impl Config {
         if !(native_int8_clip > 0.0 && native_int8_clip <= 1.0) {
             bail!("JEV_NATIVE_INT8_CLIP must be in (0, 1], got {native_int8_clip}");
         }
+        let native_int8_group_scale = env_bool("JEV_NATIVE_INT8_GROUP_SCALE")?.unwrap_or(true);
+        let native_int8_group_exclude = env_string("JEV_NATIVE_INT8_GROUP_EXCLUDE")
+            .unwrap_or_else(|| DEFAULT_INT8_GROUP_EXCLUDE.to_owned())
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
         let native_int8_exclude = env_string("JEV_NATIVE_INT8_EXCLUDE")
             .unwrap_or_else(|| DEFAULT_INT8_EXCLUDE.to_owned())
             .split(',')
@@ -192,6 +212,8 @@ impl Config {
             native_gdn_chunked_min_seq,
             native_int8,
             native_int8_clip,
+            native_int8_group_scale,
+            native_int8_group_exclude,
             native_int8_exclude,
             native_int8_all_layers,
             decision_cache_size,

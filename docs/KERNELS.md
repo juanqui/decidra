@@ -44,6 +44,27 @@ group size 64:
 The dequantizer reproduces `compressed_tensors` decompression bit-exactly on sampled
 tensors. There is no `weight_g_idx`, so weights are in column order.
 
+### W4A8-INT8 activation scales (shipped)
+
+The Marlin INT8 path (`a_type=kS8`) quantizes activations to signed int8 and applies the
+per-row activation scale in the epilogue. Two granularities are compiled:
+
+- **per-token** (`quant_int8_per_token_bf16`): one scale per row, int32 accumulation
+  across K, float conversion once. Fastest. Used for `mlp.gate_proj` by default.
+- **per-K-group-64** (`quant_int8_group_bf16` + `Marlin<..., group_a_scale=true>`): one
+  scale per row per 64-element K group, f32 accumulation per group, applied together
+  with the weight group scale. This is what lets `up_proj`, `down_proj`,
+  `in_proj_qkv`, `out_proj`, `q_proj` and GDN `z/b/a` run INT8 without failing the
+  quality gate. It costs ~35-50% more than the per-token epilogue on the same module.
+
+The granularity is fixed per module at repack (`JEV_NATIVE_INT8_GROUP_SCALE`,
+`JEV_NATIVE_INT8_GROUP_EXCLUDE`). Default: `gate_proj` per-token; the expanded set
+group-64; `o_proj/v_proj/k_proj` stay W4A16 outside layers 56-63; layers 56-63 are
+all-linear INT8. Split-K correctness: a partial slice starts at group
+`slice_row * (thread_k_blocks / group_blocks)`; forgetting this offset corrupts every
+non-zero slice (caught by the 64-row vs 4K A/B). Quality: 28/28, KL 3.095e-5,
+MAE 8.642e-4, max Δ 7.511e-3.
+
 ### Marlin W4A16 (shipped default)
 
 `JEV_NATIVE_MARLIN=true` repacks the compressed-tensors layout on the GPU into Marlin's
@@ -59,31 +80,32 @@ the reference GPTQ-Marlin repack / scale / zero-point permutations bit-exactly f
 | 1024 tokens | 1261.2 ms | 1261.2 ms | **488 ms** (2.58x) |
 
 Marlin resident weights use **13.1 GiB**; preload/repack takes **10.1 s**. Tiled FA2
-attention plus gated split-dk GDN makes long context **GEMM-bound** at ~0.49-0.58 ms/token:
+attention plus gated split-dk GDN and the mixed W4A8-INT8 linears make long context
+**GEMM-bound** at ~0.23-0.25 ms/token:
 
-| tokens | full forward (tiled FA2 + split GDN) | previous warp | peak GPU mem |
-|---|---|---|---|
-| 1K | **0.488 s** | 0.959 s | 18.15 GiB |
-| 4K | **2.12-2.18 s** | 4.65 s | ~17.2 GiB |
-| 8K | **4.23-4.32 s** | 9.88 s | ~17.6 GiB |
-| 16K | **8.62-8.97 s** | 22.88 s | 18.86 GiB |
-| 32K (32,763 tok) | **18.60-19.03 s** | - | 19.09 GiB |
+| tokens | engine CLI (warm) | resident server | GPU util |
+|---|---:|---:|---:|
+| 4K (4,090) | **0.924 s** | **0.937 s** | 100% |
+| 8K (8,178) | — | **1.918 s** | 100% |
+| 16K (16,383) | **3.900 s** | **4.151 s** | 100% |
+| 32K (32,763) | not rerun | not rerun | — |
 
-The attention kernel itself is 7-12x faster than warp on identical buffers (kernel-only
-1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms). The split-dk GDN recurrence is 3.9x faster on its
-hot kernel (1K per-layer 13.35 -> 3.41 ms; 1K forward 958 -> 488 ms). Remaining time is
-dominated by W4A16 GEMMs; attention is <1% at 1K and still small at 16K/32K.
+Peak memory at 16K is **18.10 GiB** and stays flat across repeated requests (low-memory
+pool from 12,288 tokens). The earlier W4A16-only stack measured 2.12 s (4K), 4.23-4.32 s
+(8K) and 8.62-8.97 s (16K); the current stack is 2.2-2.3x faster at every length.
+Attention is <1% at 1K and still small at 16K; the remaining time is dominated by the
+Marlin GEMMs (see the per-op table in [`RESULTS.md`](RESULTS.md)).
 
 Split GDN is used only for **seq >= `gdn_split_min_seq` (default 512)**. Short prompts
 use the accurate single-column shared recurrence: the four-way f32 reduction reorders
 the state dot products enough to shift a rare short-prompt logit. Suite row `r22`
 (54 tokens) measured split two-way delta **1.43e-2** (fails) versus shared **6.43e-3**
-(passes). Long sequences keep the 3.9x split path; 16K remains 8.62-8.97 s and passes.
+(passes). Long sequences keep the 3.9x split path; 16K remains 4.15 s and passes.
 
-For **seq >= 24,576** the engine enables a low-memory buffer-pool mode: dropped large
+For **seq >= 12,288** the engine enables a low-memory buffer-pool mode: dropped large
 tensors are released instead of retained, and large MLP/attention/GDN intermediates are
-freed as soon as they are consumed. This is what makes **32K fit and run on 24 GB**
-(19.09 GiB peak, ~4.4 GiB headroom); 1K/16K timings are unchanged.
+freed as soon as they are consumed. This keeps repeated 16K requests flat at **18.10 GiB**
+and is what makes **32K fit and run on 24 GB** (19.09 GiB peak, ~4.4 GiB headroom).
 
 Long-context correctness against CPU AWQ/SDPA probes (Marlin + tiled FA2 + split GDN):
 

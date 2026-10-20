@@ -23,6 +23,62 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
   return scratch[0];
 }
 
+// Per-token, per-K-group symmetric INT8 quantization of bf16 activations.
+// `scales` is [rows, ceil(k/group)]; each group scale includes `global_scale`.
+extern "C" __global__ void quant_int8_group_bf16(
+    const bf16* __restrict__ x, int8_t* __restrict__ out,
+    float* __restrict__ scales, int rows, int k, int group,
+    float global_scale, float clip, int uniform) {
+  int row = blockIdx.x;
+  if (row >= rows) return;
+  const bf16* xr = x + (size_t)row * k;
+  int8_t* orow = out + (size_t)row * k;
+  int groups = (k + group - 1) / group;
+  int warp = threadIdx.x >> 5;
+  int lane = threadIdx.x & 31;
+  int nwarps = blockDim.x >> 5;
+  if (uniform) {
+    // Diagnostic: one row-wide scale replicated to every group. With this
+    // mode the group-scale kernel must match the per-token kernel.
+    __shared__ float red[256];
+    float m = 0.f;
+    for (int i = threadIdx.x; i < k; i += blockDim.x)
+      m = fmaxf(m, fabsf(bf2f(xr[i])));
+    red[threadIdx.x] = m;
+    __syncthreads();
+    for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+      if (threadIdx.x < off)
+        red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + off]);
+      __syncthreads();
+    }
+    float scale = fmaxf(red[0] * clip, 1e-10f) / 127.f;
+    for (int g = warp; g < groups; g += nwarps)
+      if (lane == 0) scales[(size_t)row * groups + g] = scale * global_scale;
+    for (int i = threadIdx.x; i < k; i += blockDim.x) {
+      int v = (int)roundf(bf2f(xr[i]) / scale);
+      v = max(-127, min(127, v));
+      orow[i] = (int8_t)v;
+    }
+    return;
+  }
+  for (int g = warp; g < groups; g += nwarps) {
+    int base = g * group;
+    int n = min(group, k - base);
+    float m = 0.f;
+    for (int i = lane; i < n; i += 32) m = fmaxf(m, fabsf(bf2f(xr[base + i])));
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1)
+      m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, off));
+    float scale = fmaxf(m * clip, 1e-10f) / 127.f;
+    if (lane == 0) scales[(size_t)row * groups + g] = scale * global_scale;
+    for (int i = lane; i < n; i += 32) {
+      int v = (int)roundf(bf2f(xr[base + i]) / scale);
+      v = max(-127, min(127, v));
+      orow[base + i] = (int8_t)v;
+    }
+  }
+}
+
 // Per-token symmetric INT8 quantization of bf16 activations (full-model path).
 extern "C" __global__ void quant_int8_per_token_bf16(
     const bf16* __restrict__ x, int8_t* __restrict__ out,

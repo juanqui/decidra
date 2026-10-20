@@ -212,7 +212,8 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
                              // fetch pipeline
           const int group_blocks,  // number of consecutive 16x16 blocks
                                    // with a separate quantization scale
-          const bool is_zp_float   // is zero point of float16 type?
+          const bool is_zp_float,  // is zero point of float16 type?
+          const bool group_a_scale  // per-K-group INT8 A scales
           >
 __global__ void Marlin(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
@@ -349,6 +350,7 @@ __global__ void Marlin(
 
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
+  const int num_groups = group_blocks > 0 ? prob_k / (group_blocks * 16) : 1;
 
   int global_mn_tiles = parallel * n_tiles;
   int part2_mn_tiles = global_mn_tiles;
@@ -385,6 +387,9 @@ __global__ void Marlin(
 
   int par_id = 0;
   int locks_off = 0;
+  // Per-K-group INT8 A scales: logical group of the stage currently being
+  // multiplied. Advanced once per pipeline stage; reset per K slice.
+  int a8_group_base = 0;
 
   if (part2_mn_tiles >= gridDim.x) {
     // when part2_mn_tiles >= sms
@@ -453,7 +458,7 @@ __global__ void Marlin(
       slice_col = 0;
       par_id++;
     }
-    if (is_a_8bit && (first_init || slice_col == 0)) {
+    if (is_a_8bit && !group_a_scale && (first_init || slice_col == 0)) {
       __syncthreads();
       int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
       cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[a_s_gl_rd],
@@ -469,7 +474,7 @@ __global__ void Marlin(
       slice_iters = k_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
       C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
-      if (is_a_8bit) {
+      if (is_a_8bit && !group_a_scale) {
         __syncthreads();
         int a_s_gl_rd = par_id * 16 * thread_m_blocks + threadIdx.x;
         cp_async1_ca_pred(&sh_a_s[threadIdx.x], &a_scales_ptr[a_s_gl_rd],
@@ -487,6 +492,13 @@ __global__ void Marlin(
       par_id = (slice_col_par + global_mn_tiles - part2_mn_tiles) / n_tiles;
       A = A0 + 16 * thread_m_blocks / (is_a_8bit ? 16 : 8) * par_id * lda;
       C = C0 + 16 * thread_m_blocks / 8 * par_id * prob_n;
+    }
+    if constexpr (is_a_8bit && group_a_scale) {
+      // Split-K slices start partway through K; the first group follows
+      // slice_row exactly like s_gl_rd does.
+      a8_group_base = slice_row * (thread_k_blocks / group_blocks);
+    } else {
+      a8_group_base = 0;
     }
     if (!in_part2) {
       init_part1_slice();
@@ -1126,7 +1138,42 @@ __global__ void Marlin(
 
       if constexpr (group_blocks != -1) {
         if (group_blocks == 2 || k == 1) {
-          if constexpr (a_type == vllm::kS8) {
+          if constexpr (group_a_scale) {
+            static_assert(a_type == vllm::kS8,
+                          "group_a_scale requires INT8 A");
+            int2 s_vals[2];
+            s_vals[0] = {
+                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
+                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[1]};
+            s_vals[1] = {
+                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[0],
+                (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[1]};
+            const int gid = a8_group_base + (threadIdx.x / 32) / tb_n_warps;
+            const int lane = (threadIdx.x % 32) / 4;
+            float a_group[2 * thread_m_blocks];
+  #pragma unroll
+            for (int ii = 0; ii < 2 * thread_m_blocks; ii++) {
+              int row = par_id * 16 * thread_m_blocks + ii * 8 + lane;
+              a_group[ii] = a_scales_ptr[(size_t)row * num_groups + gid];
+            }
+  #pragma unroll
+            for (int i = 0; i < thread_m_blocks; i++) {
+  #pragma unroll
+              for (int g = 0; g < 4; g++) {
+                float a_s = a_group[i * 2 + g / 2];
+                float bs0 = (float)reinterpret_cast<int*>(&s_vals[0])[g % 2];
+                float bs1 = (float)reinterpret_cast<int*>(&s_vals[1])[g % 2];
+                float c0 = __int2float_rn(
+                    *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]));
+                float c1 = __int2float_rn(
+                    *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][1][g]));
+                frag_c[i][j][0][g] += c0 * bs0 * a_s;
+                frag_c[i][j][1][g] += c1 * bs1 * a_s;
+                frag_c_tmp[i][j][0][g] = 0.0f;
+                frag_c_tmp[i][j][1][g] = 0.0f;
+              }
+            }
+          } else if constexpr (a_type == vllm::kS8) {
             int2 s_vals[2];
             s_vals[0] = {
                 (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
@@ -1596,6 +1643,9 @@ __global__ void Marlin(
           matmul_a8(k);
         }
       }
+      if constexpr (is_a_8bit && group_a_scale) {
+        a8_group_base += thread_k_blocks / group_blocks;
+      }
       slice_iters--;
       if (slice_iters == 0) {
         break;
@@ -1623,7 +1673,7 @@ __global__ void Marlin(
         }
       }
 
-      if constexpr (is_a_8bit) {
+      if constexpr (is_a_8bit && !group_a_scale) {
         float frag_a_s[2 * thread_m_blocks];
 
         for (int i = 0; i < 2 * thread_m_blocks; i++)

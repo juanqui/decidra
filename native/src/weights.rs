@@ -32,6 +32,9 @@ pub enum LinearWeight {
         a_global: f32,
         /// Repacked for 8-bit activations (INT8 per-token quantized A).
         int8_a: bool,
+        /// Use per-K-group (64) INT8 activation scales instead of one scale per
+        /// row. Requires `int8_a`.
+        group_a: bool,
     },
     /// compressed-tensors pack-quantized W4A16 (AWQ/GPTQ), asymmetric int4.
     /// `packed` is I32 [out, ceil(in/8)] with 8 signed nibbles per word along
@@ -63,6 +66,14 @@ impl LinearWeight {
     pub fn int8_a(&self) -> bool {
         match self {
             LinearWeight::Marlin { int8_a, .. } => *int8_a,
+            _ => false,
+        }
+    }
+
+    /// True when this module uses per-K-group INT8 activation scales.
+    pub fn group_a(&self) -> bool {
+        match self {
+            LinearWeight::Marlin { group_a, .. } => *group_a,
             _ => false,
         }
     }
@@ -129,6 +140,11 @@ pub struct WeightProvider<'a> {
     pub marlin_int8: bool,
     /// Module-name substrings kept on W4A16 activations when `marlin_int8`.
     pub int8_exclude: Vec<String>,
+    /// Use per-K-group (64) activation scales on INT8 modules by default.
+    pub int8_group_scale: bool,
+    /// Module-name substrings that keep per-token scales under
+    /// `int8_group_scale` (they use the faster int32 epilogue).
+    pub int8_group_exclude: Vec<String>,
     /// Layer indices that use all-linear INT8 (sorted), overriding the
     /// per-module exclusion list inside those layers.
     pub int8_all_layers: Vec<usize>,
@@ -159,6 +175,8 @@ impl<'a> WeightProvider<'a> {
             marlin_fp8: false,
             marlin_int8: false,
             int8_exclude: Vec::new(),
+            int8_group_scale: false,
+            int8_group_exclude: Vec::new(),
             int8_all_layers: Vec::new(),
             stream: gpu.stream.clone(),
             gpu,
@@ -238,6 +256,12 @@ impl<'a> WeightProvider<'a> {
                         .int8_exclude
                         .iter()
                         .any(|p| !p.is_empty() && module.contains(p)));
+            let group_a = use_int8
+                && self.int8_group_scale
+                && !self
+                    .int8_group_exclude
+                    .iter()
+                    .any(|p| !p.is_empty() && module.contains(p));
             if self.marlin && out % 64 == 0 && in_ % 64 == 0 {
                 if (self.marlin_fp8 || use_int8) && group_size != 64 {
                     bail!("W4A8 transform requires group_size 64, got {group_size}");
@@ -320,6 +344,7 @@ impl<'a> WeightProvider<'a> {
                     zeros: self.stream.clone_htod(&zeros)?,
                     a_global,
                     int8_a: use_int8,
+                    group_a,
                 });
             }
             return Ok(LinearWeight::PackedW4A16 {

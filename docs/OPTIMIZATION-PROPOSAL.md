@@ -1,5 +1,11 @@
 # Deep optimization proposal: native prefill engine
 
+> **Historical analysis (2026-10-19).** This document predates the chunked/TC GDN,
+> mixed W4A8-INT8, FlashInfer prefill, and memory fixes. Its baseline numbers and its
+> "do not claim a native win" verdict are superseded; current measured results are in
+> [`RESULTS.md`](RESULTS.md) and [`VLLM-COMPARISON.md`](VLLM-COMPARISON.md). The ranked
+> ideas below are kept as research history.
+
 Analysis only. No GPU runs and no kernel changes were made for this document. It
 synthesizes `/tmp/jev-native-opt/PLAN.md`, `/tmp/jev-kernel-research/REPORT.md`,
 and the controlled results in [`VLLM-COMPARISON.md`](VLLM-COMPARISON.md).

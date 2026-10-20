@@ -125,6 +125,8 @@ impl NativeBackend {
         engine.set_gdn_chunked_min_seq(config.native_gdn_chunked_min_seq);
         engine.set_marlin_int8(config.native_int8);
         engine.set_int8_clip(config.native_int8_clip);
+        engine.set_int8_group_scale(config.native_int8_group_scale);
+        engine.set_int8_group_exclude(config.native_int8_group_exclude.clone());
         engine.set_int8_exclude(config.native_int8_exclude.clone());
         engine.set_int8_all_layers(&config.native_int8_all_layers);
         if !config.native_marlin {
@@ -154,6 +156,8 @@ impl NativeBackend {
             gdn_chunked_min_seq = config.native_gdn_chunked_min_seq,
             int8 = config.native_int8,
             int8_clip = config.native_int8_clip,
+            int8_group_scale = config.native_int8_group_scale,
+            int8_group_exclude = config.native_int8_group_exclude.len(),
             int8_all_layers = config.native_int8_all_layers.as_str(),
             decision_cache_entries = config.decision_cache_size,
             elapsed_secs = started.elapsed().as_secs_f64(),
