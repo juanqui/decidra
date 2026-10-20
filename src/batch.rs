@@ -272,11 +272,20 @@ fn run_worker<E: BatchExecutor>(
         };
         metrics::gauge!("jev_native_batch_queue_depth").set(state.pending.len() as f64);
 
+        // A request that arrives alone only needs a short grace period to pick
+        // up a burst; a full window is for a queue that already has waiters.
+        // This keeps a lone request's latency low without losing coalescing.
+        const LONE_WINDOW: Duration = Duration::from_micros(500);
+        let window = if state.pending.is_empty() {
+            options.window.min(LONE_WINDOW)
+        } else {
+            options.window
+        };
         let deadline = Instant::now()
             + if first.deferred {
                 Duration::ZERO
             } else {
-                options.window
+                window
             };
         let mut batch = Vec::with_capacity(options.max_batch);
         let mut batch_tokens = 0usize;

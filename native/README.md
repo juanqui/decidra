@@ -139,9 +139,9 @@ Long-context latency (Marlin weights, resident, SM89 RTX 4090, mixed W4A8-INT8):
 
 | tokens | engine CLI (warm) | resident server | peak GPU mem |
 |---|---|---|---|
-| 4K (4,090) | 0.854 s | 0.857 s | 18.83 GiB |
-| 8K (8,178) | — | 1.758 s | 20.11 GiB |
-| 16K (16,383) | 3.777 s | 3.833 s | 20.11 GiB |
+| 4K (4,090) | 0.854 s | 0.854 s | 18.83 GiB |
+| 8K (8,178) | — | 1.757 s | 20.11 GiB |
+| 16K (16,383) | 3.777 s | 3.838 s | 20.11 GiB |
 | 32K (32,763 tok) | not rerun | not rerun | — |
 
 The pre-chunked W4A16 stack measured 2.12-2.18 s (4K), 4.23-4.32 s (8K) and
@@ -402,8 +402,8 @@ scale granularities are compiled:
 Server suite (batch=1, CPU AWQ golden): **28/28, KL 3.095e-5, MAE 8.642e-4, max
 7.511e-3** — every gate passes, deterministic across three runs. Engine forward:
 4K 854 ms, 16K 3.78 s (from 1231 ms / 5.17 s on the W4A16-only selective stack).
-Server: c1/c8/c16 **24.7 / 49.5 / 53.4 req/s**; long 4K/8K/16K **0.857 / 1.758 /
-3.833 s**, all at 100% GPU for long prompts.
+Server: c1/c8/c16 **24.7 / 49.5 / 53.4 req/s**; long 4K/8K/16K **0.854 / 1.757 /
+3.838 s**, all at 100% GPU for long prompts.
 
 The environment knobs are `JEV_NATIVE_INT8` (default true),
 `JEV_NATIVE_INT8_EXCLUDE` (modules kept on W4A16),

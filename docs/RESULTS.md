@@ -49,14 +49,14 @@ max Δ 7.511e-3** — all strict gates pass, deterministic across three runs.
 
 | short, 16 unique ~73-token prompts | c1 | c2 | c4 | c8 | c16 |
 |---|---:|---:|---:|---:|---:|
-| req/s | 24.63 | 39.51 | 51.48 | 52.73 | 55.19 |
-| p50 | 41.0 ms | 51.2 ms | 77.5 ms | 149.7 ms | 217.3 ms |
+| req/s | 25.62 | 40.33 | 48.79 | 52.13 | 55.94 |
+| p50 | 39.5 ms | 49.6 ms | 76.5 ms | 132.2 ms | 168.8 ms |
 | GPU util | 93% | 91% | 93% | 96% | 98% |
 
 | long single request | 4K | 8K | 16K |
 |---|---:|---:|---:|
-| latency | **0.857 s** | **1.758 s** | **3.833 s** |
-| tok/s | 4,777 | 4,650 | 4,274 |
+| latency | **0.854 s** | **1.757 s** | **3.838 s** |
+| tok/s | 4,787 | 4,655 | 4,269 |
 | GPU util / power | 100% / 384-428 W | 100% / 422 W | 100% / 430 W |
 
 Resident memory is **18.83 GiB** (13.1 GiB weights + 2.37 GiB embedding table + INT8
@@ -312,9 +312,9 @@ For a controlled same-GPU comparison against vLLM 0.31.0 (short concurrency swee
 long prefill, repeated exact prompts, startup, memory, KV cache, kernel stacks, and
 quantization probes), see [`VLLM-COMPARISON.md`](VLLM-COMPARISON.md). Final summary:
 with 73-token prompts the shipped native engine wins **every** concurrency:
-**24.63 / 39.51 / 51.48 / 52.73 / 55.19 req/s** at c1/2/4/8/16 (median of 3 runs)
+**25.62 / 40.33 / 48.79 / 52.13 / 55.94 req/s** at c1/2/4/8/16 (median of 3 runs)
 versus vLLM **18.81 / 20.24 / 29.32 / 34.52 / 35.17**, and cold long prefill by
-**44-52%** (4K 0.857 vs 1.302 s, 8K 1.758 vs 2.660, 16K 3.833 vs 5.533;
+**44-52%** (4K 0.854 vs 1.302 s, 8K 1.757 vs 2.660, 16K 3.838 vs 5.533;
 vLLM's earlier 5.052 s 16K number was nested-prefix-cache-assisted). Native
 still wins repeated exact prompts (exact cache), startup (**~9.2 s vs 145 s**),
 GPU memory (**18.83 GiB resident / 20.11 GiB at 16K vs 21.8 GiB**), and verified
@@ -344,9 +344,9 @@ Long-context latency (Marlin resident, mixed W4A8-INT8, chunked GDN, FlashInfer)
 
 | tokens | engine CLI (warm) | resident server | GPU util | peak GPU mem |
 |---|---:|---:|---:|---:|
-| 4K (4,090) | **0.854 s** | **0.857 s** | 100% | 18.83 GiB |
-| 8K (8,178) | — | **1.758 s** | 100% | 20.11 GiB |
-| 16K (16,383) | **3.777 s** | **3.833 s** | 100% | 20.11 GiB |
+| 4K (4,090) | **0.854 s** | **0.854 s** | 100% | 18.83 GiB |
+| 8K (8,178) | — | **1.757 s** | 100% | 20.11 GiB |
+| 16K (16,383) | **3.777 s** | **3.838 s** | 100% | 20.11 GiB |
 | 32K (32,763) | not rerun | not rerun | — | — |
 
 The pre-chunked W4A16 stack measured 2.12 s (4K), 4.23-4.32 s (8K), 8.62-8.97 s (16K)
@@ -362,7 +362,7 @@ split path and pass.
 
 For **seq >= 12,288** a low-memory buffer-pool mode releases dropped large tensors and
 frees large MLP/attention/GDN intermediates as soon as they are consumed. This keeps
-repeated 16K requests flat at **20.11 GiB** (four consecutive runs, 3.83 s each) and makes
+repeated 16K requests flat at **20.11 GiB** (four consecutive runs, 3.84 s each) and makes
 **32K fit on 24 GB** (19.09 GiB peak, ~4.4 GiB headroom); 1K/8K timings are unchanged.
 
 Long-context quality gate against CPU AWQ/SDPA probes (Marlin + tiled FA2 + split GDN):

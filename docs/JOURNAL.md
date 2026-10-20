@@ -29,15 +29,15 @@ Server (one resident process, 16 unique prompts/level, cache off):
 
 | level | req/s | p50 | GPU util | power |
 |---|---:|---:|---:|---:|
-| c1 | 24.87 | 40.6 ms | 93% | 378 W |
-| c2 | 39.53 | 51.3 ms | 91% | 349 W |
-| c4 | 51.14 | 78.4 ms | 93% | 315 W |
-| c8 | 52.81 | 149.8 ms | 96% | 332 W |
-| c16 | 55.88 | 205.4 ms | 98% | 349 W |
+| c1 | 25.62 | 39.5 ms | 97% | 376 W |
+| c2 | 40.33 | 49.6 ms | 96% | 349 W |
+| c4 | 48.79 | 76.5 ms | 96% | 318 W |
+| c8 | 52.13 | 132.2 ms | 97% | 330 W |
+| c16 | 55.94 | 168.8 ms | 99% | 353 W |
 
-Long single request: **4K 0.879 s (4,657 tok/s, 100% GPU, 384-428 W)**,
-**8K 1.805 s (4,531 tok/s, 100%, 422 W)**,
-**16K 3.921 s (4,179 tok/s, 100%, 430 W)**.
+Long single request: **4K 0.854 s (4,787 tok/s, 100% GPU, 384-428 W)**,
+**8K 1.757 s (4,655 tok/s, 100%, 422 W)**,
+**16K 3.838 s (4,269 tok/s, 100%, 434 W)**.
 
 Resident/peak memory: **18.83 GiB** short, **20.51 GiB during 16K**, flat across
 repeated 16K requests. The 2.37 GiB embedding table is resident and rows are gathered
@@ -98,6 +98,10 @@ the shipped default.
 
 ### Experiments (results)
 
+- **Lone-request batch window**: when the queue is empty at the first dequeue, cap
+  the wait at 500 us instead of 2 ms; a queue with waiters keeps the full window.
+  c1 24.6 -> 25.6 req/s (p50 41.0 -> 39.5 ms), c2 40.3, c4 48.8-52.1, c16 55.9
+  req/s; no burst regression.
 - **Fused SiLU into the down quantizer**: `silu(gate)*up` is computed in the INT8
   group quantizer for `down_proj`, removing the separate BF16 elementwise tensor and
   kernel. Bit-identical logits; down 2.390 -> 2.154 ms/op at 4K, engine 4K 879 ->

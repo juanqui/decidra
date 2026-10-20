@@ -85,9 +85,9 @@ attention plus gated split-dk GDN and the mixed W4A8-INT8 linears make long cont
 
 | tokens | engine CLI (warm) | resident server | GPU util |
 |---|---:|---:|---:|
-| 4K (4,090) | **0.854 s** | **0.857 s** | 100% |
-| 8K (8,178) | — | **1.758 s** | 100% |
-| 16K (16,383) | **3.777 s** | **3.833 s** | 100% |
+| 4K (4,090) | **0.854 s** | **0.854 s** | 100% |
+| 8K (8,178) | — | **1.757 s** | 100% |
+| 16K (16,383) | **3.777 s** | **3.838 s** | 100% |
 | 32K (32,763) | not rerun | not rerun | — |
 
 Peak memory at 16K is **20.11 GiB** (including the 2.37 GiB resident embedding table)
