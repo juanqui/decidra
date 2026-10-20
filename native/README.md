@@ -362,3 +362,23 @@ At 76 rows the winning 64x64 kernel still needs two M tiles (128 padded rows),
 which is why the speedup there is 1.6x rather than 2x. Fusing the remaining
 RMSNorm/GDN/attention work and a pipelined 128-row tile with 2-CTA occupancy are
 the next steps toward the ~60 ms ideal.
+
+### Selective W4A8-INT8 status
+
+The full model can run Marlin W4A8-INT8 (`kS8 x kU4`, per-token symmetric INT8
+activations) for a subset of linears. All-linear INT8 is fast (2.6-2.76x at
+large M) but misses the decision gate; the shipped default keeps the residual
+writers and their inputs on W4A16: `linear_attn.out_proj`, `mlp.down_proj`,
+`linear_attn.in_proj_qkv`, `self_attn.o_proj/q_proj/k_proj/v_proj`, and
+`mlp.up_proj`. GDN `in_proj_z/b/a` and the MLP gate run INT8.
+
+Server suite (batch=1, CPU AWQ golden): 28/28, KL 3.456e-5, MAE 9.61e-4, max
+delta 9.63e-3. 36-token golden head top-1 36/36 (max 0.125); 4K/8K/16K probes
+match the W4A16 deltas. Full forward: 1K 382 -> 333 ms, 16K 7.63 -> 6.94 s,
+8x73 batch 222 -> 195 ms. Server c1/c8/c16: 23.4 / 37.9 / 38.1 req/s.
+
+The environment knobs are `JEV_NATIVE_INT8` (server default true),
+`JEV_NATIVE_INT8_EXCLUDE` (comma-separated module substrings) and
+`JEV_NATIVE_INT8_CLIP` (abs-max clip factor, default 1.0). The CLI equivalents
+are `--marlin-int8`, `--int8-exclude`, `--int8-clip`, and `--gdn-chunked-min-seq`
+for the GDN threshold. `--marlin-int8` without exclusions runs all-linear INT8.

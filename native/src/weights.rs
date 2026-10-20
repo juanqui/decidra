@@ -30,6 +30,8 @@ pub enum LinearWeight {
         zeros: CudaSlice<i32>,
         /// INT8-A global scale folded into activation scales; 0 for W4A16/FP8.
         a_global: f32,
+        /// Repacked for 8-bit activations (INT8 per-token quantized A).
+        int8_a: bool,
     },
     /// compressed-tensors pack-quantized W4A16 (AWQ/GPTQ), asymmetric int4.
     /// `packed` is I32 [out, ceil(in/8)] with 8 signed nibbles per word along
@@ -54,6 +56,14 @@ impl LinearWeight {
         match self {
             LinearWeight::Marlin { a_global, .. } => *a_global,
             _ => 0.0,
+        }
+    }
+
+    /// True when this module was repacked for INT8 activation quantization.
+    pub fn int8_a(&self) -> bool {
+        match self {
+            LinearWeight::Marlin { int8_a, .. } => *int8_a,
+            _ => false,
         }
     }
 
@@ -117,6 +127,8 @@ pub struct WeightProvider<'a> {
     pub marlin_fp8: bool,
     /// INT8-activation Marlin repack (raw AWQ qweight, 8-bit A layout).
     pub marlin_int8: bool,
+    /// Module-name substrings kept on W4A16 activations when `marlin_int8`.
+    pub int8_exclude: Vec<String>,
     stream: Arc<CudaStream>,
     gpu: &'a crate::cuda::Gpu,
     kernels: &'a crate::kernels::Kernels,
@@ -143,6 +155,7 @@ impl<'a> WeightProvider<'a> {
             marlin: false,
             marlin_fp8: false,
             marlin_int8: false,
+            int8_exclude: Vec::new(),
             stream: gpu.stream.clone(),
             gpu,
             kernels,
@@ -208,8 +221,13 @@ impl<'a> WeightProvider<'a> {
             if scale.len() != out * groups || zp.len() != zp_rows * groups {
                 bail!("{module}: scale/zp size mismatch");
             }
+            let use_int8 = self.marlin_int8
+                && !self
+                    .int8_exclude
+                    .iter()
+                    .any(|p| !p.is_empty() && module.contains(p));
             if self.marlin && out % 64 == 0 && in_ % 64 == 0 {
-                if (self.marlin_fp8 || self.marlin_int8) && group_size != 64 {
+                if (self.marlin_fp8 || use_int8) && group_size != 64 {
                     bail!("W4A8 transform requires group_size 64, got {group_size}");
                 }
                 let dbg = std::env::var("JEV_MARLIN_DEBUG").is_ok();
@@ -246,7 +264,7 @@ impl<'a> WeightProvider<'a> {
                     eprintln!("  transpose ok");
                 }
                 let mut qweight = self.stream.alloc_zeros::<i32>((in_ / 16) * (out * 2))?;
-                let repack_kernel = if self.marlin_fp8 || self.marlin_int8 {
+                let repack_kernel = if self.marlin_fp8 || use_int8 {
                     &self.kernels.marlin_repack_a8
                 } else {
                     &self.kernels.marlin_repack
@@ -262,7 +280,7 @@ impl<'a> WeightProvider<'a> {
                 )?;
                 let (scales, a_global) = if self.marlin_fp8 {
                     (marlin_permute_scales_a8(&scale, out, groups, 512.0), 0.0)
-                } else if self.marlin_int8 {
+                } else if use_int8 {
                     marlin_process_int8_scales(&scale, out, groups)
                 } else {
                     (
@@ -277,7 +295,7 @@ impl<'a> WeightProvider<'a> {
                 if dbg {
                     eprintln!("  repack ok");
                 }
-                let zeros = if self.marlin_fp8 || self.marlin_int8 {
+                let zeros = if self.marlin_fp8 || use_int8 {
                     marlin_permute_zeros_a8(&zp, out, groups)
                 } else {
                     marlin_permute_zeros(&zp, out, groups)
@@ -289,6 +307,7 @@ impl<'a> WeightProvider<'a> {
                     scales: self.stream.clone_htod(&scales)?,
                     zeros: self.stream.clone_htod(&zeros)?,
                     a_global,
+                    int8_a: use_int8,
                 });
             }
             return Ok(LinearWeight::PackedW4A16 {

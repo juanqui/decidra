@@ -199,6 +199,21 @@ fn cmd_batch(args: &[String]) -> Result<()> {
         eng.set_marlin(true);
         eng.set_marlin_int8(true);
     }
+    if let Some(v) = opt(args, "--int8-clip") {
+        eng.set_int8_clip(
+            v.parse()
+                .context("--int8-clip must be a number in (0, 1]")?,
+        );
+    }
+    if let Some(v) = opt(args, "--int8-exclude") {
+        eng.set_int8_exclude(
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
+    }
     if args.iter().any(|a| a == "--legacy-gdn") {
         eng.set_gdn_shared(false);
         eng.set_gdn_split(false);
@@ -309,6 +324,21 @@ fn cmd_matmul(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--marlin-int8") {
         eng.set_marlin(true);
         eng.set_marlin_int8(true);
+    }
+    if let Some(v) = opt(args, "--int8-clip") {
+        eng.set_int8_clip(
+            v.parse()
+                .context("--int8-clip must be a number in (0, 1]")?,
+        );
+    }
+    if let Some(v) = opt(args, "--int8-exclude") {
+        eng.set_int8_exclude(
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
     }
     let marlin_fp8 = args.iter().any(|a| a == "--marlin-fp8");
     let marlin_int8 = args.iter().any(|a| a == "--marlin-int8");
@@ -429,6 +459,21 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     if args.iter().any(|a| a == "--marlin-int8") {
         eng.set_marlin(true);
         eng.set_marlin_int8(true);
+    }
+    if let Some(v) = opt(args, "--int8-clip") {
+        eng.set_int8_clip(
+            v.parse()
+                .context("--int8-clip must be a number in (0, 1]")?,
+        );
+    }
+    if let Some(v) = opt(args, "--int8-exclude") {
+        eng.set_int8_exclude(
+            v.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
     }
     if args.iter().any(|a| a == "--legacy-gdn") {
         eng.set_gdn_shared(false);

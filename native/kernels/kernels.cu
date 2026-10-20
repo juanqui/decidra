@@ -26,7 +26,8 @@ __device__ __forceinline__ float block_reduce_sum(float v, float* scratch) {
 // Per-token symmetric INT8 quantization of bf16 activations (full-model path).
 extern "C" __global__ void quant_int8_per_token_bf16(
     const bf16* __restrict__ x, int8_t* __restrict__ out,
-    float* __restrict__ scales, int rows, int k, float global_scale) {
+    float* __restrict__ scales, int rows, int k, float global_scale,
+    float clip) {
   extern __shared__ float red[];
   int row = blockIdx.x;
   if (row >= rows) return;
@@ -39,7 +40,7 @@ extern "C" __global__ void quant_int8_per_token_bf16(
     if (threadIdx.x < off) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + off]);
     __syncthreads();
   }
-  float scale = fmaxf(red[0], 1e-10f) / 127.f;
+  float scale = fmaxf(red[0] * clip, 1e-10f) / 127.f;
   if (threadIdx.x == 0) scales[row] = scale * global_scale;
   __syncthreads();
   int8_t* orow = out + (size_t)row * k;
@@ -53,7 +54,8 @@ extern "C" __global__ void quant_int8_per_token_bf16(
 // Per-token symmetric INT8 quantization of an f32 activation matrix.
 extern "C" __global__ void quant_int8_per_token_f32(
     const float* __restrict__ x, int8_t* __restrict__ out,
-    float* __restrict__ scales, int rows, int k, float global_scale) {
+    float* __restrict__ scales, int rows, int k, float global_scale,
+    float clip) {
   extern __shared__ float red[];
   int row = blockIdx.x;
   if (row >= rows) return;
@@ -66,7 +68,7 @@ extern "C" __global__ void quant_int8_per_token_f32(
     if (threadIdx.x < off) red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + off]);
     __syncthreads();
   }
-  float scale = fmaxf(red[0], 1e-10f) / 127.f;
+  float scale = fmaxf(red[0] * clip, 1e-10f) / 127.f;
   if (threadIdx.x == 0) scales[row] = scale * global_scale;
   __syncthreads();
   int8_t* orow = out + (size_t)row * k;

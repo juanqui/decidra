@@ -22,6 +22,10 @@ pub const MAX_NATIVE_BATCH_WINDOW_US: u64 = 50_000;
 pub const DEFAULT_NATIVE_MAX_BATCH_TOKENS: usize = 16_384;
 pub const MIN_NATIVE_MAX_BATCH_TOKENS: usize = 512;
 pub const DEFAULT_SERVED_IDENTITY: &str = "autotrust/JEV-27B-VL@ba3f0d58+awq-w4a16";
+/// Module types kept on W4A16 when `JEV_NATIVE_INT8` is enabled. Verified at
+/// batch=1 (server suite): 28/28, max delta 9.63e-3, MAE 9.61e-4, KL
+/// 3.46e-5. The remaining INT8 modules are GDN z/b/a and the MLP gate.
+pub const DEFAULT_INT8_EXCLUDE: &str = "linear_attn.out_proj,mlp.down_proj,linear_attn.in_proj_qkv,self_attn.o_proj,self_attn.q_proj,mlp.up_proj,self_attn.v_proj,self_attn.k_proj";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -62,6 +66,14 @@ pub struct Config {
     /// Minimum sequence length for the chunked GDN path
     /// (`JEV_NATIVE_GDN_CHUNKED_MIN_SEQ`, default 64).
     pub native_gdn_chunked_min_seq: usize,
+    /// Enable selective W4A8-INT8 activations (`JEV_NATIVE_INT8`, default on;
+    /// the excluded modules in `DEFAULT_INT8_EXCLUDE` keep W4A16).
+    pub native_int8: bool,
+    /// Abs-max clip factor for INT8 activation scales
+    /// (`JEV_NATIVE_INT8_CLIP`, default 1.0 = off).
+    pub native_int8_clip: f32,
+    /// Module-name substrings kept on W4A16 (`JEV_NATIVE_INT8_EXCLUDE`).
+    pub native_int8_exclude: Vec<String>,
     /// Exact-decision logits cache entries (`JEV_DECISION_CACHE_SIZE`).
     /// Zero disables the cache.
     pub decision_cache_size: usize,
@@ -123,6 +135,23 @@ impl Config {
         }
         let native_gdn_chunked = env_bool("JEV_NATIVE_GDN_CHUNKED")?.unwrap_or(true);
         let native_gdn_chunked_min_seq = env_usize("JEV_NATIVE_GDN_CHUNKED_MIN_SEQ")?.unwrap_or(64);
+        let native_int8 = env_bool("JEV_NATIVE_INT8")?.unwrap_or(true);
+        let native_int8_clip = match env_string("JEV_NATIVE_INT8_CLIP") {
+            Some(v) => v
+                .parse::<f32>()
+                .context("JEV_NATIVE_INT8_CLIP must be a number in (0, 1]")?,
+            None => 1.0,
+        };
+        if !(native_int8_clip > 0.0 && native_int8_clip <= 1.0) {
+            bail!("JEV_NATIVE_INT8_CLIP must be in (0, 1], got {native_int8_clip}");
+        }
+        let native_int8_exclude = env_string("JEV_NATIVE_INT8_EXCLUDE")
+            .unwrap_or_else(|| DEFAULT_INT8_EXCLUDE.to_owned())
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect();
         let decision_cache_size =
             env_usize("JEV_DECISION_CACHE_SIZE")?.unwrap_or(DEFAULT_DECISION_CACHE_SIZE);
 
@@ -157,6 +186,9 @@ impl Config {
             native_max_batch_tokens,
             native_gdn_chunked,
             native_gdn_chunked_min_seq,
+            native_int8,
+            native_int8_clip,
+            native_int8_exclude,
             decision_cache_size,
             signing_key,
             metrics_enabled,

@@ -234,8 +234,10 @@ with 73-token prompts vLLM wins c1/c8/c16 (**1.21x/1.17x/1.22x rps**) and long
 prefill (**1.25-1.37x**); native wins c2 (**1.14x**), ties c4, and wins repeated
 exact prompts (exact cache), startup (**7.65 s vs 145 s**), GPU idle memory
 (**13.4 vs 21.8 GiB**), and verified 35,310-token context. W4A8-FP8/INT8 probes
-remain default OFF (FP8 ~2.6% layer MAE; INT8 suite 27/28, max 0.0589, MAE
-0.00453 after the tail-offset fix). For the
+use selective INT8 by default: the residual-writer modules keep W4A16 and
+the server suite passes (28/28, KL 3.46e-5, MAE 9.61e-4, max 9.63e-3), with
+1K 382 -> 333 ms and c8/c16 33.0 -> 37.9 req/s. All-linear INT8 does not pass
+(max 0.0589); FP8 remains off. For the
 ranked, gated plan to close the remaining gaps, see
 [`OPTIMIZATION-PROPOSAL.md`](OPTIMIZATION-PROPOSAL.md).
 

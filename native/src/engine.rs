@@ -226,6 +226,11 @@ pub struct Engine {
     marlin_fp8: AtomicBool,
     /// Experimental W4A8-INT8 repack/dispatch (default off).
     marlin_int8: AtomicBool,
+    /// Abs-max clipping factor for per-token INT8 activation scales
+    /// (`--int8-clip`, default 1.0 = no clipping). F32 bits in an AtomicU32.
+    int8_clip: std::sync::atomic::AtomicU32,
+    /// Module-name substrings kept on W4A16 activations under `marlin_int8`.
+    int8_exclude: Mutex<Vec<String>>,
     /// Marlin split-K barrier workspace (one int per SM), zeroed once.
     marlin_locks: Mutex<Option<CudaSlice<i32>>>,
     /// Warp-per-query attention (fast for long contexts); the original block
@@ -342,6 +347,8 @@ impl Engine {
             marlin: AtomicBool::new(false),
             marlin_fp8: AtomicBool::new(false),
             marlin_int8: AtomicBool::new(false),
+            int8_clip: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()),
+            int8_exclude: Mutex::new(Vec::new()),
             marlin_locks: Mutex::new(None),
             warp_attention: AtomicBool::new(true),
             prof: Prof::new(),
@@ -428,6 +435,22 @@ impl Engine {
         self.marlin_int8.store(enabled, Ordering::Relaxed);
     }
 
+    /// Clip per-token INT8 activation scales at `clip * absmax` (1.0 = off).
+    pub fn set_int8_clip(&self, clip: f32) {
+        self.int8_clip
+            .store(clip.clamp(0.01, 1.0).to_bits(), Ordering::Relaxed);
+    }
+
+    fn int8_clip(&self) -> f32 {
+        f32::from_bits(self.int8_clip.load(Ordering::Relaxed))
+    }
+
+    /// Keep modules whose names contain any of these substrings on W4A16
+    /// activations when INT8 is enabled (must be set before preload_all).
+    pub fn set_int8_exclude(&self, exclude: Vec<String>) {
+        *self.int8_exclude.lock().unwrap() = exclude;
+    }
+
     fn prof_begin(&self, _name: &'static str) -> Option<CudaEvent> {
         if !self.prof.enabled {
             return None;
@@ -491,6 +514,7 @@ impl Engine {
         p.marlin = self.marlin.load(Ordering::Relaxed);
         p.marlin_fp8 = self.marlin_fp8.load(Ordering::Relaxed);
         p.marlin_int8 = self.marlin_int8.load(Ordering::Relaxed);
+        p.int8_exclude = self.int8_exclude.lock().unwrap().clone();
         Ok(p)
     }
 
@@ -2144,7 +2168,7 @@ impl Engine {
                 zeros,
                 ..
             } => {
-                if self.marlin_int8.load(Ordering::Relaxed) {
+                if w.int8_a() {
                     let mut xq = self.gpu.stream.alloc_zeros::<i8>(rows * k)?;
                     let mut as_ = self.gpu.stream.alloc_zeros::<f32>(rows)?;
                     kernels::quant_int8_bf16(
@@ -2156,6 +2180,7 @@ impl Engine {
                         rows,
                         k,
                         w.a_global(),
+                        self.int8_clip(),
                     )?;
                     let mut c = self.alloc_bf16(rows * n)?;
                     {
@@ -2496,6 +2521,7 @@ impl Engine {
             rows,
             k,
             w.a_global(),
+            self.int8_clip(),
         )?;
         let mut c = self.alloc_bf16(rows * n)?;
         self.marlin_int8_gemm(&w, &xq, &as_, &mut c, rows, n, k)?;

@@ -717,6 +717,7 @@ pub fn quant_int8(
     rows: usize,
     k: usize,
     global_scale: f32,
+    clip: f32,
 ) -> Result<()> {
     let cfg = LaunchConfig {
         grid_dim: (rows as u32, 1, 1),
@@ -731,6 +732,7 @@ pub fn quant_int8(
     l.arg(&r_i);
     l.arg(&k_i);
     l.arg(&global_scale);
+    l.arg(&clip);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }
@@ -773,6 +775,7 @@ pub fn quant_int8_bf16(
     rows: usize,
     k: usize,
     global_scale: f32,
+    clip: f32,
 ) -> Result<()> {
     let cfg = LaunchConfig {
         grid_dim: (rows as u32, 1, 1),
@@ -787,6 +790,7 @@ pub fn quant_int8_bf16(
     l.arg(&r_i);
     l.arg(&k_i);
     l.arg(&global_scale);
+    l.arg(&clip);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }

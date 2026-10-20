@@ -149,12 +149,23 @@ shipped server, and the default remains **W4A16**.
   the activation pointer by `row_off` bytes instead of `row_off * k`, so every
   non-multiple-of-64 row count computed its last group from the wrong tokens
   (visible as the last request of an 8-request batch collapsing toward zero).
-  With that fixed the suite is **27/28, max delta 0.0589, MAE 0.00453**, still
-  outside the gate (top-1 1.0, max 0.011, MAE 0.001). Layer error is lower than
-  FP8 (~0.90-0.96% normalized MAE). Default OFF.
-- The shipped default stays **W4A16**: suite28 28/28, max delta 0.0101, MAE
-  0.000736. A future W4A8 attempt needs a full calibration/quality project before it
-  can be considered.
+  With that fixed, all-linear INT8 is 27/28, max 0.0589, MAE 0.00453; abs-max
+  clipping (`--int8-clip 0.995`) reaches 28/28 but max 0.0228, still outside the
+  gate.
+- **Selective W4A8-INT8** ships as the default (`JEV_NATIVE_INT8=true`): the
+  residual writers and their inputs stay W4A16
+  (`linear_attn.out_proj`, `mlp.down_proj`, `linear_attn.in_proj_qkv`,
+  `self_attn.o_proj/q_proj/k_proj/v_proj`, `mlp.up_proj`), while GDN z/b/a and
+  the MLP gate run INT8. Server suite at batch=1: **28/28, KL 3.456e-5, MAE
+  9.61e-4, max delta 9.63e-3** -> PASS. 36-token golden head top-1 36/36 (max
+  0.125), 4K/8K/16K probes unchanged.
+- Speed vs W4A16: **1K 382 -> 333 ms** (1.15x), **16K 7.63 -> 6.94 s** (1.10x),
+  8x73 batch 222 -> 195 ms; all-linear INT8 would be 220 ms / 5.73 s but fails
+  the gate. Server c1/c8/c16: **23.4 / 37.9 / 38.1 req/s** (W4A16: 22.9 / 33.0
+  / 33.7).
+- Disable with `JEV_NATIVE_INT8=false`; the exclusion list, clip factor, and
+  flags are `JEV_NATIVE_INT8_EXCLUDE` / `JEV_NATIVE_INT8_CLIP` (server) and
+  `--int8-exclude` / `--int8-clip` (native CLI).
 
 ## Verdict
 
