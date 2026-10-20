@@ -400,22 +400,35 @@ sequentially.
   `{"error":{"message":"backend: ...","code":502|504}}` with the server-wide backend
   status policy. `/v1/systemone` is not signed (same as the shim).
 
-## 9. Generation routes
+## 9. OpenAI-compatible decision routes
 
-`POST /v1/chat/completions` and `POST /v1/completions` always return **501** with:
+`POST /v1/chat/completions` and `POST /v1/completions` exist so LiteLLM (or any OpenAI
+client) can proxy decisions without a translation layer. They are not free-form
+generation: the user content / `prompt` must be a JSON decision request.
+
+Chat request:
 
 ```json
 {
-  "detail": "native generation not implemented: this server exposes decision endpoints only",
-  "error": {
-    "message": "native generation not implemented: this server exposes decision endpoints only",
-    "type": "not_implemented_error",
-    "code": 501
-  }
+  "model": "jev-awq",
+  "messages": [
+    {"role": "user", "content":
+      "{\"kind\":\"noul\",\"state\":\"...\",\"question\":\"...\"}"}
+  ],
+  "stream": false
 }
 ```
 
-The body is not parsed and nothing is proxied. These routes are not signed.
+The last `user` message is parsed as the `/v1/decide` body (Markdown ```json fences are
+accepted). The assistant content is the compact decision JSON, identical to
+`/v1/decide` (including `choice`, `probabilities`, `confidence`, and `usage`). Response
+`usage` is the native prompt/completion token accounting. `stream: true` returns SSE
+`chat.completion.chunk` events followed by `data: [DONE]`; `stream_options.include_usage`
+adds the usage object to the final chunk. `/v1/completions` uses the same content in the
+`text_completion` shape (`choices[].text`).
+
+Errors use the standard envelope (`error.message`, `error.type`, `error.code`). Non-JSON
+user text is a **400**. These routes are not signed.
 
 ## 10. Signing
 
@@ -481,7 +494,7 @@ recorder is not installed.
 | `/v1/systemone` bad criterion key | 400, `choice keys must match [a-z0-9-]+, got '<key>'`. |
 | `/v1/systemone` image state | 400, `native vision not implemented`. |
 | Unknown question type | 400, Python-repr of the value. |
-| `/v1/chat/completions`, `/v1/completions` | 501, `native generation not implemented`. |
+| `/v1/chat/completions`, `/v1/completions` | 400, `user message must be a JSON decision request ...`. |
 | Native engine failure | 502, `backend request failed`. |
 | Backend timeout | 504, `backend request timed out`. |
 | Malformed/non-finite logits | 502, `invalid backend response`. |

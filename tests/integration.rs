@@ -76,6 +76,8 @@ fn test_config() -> Config {
         native_gdn_chunked_min_seq: 64,
         native_int8: false,
         native_int8_clip: 1.0,
+        native_int8_group_scale: false,
+        native_int8_group_exclude: Vec::new(),
         native_int8_exclude: Vec::new(),
         native_int8_all_layers: String::new(),
         decision_cache_size: 256,
@@ -416,28 +418,6 @@ async fn image_states_are_rejected_without_a_backend_call() {
 }
 
 #[tokio::test]
-async fn generation_endpoints_return_501() {
-    let (app, prompts) = app_for().await;
-    let body = json!({"model": "client-model", "prompt": "hello", "max_tokens": 4});
-    let (status, _, bytes) = call(&app, Method::POST, "/v1/completions", Some(&body)).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    let error = decode(&bytes);
-    assert_eq!(error["error"]["type"], "not_implemented_error");
-    assert!(
-        error["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("native generation not implemented")
-    );
-
-    let body = json!({"messages": [{"role": "user", "content": "hi"}], "stream": true});
-    let (status, _, bytes) = call(&app, Method::POST, "/v1/chat/completions", Some(&body)).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
-    assert!(String::from_utf8_lossy(&bytes).contains("native generation not implemented"));
-    assert!(prompts.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
 async fn systemone_noul_choice_and_validation() {
     let (app, prompts) = app_for().await;
 
@@ -653,4 +633,94 @@ async fn validation_and_backend_error_semantics() {
         call_raw(&app, "/v1/decide", &serde_json::to_string(&body).unwrap()).await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
     assert_eq!(decode(&bytes)["error"]["type"], "backend_timeout");
+}
+
+#[tokio::test]
+async fn openai_chat_completions_returns_decision() {
+    let (app, _prompts) = app_for().await;
+    let decision = json!({"kind": "noul", "state": "hello", "question": "Is it safe?"});
+    let body = json!({
+        "model": "jev-awq",
+        "messages": [{"role": "user", "content": decision.to_string()}]
+    });
+    let (status, headers, bytes) =
+        call(&app, Method::POST, "/v1/chat/completions", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        header(&headers, "content-type")
+            .unwrap()
+            .contains("application/json")
+    );
+    let response = decode(&bytes);
+    assert_eq!(response["object"], "chat.completion");
+    assert_eq!(response["model"], "jev-awq");
+    assert_eq!(response["choices"][0]["message"]["role"], "assistant");
+    let content: Value = serde_json::from_str(
+        response["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(content["choice"], "true");
+    assert_eq!(content["kind"], "noul");
+    assert_eq!(response["usage"]["prompt_tokens"], 10);
+}
+
+#[tokio::test]
+async fn openai_chat_completions_streams_sse() {
+    let (app, _prompts) = app_for().await;
+    let decision = json!({"kind": "noul", "state": "hello", "question": "Is it safe?"});
+    let body = json!({
+        "messages": [{"role": "user", "content": decision.to_string()}],
+        "stream": true,
+        "stream_options": {"include_usage": true}
+    });
+    let (status, headers, bytes) =
+        call(&app, Method::POST, "/v1/chat/completions", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        header(&headers, "content-type")
+            .unwrap()
+            .contains("text/event-stream")
+    );
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("\"object\":\"chat.completion.chunk\""));
+    assert!(text.contains("\"finish_reason\":\"stop\""));
+    assert!(text.contains("\"usage\""));
+    assert!(text.contains("data: [DONE]"));
+}
+
+#[tokio::test]
+async fn openai_completions_returns_text_completion() {
+    let (app, _prompts) = app_for().await;
+    let decision = json!({"kind": "choice", "state": "s", "question": "q",
+                          "options": ["a", "b"]});
+    let body = json!({"prompt": decision.to_string()});
+    let (status, _headers, bytes) = call(&app, Method::POST, "/v1/completions", Some(&body)).await;
+    assert_eq!(status, StatusCode::OK);
+    let response = decode(&bytes);
+    assert_eq!(response["object"], "text_completion");
+    let decision: Value =
+        serde_json::from_str(response["choices"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(decision["kind"], "choice");
+    assert_eq!(decision["options"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn openai_chat_completions_rejects_non_json_user_message() {
+    let (app, _prompts) = app_for().await;
+    let body = json!({
+        "messages": [{"role": "user", "content": "please decide this for me"}]
+    });
+    let (status, _headers, bytes) =
+        call(&app, Method::POST, "/v1/chat/completions", Some(&body)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let response = decode(&bytes);
+    assert_eq!(response["error"]["type"], "invalid_request_error");
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("JSON decision request")
+    );
 }

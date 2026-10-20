@@ -28,6 +28,26 @@ read.
 Port `8501` is chosen so the existing Python front on `8500` and its production backend on
 `8001` remain untouched.
 
+## LiteLLM
+
+`/v1/chat/completions` and `/v1/completions` are OpenAI-compatible decision routes, so
+LiteLLM can proxy the server directly:
+
+```yaml
+model_list:
+  - model_name: jev-decisions
+    litellm_params:
+      model: openai/jev-awq
+      api_base: http://127.0.0.1:8501/v1
+      api_key: unused
+```
+
+The user content / `prompt` must be a JSON decision request. The assistant message is the
+compact decision JSON (`choice`, `probabilities`, `confidence`, `usage`), so downstream
+code can parse it as JSON rather than reading free-form text. Streaming is supported
+(SSE `chat.completion.chunk` events followed by `data: [DONE]`). A plain text prompt is a
+400; it is never silently coerced into a decision.
+
 ## Prerequisites
 
 Build:
@@ -194,7 +214,7 @@ in production.
 | Startup blocks for ~10 s with disk/GPU work | `JEV_NATIVE_CACHE=true` repacks/uploads ~13.1 GiB once; wait for the preload log line. |
 | `/v1/decide` returns 502 | Native forward failed (check logs); no fallback backend exists. |
 | `/v1/decide` returns 400 for image states | Expected: native vision is not implemented. |
-| `/v1/chat/completions` returns 501 | Expected: native generation is not implemented. |
+| `/v1/chat/completions` returns 400 | Expected: the user message must be a JSON decision request (`{"kind","state","question","options"}`). |
 | OOM during preload | Free GPU 1; do not run another model process there. |
 
 Never expose the Python shim on `8500` or the production backend on `8001` as part of this

@@ -24,7 +24,7 @@ The server owns the parts where exactness and operational control matter:
                     │  │       prompt + label ids + head math        │                   │
                     │  ├─ POST /v1/decisions ─▶ DecisionEngine ──────┤                   │
                     │  ├─ POST /v1/systemone ─▶ DecisionEngine ──────┤                   │
-                    │  ├─ POST /v1/chat/completions, /v1/completions ── 501              │
+                    │  ├─ POST /v1/chat/completions, /v1/completions ── decisions │
                     │  └─ middleware: HMAC signing, HTTP metrics                         │
                     │                                          │                         │
                     │                                          ▼                         │
@@ -227,8 +227,8 @@ Calibration follows the same pattern with `decision_head/calibration.json` then
 | `POST` | `/v1/decide` | JEV native decision (`noul`, `score`, `choice`). |
 | `POST` | `/v1/decisions` | OpenAI Decisions API shape (`predicate`, `choice`, `score`). |
 | `POST` | `/v1/systemone` | xPNP hosted System One (`noul`/`choice`, text only). |
-| `POST` | `/v1/chat/completions` | **501** — native generation not implemented. |
-| `POST` | `/v1/completions` | **501** — native generation not implemented. |
+| `POST` | `/v1/chat/completions` | OpenAI-compatible decision proxy (LiteLLM): the last user message is a JSON decision request; returns the decision JSON. |
+| `POST` | `/v1/completions` | OpenAI-compatible text-completion shape over the same decision JSON. |
 
 Examples:
 
@@ -248,11 +248,18 @@ curl -s http://127.0.0.1:8080/v1/systemone \
        "questions":{"safe":{"type":"noul","instructions":"Is this abusive?"},
                     "team":{"type":"choice","instructions":"Which team?",
                             "criteria":{"billing":"charges","support":"bugs","sales":"pricing"}}}}'
+
+# OpenAI-compatible / LiteLLM: the user message is the decision request.
+curl -s http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"jev-awq","messages":[{"role":"user",
+       "content":"{\"kind\":\"noul\",\"state\":\"q\",\"question\":\"Is this abusive?\"}"}]}'
 ```
 
 Text decisions are the supported surface. Any state containing an image part is rejected
-with **400** (`native vision not implemented`); no image is proxied anywhere. Generation
-endpoints return **501** with an OpenAI-shaped `not_implemented_error` envelope.
+with **400** (`native vision not implemented`); no image is proxied anywhere. The
+OpenAI-compatible routes serve decisions, not free-form generation: the user message must
+be a JSON decision request, and the assistant content is the compact decision JSON.
 
 ## Strategies
 
@@ -283,8 +290,9 @@ x-jev-signature: sha256=<hex HMAC-SHA256 over the exact response body bytes>
 ```
 
 This includes `/v1/decide/info` and error responses on those paths. `/health`, `/metrics`,
-`/v1/models`, and the 501 generation routes are not signed. The signature is calculated
-after the body is produced and before it is sent; `content-type` is preserved.
+`/v1/models`, and responses to the OpenAI-compatible decision routes are not signed. The
+signature is calculated after the body is produced and before it is sent; `content-type`
+is preserved.
 
 Verify with Python (tooling only, not runtime):
 
@@ -297,7 +305,7 @@ assert expected == headers["x-jev-signature"]
 ## Tests and evaluation
 
 ```bash
-cargo test                                    # 31 unit + 7 integration, mock backend
+cargo test                                    # 47 unit + 10 integration, mock backend
 cargo build --release --features native
 JEV_CUDA_LIBS=/path/to/cublas ./scripts/native-smoke.sh
 ```
@@ -348,18 +356,15 @@ Single-forward native measurements on GPU 1 with resident packed weights
 
 Marlin preload is **10.1 s** (repack) and uses **13.1 GiB** resident; the fallback paths
 use 5.8 s / 12.7 GiB. Init is 0.2 s. At 36 tokens Marlin runs at 100% GPU utilization.
-Long-context latency with Marlin + tiled FA2 + gated split GDN: **4K 2.12-2.18 s**,
-**8K 4.23-4.32 s**, **16K 8.62-8.97 s**, **32K (32,763 tokens) 18.60-19.03 s**. Peak
-memory is **18.86 GiB at 16K** and **19.09 GiB at 32K** (24 GB card, ~4.4 GiB headroom);
-the GPU is at 100% utilization, ~455 W. The split-dk GDN recurrence is 3.9x faster on its
-hot kernel (1K per-layer 13.35 -> 3.41 ms) and cuts the 1K forward from 958 to ~488 ms.
-It is used only for sequences **>= 512 tokens**: shorter prompts use the accurate shared
-GDN because the four-way f32 reduction reorders the state dot products enough to move
-rare short-prompt logits (suite `r22`, 54 tokens: split two-way delta 1.43e-2 vs shared
-6.43e-3). For **seq >= 24,576** the engine enables a low-memory buffer-pool mode: it
-releases dropped large tensors instead of retaining them and drops large MLP/attention/GDN
-intermediates as soon as they are consumed. 1K/16K timings are unchanged. Full long
-context is **GEMM-bound** at ~0.49-0.55 ms/token. Tiled FA2 remains 7-12x faster than the
+Long-context latency with Marlin + mixed W4A8-INT8 + chunked GDN + FlashInfer:
+**4K 0.937 s**, **8K 1.918 s**, **16K 4.151 s** (resident server; engine CLI 4K
+0.924 s, 16K 3.900 s). Peak memory is **16.85 GiB** resident and **18.10 GiB at 16K**,
+flat across repeated 16K requests; long prefill holds 100% GPU at ~420-430 W. The
+pre-chunked W4A16 stack measured 2.12-2.18 / 4.23-4.32 / 8.62-8.97 s. For
+**seq >= 12,288** the engine enables a low-memory buffer-pool mode: it releases dropped
+large tensors instead of retaining them and drops large MLP/attention/GDN intermediates
+as soon as they are consumed. Full long context is **GEMM-bound** at ~0.23-0.25
+ms/token. Tiled FA2 remains 7-12x faster than the
 warp kernel on identical buffers (kernel-only 1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms).
 
 With `JEV_NATIVE_MARLIN=false`, the fallback hybrid policy uses fused only for
@@ -390,12 +395,13 @@ Batch correctness: a batch of one is bit-identical to the single-call path. Batc
 their single-request probabilities by at most **4.2e-5** with identical top-1, and the
 28-row suite max delta is **1.010e-2**, inside the 0.011 gate.
 
-Long context runs alone (it exceeds the 16,384-token batch cap). With chunked GDN on
-by default: **4,032 tokens -> 200 in 1.63 s**, **8,029 -> 3.27 s**, **16,024 -> 6.77 s**,
-and **35,310 -> 16.67 s**, all choice `true` (the 35K result is the verified maximum on
-the 24 GB GPU). The legacy path measured 2.12-2.18 s / 4.23-4.32 s / 8.62-8.97 s /
-20.15 s at those lengths. The 10-row long-context suite is **10/10 top-1**, and repeated
-16K/35K runs returned 200 with no timeout/OOM.
+Long context runs alone (it exceeds the 16,384-token batch cap). With the shipped
+mixed W4A8-INT8 path: **4K 0.937 s**, **8K 1.918 s**, **16K 4.151 s**, all choice
+`true`; the previous 35,310-token probe (16.67 s) remains the verified maximum on the
+24 GB GPU but was not rerun after the INT8 change. The pre-chunked path measured
+2.12-2.18 s / 4.23-4.32 s / 8.62-8.97 s / 20.15 s at those lengths. The 10-row
+long-context suite is **10/10 top-1**, and repeated 16K runs stay at 4.15 s and
+**18.10 GiB** with no timeout/OOM.
 
 Exact-decision cache (256 entries, default): unique prompts are unchanged (suite28
 28/28 and c1/c4/c8 identical within noise). Repeating one exact prompt 16x at c=1
@@ -467,19 +473,18 @@ WantedBy=multi-user.target
 - One forward produces one decision read-out position. Latency is dominated by prefill;
   nothing is decoded. Marlin single-forward timings: **45.1 ms** (36 tokens),
   **73.0 ms** (76 tokens), **488 ms** (1024 tokens). Long context is GEMM-bound.
-  The default chunked GDN path cuts the recurrent stage 2.1x and the full forward
-  **1K to 395 ms (-17.7%)** and **16K to 6.94 s (-16.4%)**; server probes measure
-  4K **1.63 s**, 8K **3.27 s**, 16K **6.77 s**, 35.3K **16.67 s** (legacy:
-  2.12-2.18 / 4.23-4.32 / 8.62-8.97 / 20.15 s). Peak memory remains **18.86 GiB at
-  16K / 19.09 GiB at 32K**. For seq >= 24,576 the low-memory buffer-pool mode drops
-  intermediates early.
+  The current mixed W4A8-INT8 stack measures **4K 0.937 s**, **8K 1.918 s**,
+  **16K 4.151 s** and **16K 18.10 GiB peak**; the earlier chunked-GDN-only stack
+  measured 1.63 / 3.27 / 6.77 / 16.67 s at 4K/8K/16K/35K. For seq >= 12,288 the
+  low-memory buffer-pool mode drops intermediates early, which keeps repeated 16K
+  requests flat.
 - The split-dk GDN recurrence is 3.9x faster than the previous shared-state kernel
   (1K per-layer 13.35 -> 3.41 ms) but is gated to sequences >= 512 tokens; shorter
   prompts keep the accurate shared recurrence. Tiled FA2 attention is 7-12x faster than
   warp on identical buffers (kernel-only 1K 0.276 ms, 4K 2.85 ms, 8K 9.68 ms).
 - `JEV_NATIVE_GDN_CHUNKED=true` (default) uses the chunked TF32 WMMA GDN prefill for
-  sequences >= 512 tokens: 2.1x on the GDN stage, **1K -17.7%** and **16K -16.4%**
-  end-to-end. Prompts below 512 tokens keep the shared/split path, so short-request
+  sequences >= 64 tokens (`JEV_NATIVE_GDN_CHUNKED_MIN_SEQ`); shorter prompts keep the
+  shared/split path, so short-request
   latency is unchanged; `false` restores the legacy recurrence everywhere.
 - Requests are batched. A single engine thread owns the CUDA context; the HTTP
   reactor tokenizes and enqueues, then awaits a oneshot reply. The worker blocks for
@@ -536,8 +541,9 @@ Prometheus metrics exposed:
 - Native engine failures are surfaced as structured **502**; backend timeouts as **504**;
   request validation stays **400**.
 - Image states return **400** (`native vision not implemented`).
-- `/v1/chat/completions` and `/v1/completions` return **501**
-  (`native generation not implemented`). They never proxy to another process.
+- `/v1/chat/completions` and `/v1/completions` are OpenAI-compatible decision routes.
+  They parse the request body, run the same native decision as `/v1/decide`, and never
+  proxy to another process. Non-JSON user text is a **400**.
 - `/v1/decide` additionally reports `confidence` (the top probability), as requested for
   this service. The Python shim omits it.
 - `/v1/systemone` is ported from the shim's xPNP handler: one pass per question, no

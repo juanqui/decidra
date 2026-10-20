@@ -1,5 +1,6 @@
 //! Axum application: JEV decision endpoints, OpenAI-compatible decisions,
-//! HMAC signing, and Prometheus metrics. Generation endpoints return 501.
+//! HMAC signing, and Prometheus metrics. The OpenAI routes execute the same
+//! native decision as `/v1/decide`; they do not generate free-form text.
 
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
 
@@ -35,8 +36,6 @@ use crate::{
 
 const SIGNATURE_HEADER: &str = "x-jev-signature";
 const SIGNATURE_BODY_LIMIT: usize = 128 * 1024 * 1024;
-const GENERATION_UNSUPPORTED: &str =
-    "native generation not implemented: this server exposes decision endpoints only";
 
 /// Startup diagnostics, also printed by `--check-config`.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -261,6 +260,11 @@ async fn decide(
     payload: Result<Json<DecideRequest>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(request) = payload.map_err(json_rejection)?;
+    decide_value(&state, request).await.map(Json)
+}
+
+/// Shared decision path used by `/v1/decide` and the OpenAI-compatible routes.
+async fn decide_value(state: &AppState, request: DecideRequest) -> Result<Value, ApiError> {
     let kind = Kind::parse(&request.kind)
         .ok_or_else(|| ApiError::bad_request("kind must be noul|score|choice"))?;
     prompt::validate_state(&request.state).map_err(ApiError::bad_request)?;
@@ -313,7 +317,7 @@ async fn decide(
     };
     let usage = outcome.usage;
 
-    Ok(Json(json!({
+    Ok(json!({
         "kind": kind.as_str(),
         "effective_kind": kind.as_str(),
         "options": options,
@@ -330,7 +334,7 @@ async fn decide(
             "total_tokens": usage.total_tokens(),
         },
         "num_model_requests": usage.requests,
-    })))
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -940,14 +944,277 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
     .into_response()
 }
 
-/// The native engine implements decision read-outs only. Generation is not
-/// proxied to any other process.
-async fn chat_completions() -> ApiError {
-    ApiError::not_implemented(GENERATION_UNSUPPORTED)
+/// OpenAI-compatible chat completions. The last `user` message must be a JSON
+/// decision request (`{"kind","state","question","options"}`); the assistant
+/// content is the compact decision JSON. This is the route LiteLLM proxies.
+#[derive(Debug, Deserialize)]
+struct ChatCompletionRequest {
+    #[serde(default)]
+    model: Option<String>,
+    messages: Vec<ChatMessage>,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
 }
 
-async fn completions() -> ApiError {
-    ApiError::not_implemented(GENERATION_UNSUPPORTED)
+#[derive(Debug, Deserialize)]
+struct ChatMessage {
+    role: String,
+    #[serde(default)]
+    content: Option<ChatContent>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ChatContent {
+    Text(String),
+    Parts(Vec<ChatContentPart>),
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatContentPart {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CompletionRequest {
+    #[serde(default)]
+    model: Option<String>,
+    prompt: CompletionPrompt,
+    #[serde(default)]
+    stream: bool,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum CompletionPrompt {
+    Text(String),
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn message_text(message: &ChatMessage) -> Result<String, ApiError> {
+    match &message.content {
+        Some(ChatContent::Text(text)) => Ok(text.clone()),
+        Some(ChatContent::Parts(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                if part.kind != "text" {
+                    return Err(ApiError::bad_request(format!(
+                        "only text content parts are supported, got {:?}",
+                        part.kind
+                    )));
+                }
+                if let Some(text) = &part.text {
+                    out.push_str(text);
+                }
+            }
+            Ok(out)
+        }
+        None => Ok(String::new()),
+    }
+}
+
+/// Parse a decision request from user text, optionally inside a Markdown fence.
+fn parse_decision_text(text: &str) -> Result<DecideRequest, ApiError> {
+    let trimmed = text.trim();
+    let unwrapped = trimmed
+        .strip_prefix("```json")
+        .or_else(|| trimmed.strip_prefix("```"))
+        .and_then(|rest| rest.strip_suffix("```"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    serde_json::from_str(unwrapped).map_err(|error| {
+        ApiError::bad_request(format!(
+            "user message must be a JSON decision request \
+             {{\"kind\":\"noul|score|choice\",\"state\":...,\"question\":...,\"options\":[...]}}: {error}"
+        ))
+    })
+}
+
+fn openai_usage(decision: &Value) -> Value {
+    decision
+        .get("usage")
+        .cloned()
+        .unwrap_or_else(|| json!({"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}))
+}
+
+fn decision_content(decision: &Value) -> String {
+    serde_json::to_string(decision).unwrap_or_default()
+}
+
+fn sse_events(events: Vec<Value>) -> Response {
+    use axum::response::sse::{Event, Sse};
+    let items: Vec<Result<Event, std::convert::Infallible>> = events
+        .into_iter()
+        .map(|value| {
+            let data = if value.is_string() {
+                value.as_str().unwrap_or_default().to_owned()
+            } else {
+                value.to_string()
+            };
+            Ok(Event::default().data(data))
+        })
+        .collect();
+    Sse::new(futures::stream::iter(items)).into_response()
+}
+
+async fn chat_completions(
+    State(state): State<AppState>,
+    payload: Result<Json<ChatCompletionRequest>, JsonRejection>,
+) -> Response {
+    let request = match payload {
+        Ok(Json(request)) => request,
+        Err(rejection) => return json_rejection(rejection).into_response(),
+    };
+    let text = match request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(message_text)
+        .transpose()
+    {
+        Ok(Some(text)) => text,
+        Ok(None) => {
+            return ApiError::bad_request("chat request needs a user message").into_response();
+        }
+        Err(error) => return error.into_response(),
+    };
+    let decision_request = match parse_decision_text(&text) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let decision = match decide_value(&state, decision_request).await {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let model = request
+        .model
+        .unwrap_or_else(|| state.config.model_id.clone());
+    let content = decision_content(&decision);
+    let usage = openai_usage(&decision);
+    let id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    let created = unix_now();
+    if request.stream {
+        let include_usage = request
+            .stream_options
+            .map(|options| options.include_usage)
+            .unwrap_or(false);
+        let mut events = vec![
+            json!({
+                "id": id, "object": "chat.completion.chunk", "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": null}]
+            }),
+            json!({
+                "id": id, "object": "chat.completion.chunk", "created": created,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"content": content}, "finish_reason": null}]
+            }),
+        ];
+        let mut finish = json!({
+            "id": id, "object": "chat.completion.chunk", "created": created,
+            "model": model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+        });
+        if include_usage {
+            finish["usage"] = usage;
+        }
+        events.push(finish);
+        events.push(Value::String("[DONE]".to_owned()));
+        return sse_events(events);
+    }
+    Json(json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": {"role": "assistant", "content": content},
+            "finish_reason": "stop"
+        }],
+        "usage": usage,
+    }))
+    .into_response()
+}
+
+async fn completions(
+    State(state): State<AppState>,
+    payload: Result<Json<CompletionRequest>, JsonRejection>,
+) -> Response {
+    let request = match payload {
+        Ok(Json(request)) => request,
+        Err(rejection) => return json_rejection(rejection).into_response(),
+    };
+    let CompletionPrompt::Text(text) = request.prompt;
+    let decision_request = match parse_decision_text(&text) {
+        Ok(request) => request,
+        Err(error) => return error.into_response(),
+    };
+    let decision = match decide_value(&state, decision_request).await {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let model = request
+        .model
+        .unwrap_or_else(|| state.config.model_id.clone());
+    let content = decision_content(&decision);
+    let usage = openai_usage(&decision);
+    let id = format!("cmpl-{}", Uuid::new_v4().simple());
+    let created = unix_now();
+    if request.stream {
+        let include_usage = request
+            .stream_options
+            .map(|options| options.include_usage)
+            .unwrap_or(false);
+        let mut events = vec![json!({
+            "id": id, "object": "text_completion", "created": created, "model": model,
+            "choices": [{"index": 0, "text": content, "finish_reason": null, "logprobs": null}]
+        })];
+        let mut finish = json!({
+            "id": id, "object": "text_completion", "created": created, "model": model,
+            "choices": [{"index": 0, "text": "", "finish_reason": "stop", "logprobs": null}]
+        });
+        if include_usage {
+            finish["usage"] = usage;
+        }
+        events.push(finish);
+        events.push(Value::String("[DONE]".to_owned()));
+        return sse_events(events);
+    }
+    Json(json!({
+        "id": id,
+        "object": "text_completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "text": content,
+            "finish_reason": "stop",
+            "logprobs": null
+        }],
+        "usage": usage,
+    }))
+    .into_response()
 }
 
 fn json_rejection(rejection: JsonRejection) -> ApiError {
