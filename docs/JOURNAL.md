@@ -29,17 +29,17 @@ Server (one resident process, 16 unique prompts/level, cache off):
 
 | level | req/s | p50 | GPU util | power |
 |---|---:|---:|---:|---:|
-| c1 | 25.08 | 40.2 ms | 97% | 376 W |
-| c2 | 38.95 | 51.9 ms | 93% | 349 W |
-| c4 | 50.18 | 79.2 ms | 93% | 328 W |
-| c8 | 53.20 | 148.4 ms | 96% | 334 W |
-| c16 | 53.44 | 240.5 ms | 95% | 353 W |
+| c1 | 24.87 | 40.6 ms | 93% | 378 W |
+| c2 | 39.53 | 51.3 ms | 91% | 349 W |
+| c4 | 51.14 | 78.4 ms | 93% | 315 W |
+| c8 | 52.81 | 149.8 ms | 96% | 332 W |
+| c16 | 55.88 | 205.4 ms | 98% | 349 W |
 
-Long single request: **4K 0.913 s (4,477 tok/s, 100% GPU, 384-428 W)**,
-**8K 1.871 s (4,371 tok/s, 100%, 422 W)**,
-**16K 4.051 s (4,045 tok/s, 100%, 430 W)**.
+Long single request: **4K 0.879 s (4,657 tok/s, 100% GPU, 384-428 W)**,
+**8K 1.805 s (4,531 tok/s, 100%, 422 W)**,
+**16K 3.921 s (4,179 tok/s, 100%, 430 W)**.
 
-Resident/peak memory: **18.83 GiB** short, **20.17 GiB during 16K**, flat across
+Resident/peak memory: **18.83 GiB** short, **20.51 GiB during 16K**, flat across
 repeated 16K requests. The 2.37 GiB embedding table is resident and rows are gathered
 on-device; the low-memory pool threshold is 12,288 tokens.
 
@@ -97,6 +97,13 @@ the shipped default.
   must then match the per-token kernel — it does).
 
 ### Experiments (results)
+
+- **Group-scale staging in shared memory**: each K stage stages the block's 64
+  activation scales once (reusing the unused per-row scale reservation in the dynamic
+  buffer) instead of 8 global loads per thread per group. Group GEMMs 5-6.5% faster
+  (up 2.346 -> 2.224 ms, down 2.512 -> 2.390, in_qkv 1.394 -> 1.321 at 4K), logits
+  bit-identical. Server 4K/8K/16K 0.913/1.871/4.051 -> 0.879/1.805/3.921 s; c16
+  53.4 -> 55.9 req/s.
 
 - **BN=128 Marlin tiles** (thread_n_blocks=8, thread_k_blocks=4, tmb 2..4) for small M:
   after fixing the group-scale application to run at the last k of the stage

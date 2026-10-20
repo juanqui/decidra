@@ -36,31 +36,31 @@ GPU 1 only.
 
 | c | native rps | vLLM rps | native p50 / p95 | vLLM p50 / p95 | native tok/s | vLLM tok/s |
 |---:|---:|---:|---|---|---:|---:|
-| 1 | **25.08** | 18.81 | **40.2 / 43.9 ms** | 53.06 / 54.08 ms | **1,838** | 1,373 |
-| 2 | **38.95** | 20.24 | **51.9 / 54.5 ms** | 98.20 / 103.24 ms | **2,845** | 1,478 |
-| 4 | **50.18** | 29.32 | **79.2 / 80.3 ms** | 135.10 / 138.67 ms | **3,665** | 2,140 |
-| 8 | **53.20** | 34.52 | **148.4 / 206.5 ms** | 229.98 / 231.08 ms | **3,887** | 2,522 |
-| 16 | **53.44** | 35.17 | **240.5 / 292.5 ms** | 304.75 / 454.23 ms | **3,899** | 2,600 |
+| 1 | **24.87** | 18.81 | **40.6 / 44.2 ms** | 53.06 / 54.08 ms | **1,815** | 1,373 |
+| 2 | **39.53** | 20.24 | **51.3 / 54.3 ms** | 98.20 / 103.24 ms | **2,886** | 1,478 |
+| 4 | **51.14** | 29.32 | **78.4 / 79.9 ms** | 135.10 / 138.67 ms | **3,733** | 2,140 |
+| 8 | **52.81** | 34.52 | **149.8 / 153.4 ms** | 229.98 / 231.08 ms | **3,855** | 2,522 |
+| 16 | **55.88** | 35.17 | **205.4 / 280.1 ms** | 304.75 / 454.23 ms | **4,132** | 2,600 |
 
-Native is ahead at every concurrency: **1.33× / 1.92× / 1.71× / 1.54× /
-1.52×** req/s. These are the final native medians with the shipped default
+Native is ahead at every concurrency: **1.32× / 1.95× / 1.74× / 1.53× /
+1.59×** req/s. These are the final native medians with the shipped default
 config (mixed per-module W4A8-INT8 + layers 56-63 all-linear + Marlin full-M +
-FlashInfer), 3 runs, cache disabled. At c16 the GPU is 93–97% utilized
-(353 W); long prefill is 100% (420–430 W).
+FlashInfer), 3 runs, cache disabled. At c16 the GPU is 91–98% utilized
+(349 W); long prefill is 100% (420–430 W).
 
 ## Long single request (cold, exact native prompts, median of 3)
 
 | prompt | native latency | native tok/s | vLLM cold latency | vLLM tok/s | native speedup |
 |---|---:|---:|---:|---:|---:|
-| 4K (4,090 tok) | **0.913 s** | **4,477** | 1.302 s | 3,142 | **1.43×** |
-| 8K (8,178 tok) | **1.871 s** | **4,371** | 2.660 s | 3,075 | **1.42×** |
-| 16K (16,383 tok) | **4.051 s** | **4,045** | 5.533 s | 2,962 | **1.37×** |
+| 4K (4,090 tok) | **0.879 s** | **4,657** | 1.302 s | 3,142 | **1.48×** |
+| 8K (8,178 tok) | **1.805 s** | **4,531** | 2.660 s | 3,075 | **1.47×** |
+| 16K (16,383 tok) | **3.921 s** | **4,179** | 5.533 s | 2,962 | **1.41×** |
 | 35.3K (35,310 tok) | not rerun | — | not runnable (16,384 cap) | — | — |
 
 All choices were `true`. With prefix caching bypassed, **native wins cold
 long prefill by 33–39%** (one resident server, 3 cold runs per size, 100% GPU
-utilization, 420–430 W). Four consecutive 16K requests stay at 4.05 s and
-**19.28 GiB peak**, so the earlier pooled-buffer memory ceiling at repeated 16K
+utilization, 420–430 W). Repeated 16K requests stay at 3.92 s and
+**20.51 GiB peak**, so the earlier pooled-buffer memory ceiling at repeated 16K
 is fixed: the low-memory pool threshold now engages at 12,288 tokens. The
 earlier vLLM 5.052 s 16K number was cache-assisted by the nested 4K prompt; the
 cold 16K vLLM latency is 5.533 s.
@@ -90,21 +90,21 @@ Final native full forward with this configuration (engine CLI, cache off):
 | metric | native | vLLM 0.31.0 |
 |---|---:|---:|
 | idle/resident GPU memory | **18.83 GiB** (13.1 GiB weights + 2.37 GiB embedding + scratch) | 21,909 MiB |
-| 16K prefill peak | **20.17 GiB** | ~21.9 GiB |
-| repeated 16K requests | flat 20.17 GiB | n/a (16K cap) |
+| 16K prefill peak | **20.51 GiB** | ~21.9 GiB |
+| repeated 16K requests | flat 20.51 GiB | n/a (16K cap) |
 | startup to ready | **9.2 s** | 145 s |
 
 ## Verdict
 
-- **Short:** native beats vLLM at every concurrency, by 1.33–1.92× req/s and
+- **Short:** native beats vLLM at every concurrency, by 1.32–1.95× req/s and
   1.3–1.9× lower p50; c16 also has lower p95 (293 vs 454 ms).
-- **Long:** native beats vLLM by 37–43% on cold 4K/8K/16K, at 100% GPU utilization.
+- **Long:** native beats vLLM by 41–48% on cold 4K/8K/16K, at 100% GPU utilization.
   vLLM no longer wins long single-request prefill once its nested-prefix cache
   benefit is removed.
 - **Quality:** native 28/28, max Δ 0.00751, MAE 0.000864, KL 3.10e-5 (PASS);
   vLLM 28/28, max Δ 0.01377, MAE 0.00155 (fails the max/MAE gates). Native is
   closer to the CPU golden.
-- **Memory:** native is 3.0 GiB leaner at rest and 1.7 GiB leaner at 16K.
+- **Memory:** native is 3.0 GiB leaner at rest and 1.4 GiB leaner at 16K.
 - vLLM still has the operational advantages of a mature server (continuous
   batching, CUDA graphs, prefix/KV caching), but on this exact single-GPU decision
   workload the shipped native engine is faster on every measured axis.

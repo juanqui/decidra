@@ -335,8 +335,14 @@ __global__ void Marlin(
   constexpr int m_block_size = m_block_size_8 ? 8 : (16 * thread_m_blocks);
 
   extern __shared__ int4 sh[];
+  // Group-scale staging reuses the activation-scale reservation at the front
+  // of the dynamic buffer: [warp_row][16 * thread_m_blocks] floats.
+  float* sh_a_group = reinterpret_cast<float*>(sh);
   float* sh_a_s = reinterpret_cast<float*>(sh);
-  int4* sh_new = sh + (is_a_8bit ? (4 * thread_m_blocks) : 0);
+  int4* sh_new =
+      sh + (is_a_8bit ? (4 * thread_m_blocks +
+                         (group_a_scale ? 4 * thread_m_blocks : 0))
+                      : 0);
   constexpr int pack_factor = 32 / b_type.size_bits();
   static_assert(thread_m_blocks == 1 || !m_block_size_8);
 
@@ -732,6 +738,9 @@ __global__ void Marlin(
   I4 frag_b_quant[2][b_thread_vecs];
   FragC frag_c[thread_m_blocks][is_a_8bit ? 2 : 4][2];
   FragC frag_c_tmp[thread_m_blocks][is_a_8bit ? 2 : 4][2];
+  // Group-scale prefetch: loaded at the first k of a stage (independent of the
+  // MMA) and consumed at the last k, hiding the global load latency.
+  float a_group[2 * thread_m_blocks];
   FragS frag_s[2][4];
   FragS frag_bias[2][4];
   int frag_qzp[2][num_ints_per_thread];  // Zero-points
@@ -1102,6 +1111,30 @@ __global__ void Marlin(
 
   auto matmul_a8 = [&](int k) {
     int k2 = k % 2;
+    if constexpr (group_a_scale) {
+      if (k == 0) {
+        constexpr int a8_warp_rows = threads / 32 / tb_n_warps;
+        constexpr int a8_k_per_warp =
+            (thread_k_blocks * 16) / (a8_warp_rows > 0 ? a8_warp_rows : 1);
+        const int wr = (threadIdx.x / 32) / tb_n_warps;
+        const int tid_row =
+            (threadIdx.x / 32 - wr * tb_n_warps) * 32 + (threadIdx.x % 32);
+        if (tid_row < 16 * thread_m_blocks) {
+          const int row = par_id * 16 * thread_m_blocks + tid_row;
+          const int gid =
+              a8_group_base + (wr * a8_k_per_warp) / (group_blocks * 16);
+          sh_a_group[wr * 16 * thread_m_blocks + tid_row] =
+              a_scales_ptr[(size_t)row * num_groups + gid];
+        }
+        __syncthreads();
+        const int lane = (threadIdx.x % 32) / 4;
+  #pragma unroll
+        for (int ii = 0; ii < 2 * thread_m_blocks; ii++) {
+          a_group[ii] =
+              sh_a_group[wr * 16 * thread_m_blocks + ii * 8 + lane];
+        }
+      }
+    }
   #pragma unroll
     for (int j = 0; j < 2; j++) {
       FragB frag_b[2];
@@ -1148,14 +1181,6 @@ __global__ void Marlin(
             s_vals[1] = {
                 (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[0],
                 (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2 + 1][0])[1]};
-            const int gid = a8_group_base + (threadIdx.x / 32) / tb_n_warps;
-            const int lane = (threadIdx.x % 32) / 4;
-            float a_group[2 * thread_m_blocks];
-  #pragma unroll
-            for (int ii = 0; ii < 2 * thread_m_blocks; ii++) {
-              int row = par_id * 16 * thread_m_blocks + ii * 8 + lane;
-              a_group[ii] = a_scales_ptr[(size_t)row * num_groups + gid];
-            }
   #pragma unroll
             for (int i = 0; i < thread_m_blocks; i++) {
   #pragma unroll
