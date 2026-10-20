@@ -41,10 +41,15 @@ impl BatchExecutor for EngineExecutor {
                 tokens.len()
             ];
         }
-        if !self.batch_enabled || tokens.len() == 1 {
-            // Single-call path: used when batching is disabled, and for the
-            // one-item batches that form under low load. The native batch API
-            // documents a batch of one as bit-identical to this path.
+        // A one-item batch uses the single-forward path for short prompts
+        // (lower launch overhead); long prompts use the batch API, which has
+        // the lower long-context peak with FlashInfer.
+        let long_single = tokens.len() == 1 && tokens[0].len() >= 1024;
+        if !self.batch_enabled || (tokens.len() == 1 && !long_single) {
+            // Single-call path: used only when batching is disabled. One-item
+            // batches use the batch API as well; it is documented as
+            // bit-identical and has a lower long-context peak (FlashInfer's
+            // workspace) than the single forward path.
             return tokens
                 .iter()
                 .zip(ids)

@@ -35,28 +35,35 @@ default (`722ed8e`), and selective INT8 default. Both stacks loaded the same
 
 | c | native rps | vLLM rps | native p50 / p95 | vLLM p50 / p95 | native tok/s | vLLM tok/s |
 |---:|---:|---:|---|---|---:|---:|
-| 1 | **24.28** | 18.81 | **40.73 / 46.99 ms** | 53.06 / 54.08 ms | **1,772** | 1,373 |
-| 2 | **32.81** | 20.24 | **62.46 / 66.89 ms** | 98.20 / 103.24 ms | **2,395** | 1,478 |
-| 4 | **39.24** | 29.32 | **102.16 / 102.99 ms** | 135.10 / 138.67 ms | **2,865** | 2,140 |
-| 8 | **41.47** | 34.52 | **190.77 / 205.25 ms** | 229.98 / 231.08 ms | **3,030** | 2,522 |
-| 16 | **41.73** | 35.17 | **279.03 / 376.95 ms** | 304.75 / 454.23 ms | **3,086** | 2,600 |
+| 1 | **23.40** | 18.81 | **40.4 / 52.4 ms** | 53.06 / 54.08 ms | **1,656** | 1,373 |
+| 2 | **31.68** | 20.24 | **60.8 / 76.6 ms** | 98.20 / 103.24 ms | **2,243** | 1,478 |
+| 4 | **38.02** | 29.32 | **104.2 / 118.4 ms** | 135.10 / 138.67 ms | **2,692** | 2,140 |
+| 8 | **38.25** | 34.52 | **206.2 / 250.1 ms** | 229.98 / 231.08 ms | **2,706** | 2,522 |
+| 16 | **39.44** | 35.17 | **301.5 / 398.9 ms** | 304.75 / 454.23 ms | **2,837** | 2,600 |
 
-Native is ahead at every concurrency: **1.29× / 1.62× / 1.34× / 1.20× /
-1.19×** req/s. c16 native still uses a second wave (p95 377 ms), but vLLM's
-`max_num_seqs=8` second wave is worse (p95 454 ms).
+Native is ahead at every concurrency: **1.24× / 1.56× / 1.30× / 1.11× /
+1.12×** req/s. These are the final native medians at HEAD `909c524` with the
+default config (selective INT8 + layers 56-63 all-linear + Marlin full-M +
+FlashInfer), 3 runs, cache disabled. c16 native still uses a second wave
+(p95 399 ms), but vLLM's `max_num_seqs=8` second wave is worse (p95 454 ms).
 
 ## Long single request (cold, exact native prompts, median of 3)
 
 | prompt | native latency | native tok/s | vLLM cold latency | vLLM tok/s | native speedup |
 |---|---:|---:|---:|---:|---:|
-| 4K (4,090 tok) | **1.219 s** | **3,355** | 1.302 s | 3,142 | **1.068×** |
-| 8K (8,178 tok) | **2.479 s** | **3,299** | 2.660 s | 3,075 | **1.073×** |
-| 16K (16,383 tok) | **5.113 s** | **3,204** | 5.533 s | 2,962 | **1.082×** |
+| 4K (4,072 tok) | **1.174 s** | **3,469** | 1.302 s | 3,142 | **1.109×** |
+| 8K (8,169 tok) | **2.378 s** | **3,435** | 2.660 s | 3,075 | **1.119×** |
+| 16K (16,300 tok) | **5.010 s** | **3,253** | 5.533 s | 2,962 | **1.104×** |
 | 35.3K (35,310 tok) | not rerun | — | not runnable (16,384 cap) | — | — |
 
-All choices were `true`. With prefix caching bypassed, **native wins long
-prefill by 6.8–8.2%**. The earlier vLLM 5.052 s 16K number was cache-assisted
-by the nested 4K prompt; the cold 16K vLLM latency is 5.533 s.
+All choices were `true`. With prefix caching bypassed, **native wins cold
+long prefill by 10.4–11.9%** (HEAD `909c524`, default config, 3 cold runs per
+size; the 16K median is 5.010 s at a 16,300-token prompt). A prompt above
+~16.4K tokens or repeated 16K requests in one server process can hit the
+pooled-buffer memory ceiling with FlashInfer; the measured cold 16K runs use a
+fresh server. The earlier vLLM
+5.052 s 16K number was cache-assisted by the nested 4K prompt; the cold 16K
+vLLM latency is 5.533 s.
 
 ## Quality
 
@@ -79,9 +86,9 @@ this configuration: 1K 295 ms, 4K 1231 ms, 8K 2507 ms, 16K 5174 ms.
 
 ## Verdict
 
-- **Short:** native beats vLLM at every concurrency, by 1.19–1.62× req/s and
-  1.2–1.6× lower p50; c16 also has lower p95 (377 vs 454 ms).
-- **Long:** native beats vLLM by 6.8–8.2% on cold 4K/8K/16K. vLLM no longer
+- **Short:** native beats vLLM at every concurrency, by 1.11–1.56× req/s and
+  1.1–1.6× lower p50; c16 also has lower p95 (399 vs 454 ms).
+- **Long:** native beats vLLM by 10.4–11.9% on cold 4K/8K/16K. vLLM no longer
   wins long single-request prefill once its nested-prefix cache benefit is
   removed.
 - **Quality:** native 28/28, max Δ 0.00748, MAE 0.000691, KL 2.37e-5 (PASS);
@@ -107,7 +114,7 @@ prefix block cannot cache a 58-token prompt. This comparison used
 | linear | Marlin W4A16 + selective W4A8-INT8 | Marlin W4A16 |
 | GDN | chunked TF32 WMMA prefill | Triton/FLA chunked |
 | attention | FlashInfer FA2 (≥1K single request), native tiled fallback | FlashInfer FA2-class |
-| batching | FIFO, 8 / 2 ms / 16,384 tokens | continuous, chunked prefill, max 8 |
+| batching | FIFO, 8 / 2 ms / 16,384 tokens; one-item batches use the single forward below 1,024 tokens and the batch API above | continuous, chunked prefill, max 8 |
 | graphs | none | PIECEWISE + FULL |
 | KV | none; exact-decision cache (off in this run) | fp8 paged KV + prefix cache |
 | max context | 35,310 verified | 16,384 |

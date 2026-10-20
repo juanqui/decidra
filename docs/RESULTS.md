@@ -278,9 +278,10 @@ For a controlled same-GPU comparison against vLLM 0.31.0 (short concurrency swee
 long prefill, repeated exact prompts, startup, memory, KV cache, kernel stacks, and
 quantization probes), see [`VLLM-COMPARISON.md`](VLLM-COMPARISON.md). Final summary:
 with 73-token prompts the shipped native engine now wins **every** concurrency:
-**24.28 / 32.81 / 39.24 / 41.47 / 41.73 req/s** at c1/2/4/8/16 versus vLLM
+**23.40 / 31.68 / 38.02 / 38.25 / 39.44 req/s** at c1/2/4/8/16 (HEAD
+909c524, default config, median of 3 runs) versus vLLM
 **18.81 / 20.24 / 29.32 / 34.52 / 35.17**, and cold long prefill by
-**6.8-8.2%** (4K 1.219 vs 1.302 s, 8K 2.479 vs 2.660, 16K 5.113 vs 5.533;
+**10.4-11.9%** (4K 1.174 vs 1.302 s, 8K 2.378 vs 2.660, 16K 5.010 vs 5.533;
 vLLM's earlier 5.052 s 16K number was nested-prefix-cache-assisted). Native
 still wins repeated exact prompts (exact cache), startup (**~8 s vs 145 s**),
 GPU idle memory (**13.4 vs 21.8 GiB**), and verified 35,310-token context.
