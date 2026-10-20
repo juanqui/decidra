@@ -5,6 +5,52 @@
 > Kernel-level CUTLASS / warp-specialization work is tracked separately in
 > `docs/CUTLASS.md` (measurements, design, checklist).
 
+## 2026-10-20 — W4A8 card example: artifact math vs vLLM weight-only
+
+- Card example (billing / shipping / tech support), same W4A8 artifact + adapter:
+  provider card 0.9963; local vLLM 0.31.0 0.9588; engine INT8 0.9606; CPU
+  compressed-tensors decompress + LoRA + configured per-token INT8 0.9623; CPU
+  weight-only 0.9582; engine weight-only 0.9588.
+- The engine INT8 is 0.0017 from the CPU artifact-math reference; the local vLLM is
+  0.0035 away. Across the 28-row suite the engine weight-only vs vLLM is 28/28,
+  max 9.77e-3, MAE 1.23e-3, i.e. vLLM's W4A8 path behaves as weight-only here.
+- The card's 0.9963 is not reproducible with the downloaded artifact under any local
+  implementation; all cluster at 0.958-0.962, and the card number is close to the
+  merged-BF16 teacher (0.9969 / 0.9976).
+- The engine default INT8 is the faithful configured W4A8;
+  `DECIDRA_NATIVE_INT8=false` reproduces the vLLM / weight-only behavior. The 28-row
+  CPU artifact golden was paused to free RAM for the AutoTrust quant.
+
+## 2026-10-20 — AutoTrust-JEV-27B-v1.1 INT4/INT8 quantization
+
+- Model `autotrust/AutoTrust-JEV-27B-v1.1`: Qwen3.5 hybrid text stack whose
+  `text_config` is byte-identical to JEV-27B-VL; separate BF16 `lm_head` with the
+  255-code `jev-code-readout-v1`; serving needs StartLux bidirectional prompt
+  attention plus the chat-template code prompt.
+- Engine gap: the native backend is causal and uses the JEV verbalizer head. Faithful
+  serving needs a bidirectional full-attention prefill and the code readout (the
+  engine's `decision_logits` already returns arbitrary lm_head rows, so the readout
+  itself is available). The quantization is otherwise portable.
+- Calibration: 1024 kind-balanced rows (60/40 choice/noul) rendered with the model's
+  `jev_format` chat template and 255 codes (113-563 tokens); 256 disjoint held-out.
+- Quant: AWQ smoothing + GPTQ, W4A16 asymmetric group 64, actorder=weight, ignore
+  lm_head/visual/mtp, max_seq 1024, output
+  `/srv/models/autotrust-jev-27b-v1.1-awq-g64` (496 modules, 2 h).
+- Post: vision spliced (333 tensors), lm_head BF16 indexed, engine decision head with
+  the 255 readout ids / zero bias / T=1.0; `native/tests/autotrust_probe.rs` compiles.
+- Validation (16 held-out rows, causal forward):
+  - HF transformers on the quantized dir vs BF16: top-1 15/16, max 0.0587,
+    MAE 1.97e-2, KL 2.59e-3 -> the AWQ+GPTQ g64 quant is good.
+  - Native engine on the same quantized dir vs BF16: top-1 10/16, max 0.392,
+    KL 6.92e-2; vs the HF quantized dir: 11/16, max 0.386, KL 6.65e-2.
+  - Conclusion: the quantization is sound; the native engine's forward for the
+    Qwen3.8 weights (the AutoTrust base differs from JEV-27B-VL despite the
+    byte-identical text_config) is the next issue. The native `Engine::new` probe
+    measures the W4A16 weight-only path; the INT8 activation setters are applied
+    server-side, so the INT8 path needs a server-side or explicit-setter test.
+  - The AutoTrust also requires StartLux bidirectional prompt attention and the
+    chat-template code readout; both are separate engine-port items.
+
 ## 2026-10-20 — W4A8 group-128 checkpoint support
 
 - Loader accepts group 128 with the compressed-tensors offset zero point 8
