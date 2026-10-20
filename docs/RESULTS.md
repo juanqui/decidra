@@ -198,6 +198,22 @@ shared/split recurrence, and `false` restores the legacy path everywhere.
   by the GDN delta (previous measurements: 4K 1.63 s, 8K 3.27 s, 16K 6.77 s,
   35.3K 16.67 s).
 
+## FlashInfer long-context attention
+
+Single-request full-attention prefill for `seq >= 1024` uses vendored
+FlashInfer 0.7.0.post1 (`native/third_party/flashinfer`, built into
+`libfi_prefill.so`); batched requests and shorter prompts keep the native
+tiled/warp kernels. Attention per forward, FI off -> on (same weights, clean
+env): 1K 3.98 -> 2.21 ms; 4K 40.5 -> 22.6; 8K 148.5 -> 82.2; 16K 567 -> 315 ms
+(1.80x). Full forward: 1K 347.2 -> 345.4 ms, 4K 1453.9 -> 1434.5, 8K
+2981.4 -> 2914.6, 16K 6249.8 -> 5998.6 ms (-251 ms, -4.0%).
+
+Quality: suite28 is bit-identical (FI unused below 1K) and passes the gate
+(28/28, KL 3.456e-5, MAE 9.606e-4, max 9.633e-3). 4K/8K/16K probe logits:
+FI on vs golden [-0.0469,+0.0313], [+0.0156,-0.0313], [+0.0156,0.0], within the
+W4A16 envelope with unchanged top-1. Disable with
+`JEV_FLASHINFER_ATTENTION=0`; `JEV_FLASHINFER_MIN_SEQ` sets the threshold.
+
 ## Request batching
 
 The native backend runs one engine thread. HTTP handlers tokenize on the reactor,

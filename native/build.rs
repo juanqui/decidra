@@ -24,6 +24,9 @@ struct Job {
     extra: &'static [&'static str],
 }
 
+const FI_SRC: &str = "third_party/flashinfer/fi_prefill.cu";
+const FI_SO: &str = "libfi_prefill.so";
+
 const JOBS: &[Job] = &[
     Job {
         name: "kernels",
@@ -85,6 +88,71 @@ fn main() {
         "cargo:rustc-env=JEV_MARLIN_CUBIN={}",
         out_dir.join("marlin.cubin").display()
     );
+
+    let fi_so = build_flashinfer(&manifest, &out_dir);
+    println!("cargo:rustc-env=JEV_FI_PREFILL_SO={}", fi_so.display());
+    println!("cargo:rustc-link-lib=dl");
+}
+
+fn build_flashinfer(manifest: &Path, out_dir: &Path) -> PathBuf {
+    let so = out_dir.join(FI_SO);
+    let src = manifest.join(FI_SRC);
+    let newest = newest_mtime(&manifest.join("third_party"));
+    if let (Some(src_m), Some(out_m)) = (
+        fs::metadata(&src).and_then(|m| m.modified()).ok(),
+        fs::metadata(&so).and_then(|m| m.modified()).ok(),
+    ) {
+        if out_m >= src_m && newest.map(|n| out_m >= n).unwrap_or(false) {
+            return so;
+        }
+    }
+    let args: Vec<String> = [
+        "-O3",
+        "-std=c++17",
+        "-arch=sm_89",
+        "-shared",
+        "-Xcompiler",
+        "-fPIC",
+        "-Xcompiler",
+        "-fvisibility=hidden",
+        "-I",
+        "third_party/flashinfer/include",
+        "-I",
+        "third_party/flashinfer/cccl/libcudacxx/include",
+        "-lcudart_static",
+        "-lrt",
+        "-lpthread",
+        "-ldl",
+        "-lstdc++",
+        "-lm",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    if let Ok(nvcc) = env::var("JEV_NVCC") {
+        run_native_cmd(Path::new(&nvcc), &args, manifest, FI_SRC, &so);
+        return so;
+    }
+    if Command::new("nvcc").arg("--version").output().is_ok() {
+        run_native_cmd(Path::new("nvcc"), &args, manifest, FI_SRC, &so);
+        return so;
+    }
+    if let Err(e) = run_docker_raw(&args, manifest, out_dir, FI_SRC, FI_SO) {
+        panic!("failed to build FlashInfer prefill library: {e}");
+    }
+    so
+}
+
+fn run_native_cmd(nvcc: &Path, args: &[String], manifest: &Path, src: &str, out: &Path) {
+    let status = Command::new(nvcc)
+        .args(args)
+        .arg("-o")
+        .arg(out)
+        .arg(src)
+        .current_dir(manifest)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to run {}: {e}", nvcc.display()));
+    assert!(status.success(), "nvcc failed for {src}");
 }
 
 fn build(job: &Job, manifest: &Path, out_dir: &Path, cubin: &Path) {
@@ -126,6 +194,20 @@ fn run_docker(
     job: &Job,
     cubin: &Path,
 ) -> Result<(), String> {
+    let out_name = cubin
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("kernel.cubin");
+    run_docker_raw(args, manifest, out_dir, job.src, out_name)
+}
+
+fn run_docker_raw(
+    args: &[String],
+    manifest: &Path,
+    out_dir: &Path,
+    src: &str,
+    out_name: &str,
+) -> Result<(), String> {
     let image = env::var("JEV_CUDA_IMAGE")
         .unwrap_or_else(|_| "nvidia/cuda:13.1.1-devel-ubuntu24.04".into());
     let uid = Command::new("id")
@@ -142,11 +224,6 @@ fn run_docker(
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "0".into());
-
-    let out_name = cubin
-        .file_name()
-        .and_then(|f| f.to_str())
-        .unwrap_or("kernel.cubin");
     let mut cmd = Command::new("docker");
     cmd.arg("run")
         .arg("--rm")
@@ -164,12 +241,12 @@ fn run_docker(
         .args(args)
         .arg("-o")
         .arg(format!("/out/{out_name}"))
-        .arg(format!("/w/{}", job.src));
+        .arg(format!("/w/{src}"));
     let out = cmd.output().map_err(|e| format!("docker exec: {e}"))?;
     if !out.status.success() {
         return Err(format!(
             "docker nvcc failed for {}:\nstdout: {}\nstderr: {}",
-            job.src,
+            src,
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ));

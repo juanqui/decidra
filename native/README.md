@@ -73,6 +73,16 @@ every intermediate as raw f32 for golden comparison. `--preload` keeps all
 decoder layers resident; `--no-cache` streams one layer at a time (needed for the
 51 GiB merged-BF16 checkpoint on a 24 GiB card).
 
+## Profiling
+
+`JEV_PROFILE=1` records per-stage CUDA events. The debug variables
+`JEV_MARLIN_DEBUG` and `JEV_GEMM_DEBUG` now only log (they no longer call
+`cudaStreamSynchronize`); per-GEMM timing needs the explicit
+`JEV_GEMM_DEBUG_SYNC=1` opt-in. Do not leave debug variables exported while
+benchmarking: a single synchronize per GEMM serializes the stream and inflates
+the enclosing event windows. Use `env -u JEV_MARLIN_DEBUG -u JEV_GEMM_DEBUG
+-u JEV_PROFILE` for clean timings.
+
 ## Library API
 
 ```rust
@@ -113,6 +123,17 @@ Three causal GQA kernels share the same graph:
   synchronization in the key loop. Kept as the fallback.
 - **block-per-query**: the original kernel, still compiled for A/B but not
   exposed on the CLI.
+
+For **single-request, seq >= 1024** full-attention layers the engine loads
+vendored FlashInfer 0.7.0.post1 headers (`third_party/flashinfer`) through a
+small `fi_prefill.cu` wrapper (`libfi_prefill.so`, built by `build.rs` and
+dlopen'd at runtime). 24Q/4KV head_dim 256 BF16 prefill uses FA2 split-K and
+runs 1.80x faster than the native tiled d256 kernel: 16K attention
+567 -> 315 ms over the 16 layers, full 16K forward 6.25 -> 6.00 s. 8K saves
+2.2%, 4K 1.3%, 1K 0.5%. Batched requests, other shapes, and load failures use
+the native tiled/warp kernels. Disable with `JEV_FLASHINFER_ATTENTION=0`,
+change the threshold with `JEV_FLASHINFER_MIN_SEQ` (default 1024). See
+`native/third_party/flashinfer/INTEGRATION.md`.
 
 Long-context latency (Marlin weights, resident, SM89 RTX 4090):
 

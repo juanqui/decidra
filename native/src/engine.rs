@@ -236,6 +236,10 @@ pub struct Engine {
     /// Warp-per-query attention (fast for long contexts); the original block
     /// kernel remains selectable.
     warp_attention: AtomicBool,
+    /// Vendored FlashInfer FA2 prefill (single-request, hd256, 24Q/4KV).
+    flashinfer: Option<Arc<crate::flashinfer::FlashInfer>>,
+    flashinfer_enabled: AtomicBool,
+    flashinfer_min_seq: std::sync::atomic::AtomicUsize,
     prof: Prof,
     /// Use the shared-state GDN recurrence (default) and its value-column split.
     gdn_shared: AtomicBool,
@@ -321,6 +325,15 @@ impl Engine {
         let store = Store::open(model_dir)?;
         let gpu = Gpu::new(0)?;
         let kernels = Kernels::load(&gpu)?;
+        let flashinfer = crate::flashinfer::FlashInfer::load();
+        let flashinfer_enabled = flashinfer.is_some()
+            && std::env::var("JEV_FLASHINFER_ATTENTION")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        let flashinfer_min_seq = std::env::var("JEV_FLASHINFER_MIN_SEQ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1024usize);
         let weight_cache = Mutex::new(vec![None; cfg.num_hidden_layers]);
         Ok(Self {
             gpu,
@@ -351,6 +364,9 @@ impl Engine {
             int8_exclude: Mutex::new(Vec::new()),
             marlin_locks: Mutex::new(None),
             warp_attention: AtomicBool::new(true),
+            flashinfer,
+            flashinfer_enabled: AtomicBool::new(flashinfer_enabled),
+            flashinfer_min_seq: std::sync::atomic::AtomicUsize::new(flashinfer_min_seq),
             prof: Prof::new(),
             gdn_shared: AtomicBool::new(true),
             gdn_chunks: std::sync::atomic::AtomicUsize::new(2),
@@ -389,6 +405,32 @@ impl Engine {
 
     pub fn set_warp_attention(&self, enabled: bool) {
         self.warp_attention.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_flashinfer_attention(&self, enabled: bool) {
+        self.flashinfer_enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn set_flashinfer_min_seq(&self, seq: usize) {
+        self.flashinfer_min_seq.store(seq, Ordering::Relaxed);
+    }
+
+    fn flashinfer_for(
+        &self,
+        seq: usize,
+        hd: usize,
+        heads: usize,
+        kv: usize,
+    ) -> Option<&crate::flashinfer::FlashInfer> {
+        if !self.flashinfer_enabled.load(Ordering::Relaxed)
+            || seq < self.flashinfer_min_seq.load(Ordering::Relaxed)
+            || hd != 256
+            || heads != 24
+            || kv != 4
+        {
+            return None;
+        }
+        self.flashinfer.as_deref()
     }
 
     pub fn set_gdn_shared(&self, enabled: bool) {
@@ -1099,23 +1141,32 @@ impl Engine {
             let mut ov = attn
                 .try_slice_mut(o * hv..(o + l) * hv)
                 .context("attention out view")?;
-            match (use_warp, tc) {
-                (true, Some(tc)) => kernels::attention_tc(
-                    &self.gpu, tc, &qv, &kvw, &vvw, &mut ov, l, heads, kv, hd, scale,
-                )?,
-                _ => kernels::attention_warp(
-                    &self.gpu,
-                    &self.kernels.attention_warp,
-                    &qv,
-                    &kvw,
-                    &vvw,
-                    &mut ov,
-                    l,
-                    heads,
-                    kv,
-                    hd,
-                    scale,
-                )?,
+            let fi = if b.batch() == 1 {
+                self.flashinfer_for(l, hd, heads, kv)
+            } else {
+                None
+            };
+            if let Some(fi) = fi {
+                fi.prefill(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+            } else {
+                match (use_warp, tc) {
+                    (true, Some(tc)) => kernels::attention_tc(
+                        &self.gpu, tc, &qv, &kvw, &vvw, &mut ov, l, heads, kv, hd, scale,
+                    )?,
+                    _ => kernels::attention_warp(
+                        &self.gpu,
+                        &self.kernels.attention_warp,
+                        &qv,
+                        &kvw,
+                        &vvw,
+                        &mut ov,
+                        l,
+                        heads,
+                        kv,
+                        hd,
+                        scale,
+                    )?,
+                }
             }
         }
         self.prof_end("attn", __attn_t);
@@ -1757,7 +1808,9 @@ impl Engine {
 
         let mut attn = self.alloc_bf16(seq * heads * hd)?;
         let __attn_t = self.prof_begin("attn");
-        if self.warp_attention.load(Ordering::Relaxed) {
+        if let Some(fi) = self.flashinfer_for(seq, hd, heads, kv) {
+            fi.prefill(&self.gpu, &*qn, &*kn, &*vv, &mut *attn, seq)?;
+        } else if self.warp_attention.load(Ordering::Relaxed) {
             let tc = match hd {
                 64 => Some(&self.kernels.attention_tc_64),
                 128 => Some(&self.kernels.attention_tc_128),
@@ -2126,13 +2179,19 @@ impl Engine {
             bail!("gemm input has {} values, expected {}", x.len(), rows * k);
         }
         let dbg = std::env::var("JEV_GEMM_DEBUG").is_ok();
+        // Synchronizing here makes any benchmarks with the debug variable set
+        // measure serialized launches. Timing requires the explicit
+        // JEV_GEMM_DEBUG_SYNC opt-in; JEV_GEMM_DEBUG only logs labels.
+        let dbg_sync = std::env::var("JEV_GEMM_DEBUG_SYNC").is_ok();
         let mark = |label: &str, t: std::time::Instant| {
-            if dbg {
+            if dbg_sync {
                 let _ = self.gpu.synchronize();
+            }
+            if dbg || dbg_sync {
                 eprintln!("{label}: {:.3} ms", t.elapsed().as_secs_f64() * 1e3);
             }
         };
-        if dbg {
+        if dbg_sync {
             let _ = self.gpu.synchronize();
         }
         let t0 = std::time::Instant::now();

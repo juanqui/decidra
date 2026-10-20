@@ -670,8 +670,9 @@ pub fn marlin_gemm(
     l.arg(&MR_SHARED);
     unsafe { l.launch(cfg) }?;
     if std::env::var("JEV_MARLIN_DEBUG").is_ok() {
-        gpu.synchronize()?;
-        eprintln!("marlin gemm ok: m={m} n={n} k={k} off={row_off}");
+        // Log only; a sync here would serialize any profiling run that has the
+        // debug variable set. Use JEV_PROFILE / events for timing.
+        eprintln!("marlin gemm: m={m} n={n} k={k} off={row_off}");
     }
     Ok(())
 }

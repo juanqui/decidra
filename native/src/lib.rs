@@ -13,6 +13,7 @@
 pub mod config;
 pub mod cuda;
 pub mod engine;
+pub mod flashinfer;
 pub mod kernels;
 pub mod tensor;
 pub mod weights;
