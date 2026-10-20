@@ -167,16 +167,28 @@ Batched requests have deterministic BF16/M-tiling composition noise. Top-1 was
 
 ### W4A8 checkpoint
 
-28-row suite, engine vs vLLM 0.31.0, same W4A8 artifact and adapter:
+28-row suite, three implementations of the same W4A8 artifact + adapter against the
+CPU artifact-math golden (`eval/data/w4a8-cpu-suite28.json`: compressed-tensors
+decompress + LoRA + the configured per-token INT8):
 
 | comparison | top-1 | max Δ | mean MAE | mean KL |
 |---|---:|---:|---:|---:|
-| Decidra vs vLLM W4A8 | **28/28** | **0.0304** | **0.00266** | **2.20e-4** |
+| Decidra vs CPU artifact | **28/28** | **0.0176** | **0.00328** | **2.33e-4** |
+| vLLM 0.31.0 vs CPU artifact | 28/28 | 0.0267 | 0.00349 | 3.04e-4 |
+| Decidra vs vLLM | 28/28 | 0.0304 | 0.00266 | 2.20e-4 |
 
-The W4A16 CPU golden does not apply to this artifact. Both implementations use
-the same weights, per-token activation scheme, and LoRA; top-1 agrees on every
-row. The residual probability difference is engine-vs-vLLM numeric (activation
-scales, tile reduction order, and LoRA application order).
+Decidra is closer to the artifact math than vLLM 0.31.0 on max Δ and KL. On the card
+example (billing) the engine gives 0.9606, the CPU artifact 0.9623, the local vLLM
+0.9588. vLLM's W4A8 path behaves as weight-only here: the engine's weight-only path
+(`DECIDRA_NATIVE_INT8=false`) matches it at 28/28, max 9.77e-3, MAE 1.23e-3. The
+provider card's example value (0.9963) is not reproducible with the downloaded
+artifact under any local implementation; it is close to the merged-BF16 teacher
+(0.9969). Against that teacher the W4A8 quantization error is max 0.258, MAE 0.0598,
+KL 0.0697 on this suite (28/28 top-1; engine and vLLM within 0.014 max of each other).
+
+Gate for this artifact: `eval/suite.py --baseline eval/data/w4a8-cpu-suite28.json
+--max-delta 0.02 --max-mae 0.004 --max-kl 0.001` against a running W4A8 server.
+The W4A16 CPU golden does not apply to this artifact.
 
 ## Build from source
 

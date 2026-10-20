@@ -1,0 +1,384 @@
+{
+ "rows": [
+  {
+   "id": "r01",
+   "truth": "billing",
+   "kind": "choice",
+   "choice": "billing",
+   "probabilities": [
+    0.942556667907202,
+    0.057400325161145654,
+    4.300693165226504e-05
+   ],
+   "tokens": 56,
+   "seconds": 6.79
+  },
+  {
+   "id": "r02",
+   "truth": "support",
+   "kind": "choice",
+   "choice": "billing",
+   "probabilities": [
+    0.5607600186405249,
+    0.43848627881453345,
+    0.0007537025449416525
+   ],
+   "tokens": 57,
+   "seconds": 6.58
+  },
+  {
+   "id": "r03",
+   "truth": "sales",
+   "kind": "choice",
+   "choice": "sales",
+   "probabilities": [
+    0.1794961870290241,
+    0.06456361455686861,
+    0.7559401984141073
+   ],
+   "tokens": 61,
+   "seconds": 6.02
+  },
+  {
+   "id": "r04",
+   "truth": false,
+   "kind": "noul",
+   "choice": "false",
+   "probabilities": [
+    0.7317372559881428,
+    0.2682627440118572
+   ],
+   "tokens": 47,
+   "seconds": 7.35
+  },
+  {
+   "id": "r05",
+   "truth": true,
+   "kind": "noul",
+   "choice": "true",
+   "probabilities": [
+    0.3443733858314714,
+    0.6556266141685286
+   ],
+   "tokens": 50,
+   "seconds": 6.06
+  },
+  {
+   "id": "r06",
+   "truth": 3,
+   "kind": "score",
+   "choice": "5",
+   "probabilities": [
+    0.00026837086692960664,
+    0.0015123356931370203,
+    0.002471872105445028,
+    0.009245771778942386,
+    0.31105242798240673,
+    0.6754492215731392
+   ],
+   "tokens": 58,
+   "seconds": 6.63
+  },
+  {
+   "id": "r07",
+   "truth": 0,
+   "kind": "score",
+   "choice": "1",
+   "probabilities": [
+    0.15972603407053615,
+    0.4467114370128828,
+    0.17568710134084262,
+    0.19778196964812336,
+    0.016626329621379554,
+    0.003467128306235462
+   ],
+   "tokens": 52,
+   "seconds": 7.21
+  },
+  {
+   "id": "r08",
+   "truth": "spanish",
+   "kind": "choice",
+   "choice": "spanish",
+   "probabilities": [
+    0.001363300438602224,
+    0.9951206486479243,
+    0.002551241681860199,
+    0.0009648092316134336
+   ],
+   "tokens": 61,
+   "seconds": 5.87
+  },
+  {
+   "id": "r09",
+   "truth": true,
+   "kind": "noul",
+   "choice": "true",
+   "probabilities": [
+    0.07145078225584159,
+    0.9285492177441584
+   ],
+   "tokens": 42,
+   "seconds": 5.99
+  },
+  {
+   "id": "r10",
+   "truth": "contract",
+   "kind": "choice",
+   "choice": "contract",
+   "probabilities": [
+    0.9998792701063813,
+    4.527338676017391e-05,
+    6.857237797576007e-05,
+    6.884128882747263e-06
+   ],
+   "tokens": 89,
+   "seconds": 7.49
+  },
+  {
+   "id": "r11",
+   "truth": "support_ticket",
+   "kind": "choice",
+   "choice": "support_ticket",
+   "probabilities": [
+    0.0002377559890558339,
+    0.00031967970650332103,
+    0.9978169862341486,
+    0.0016255780702922424
+   ],
+   "tokens": 69,
+   "seconds": 7.84
+  },
+  {
+   "id": "r12",
+   "truth": true,
+   "kind": "noul",
+   "choice": "true",
+   "probabilities": [
+    0.04391186466965153,
+    0.9560881353303485
+   ],
+   "tokens": 53,
+   "seconds": 7.04
+  },
+  {
+   "id": "r13",
+   "truth": false,
+   "kind": "noul",
+   "choice": "false",
+   "probabilities": [
+    0.9866894187307899,
+    0.013310581269210173
+   ],
+   "tokens": 49,
+   "seconds": 6.96
+  },
+  {
+   "id": "r14",
+   "truth": "web_search",
+   "kind": "choice",
+   "choice": "web_search",
+   "probabilities": [
+    0.7997419492725246,
+    0.0037065277261833303,
+    0.010927496224001196,
+    0.18562402677729073
+   ],
+   "tokens": 52,
+   "seconds": 7.0
+  },
+  {
+   "id": "r15",
+   "truth": "calculator",
+   "kind": "choice",
+   "choice": "calculator",
+   "probabilities": [
+    0.0022205639628313503,
+    0.9070836708468323,
+    0.0003299125306247534,
+    0.0903658526597116
+   ],
+   "tokens": 57,
+   "seconds": 8.21
+  },
+  {
+   "id": "r16",
+   "truth": "calendar",
+   "kind": "choice",
+   "choice": "calendar",
+   "probabilities": [
+    5.5381343701035606e-05,
+    4.93522200337818e-05,
+    0.9939574340408562,
+    0.00593783239540901
+   ],
+   "tokens": 60,
+   "seconds": 6.38
+  },
+  {
+   "id": "r17",
+   "truth": 4,
+   "kind": "score",
+   "choice": "3",
+   "probabilities": [
+    0.009517995585330282,
+    0.013006906743704695,
+    0.06471269544066004,
+    0.6594313623193697,
+    0.24902967712390447,
+    0.004301362787030754
+   ],
+   "tokens": 57,
+   "seconds": 6.37
+  },
+  {
+   "id": "r18",
+   "truth": 0,
+   "kind": "score",
+   "choice": "0",
+   "probabilities": [
+    0.41611942166446203,
+    0.18321335915811732,
+    0.04146116016353273,
+    0.2129714830027122,
+    0.08795910807269763,
+    0.05827546793847808
+   ],
+   "tokens": 52,
+   "seconds": 6.22
+  },
+  {
+   "id": "r19",
+   "truth": false,
+   "kind": "noul",
+   "choice": "false",
+   "probabilities": [
+    0.7848597180226773,
+    0.21514028197732268
+   ],
+   "tokens": 44,
+   "seconds": 5.99
+  },
+  {
+   "id": "r20",
+   "truth": "trust_and_safety",
+   "kind": "choice",
+   "choice": "legal",
+   "probabilities": [
+    0.01669676796935021,
+    0.307730341764207,
+    0.29385438422654586,
+    0.381718506039897
+   ],
+   "tokens": 61,
+   "seconds": 6.53
+  },
+  {
+   "id": "r21",
+   "truth": "billing",
+   "kind": "choice",
+   "choice": "billing",
+   "probabilities": [
+    0.914344379608642,
+    0.0843386245745634,
+    0.0013169958167944635
+   ],
+   "tokens": 63,
+   "seconds": 6.07
+  },
+  {
+   "id": "r22",
+   "truth": false,
+   "kind": "noul",
+   "choice": "false",
+   "probabilities": [
+    0.8934102128724594,
+    0.10658978712754064
+   ],
+   "tokens": 54,
+   "seconds": 8.04
+  },
+  {
+   "id": "r23",
+   "truth": "translation",
+   "kind": "choice",
+   "choice": "translation",
+   "probabilities": [
+    0.9504281355504886,
+    0.006519726472734567,
+    0.042555867056321244,
+    0.0004962709204557158
+   ],
+   "tokens": 50,
+   "seconds": 5.94
+  },
+  {
+   "id": "r24",
+   "truth": true,
+   "kind": "noul",
+   "choice": "true",
+   "probabilities": [
+    0.05198014094562016,
+    0.9480198590543799
+   ],
+   "tokens": 45,
+   "seconds": 5.26
+  },
+  {
+   "id": "r25",
+   "truth": 0,
+   "kind": "score",
+   "choice": "4",
+   "probabilities": [
+    0.024718480450513385,
+    0.0061177310250100465,
+    0.013866180812168517,
+    0.31996957347757893,
+    0.6148270072320845,
+    0.020501027002644702
+   ],
+   "tokens": 56,
+   "seconds": 6.86
+  },
+  {
+   "id": "r26",
+   "truth": "201",
+   "kind": "choice",
+   "choice": "201",
+   "probabilities": [
+    0.0011687103665690656,
+    0.9987162219748896,
+    4.7352085211394e-05,
+    6.771557332995115e-05
+   ],
+   "tokens": 64,
+   "seconds": 6.82
+  },
+  {
+   "id": "r27",
+   "truth": "sev1",
+   "kind": "choice",
+   "choice": "sev1",
+   "probabilities": [
+    0.980851044886306,
+    0.01914375642693791,
+    5.198686756104353e-06
+   ],
+   "tokens": 179,
+   "seconds": 9.7
+  },
+  {
+   "id": "r28",
+   "truth": "mixed",
+   "kind": "choice",
+   "choice": "mixed",
+   "probabilities": [
+    0.0006809846573267698,
+    0.017739178864391098,
+    0.9815798364782822
+   ],
+   "tokens": 146,
+   "seconds": 11.84
+  }
+ ]
+}

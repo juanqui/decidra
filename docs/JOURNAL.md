@@ -18,8 +18,13 @@
   implementation; all cluster at 0.958-0.962, and the card number is close to the
   merged-BF16 teacher (0.9969 / 0.9976).
 - The engine default INT8 is the faithful configured W4A8;
-  `DECIDRA_NATIVE_INT8=false` reproduces the vLLM / weight-only behavior. The 28-row
-  CPU artifact golden was paused to free RAM for the AutoTrust quant.
+  `DECIDRA_NATIVE_INT8=false` reproduces the vLLM / weight-only behavior.
+- 28-row CPU artifact golden (resumed): engine 28/28, max 0.0176, MAE 3.28e-3,
+  KL 2.33e-4; vLLM 28/28, max 0.0267, MAE 3.49e-3, KL 3.04e-4 -> the engine is
+  closer to the artifact math. Against the merged-BF16 teacher: CPU artifact max
+  0.2578 / MAE 5.98e-2, engine max 0.2730 / MAE 6.00e-2, vLLM max 0.2845 / MAE
+  6.03e-2. Saved as `eval/data/w4a8-cpu-suite28.json`; the README gate is
+  max 0.02 / MAE 0.004 / KL 1e-3 for a W4A8 server.
 
 ## 2026-10-20 — AutoTrust-JEV-27B-v1.1 INT4/INT8 quantization
 
