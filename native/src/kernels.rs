@@ -37,6 +37,7 @@ pub struct Kernels {
     pub conv1d_silu_tiled: CudaFunction,
     pub conv1d_silu_tiled_batched: CudaFunction,
     pub gather_rows: CudaFunction,
+    pub embed_gather: CudaFunction,
     pub quant_fp8: CudaFunction,
     pub quant_int8: CudaFunction,
     pub quant_int8_bf16: CudaFunction,
@@ -155,6 +156,7 @@ impl Kernels {
             conv1d_silu_tiled: gpu.func("conv1d_silu_tiled_bf16")?,
             conv1d_silu_tiled_batched: gpu.func("conv1d_silu_tiled_batched_bf16")?,
             gather_rows: gpu.func("gather_rows_bf16")?,
+            embed_gather: gpu.func("embed_gather_bf16")?,
             quant_fp8: gpu.func("quant_fp8_per_token_f32")?,
             quant_int8: gpu.func("quant_int8_per_token_f32")?,
             quant_int8_bf16: gpu.func("quant_int8_per_token_bf16")?,
@@ -864,6 +866,33 @@ pub fn quant_int8_group_bf16(
     l.arg(&global_scale);
     l.arg(&clip);
     l.arg(&u_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+/// Device-side embedding gather: `table[vocab, hidden]`, `ids[seq]` -> `out`.
+#[allow(clippy::too_many_arguments)]
+pub fn embed_gather(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    table: &CudaSlice<bf16>,
+    ids: &CudaSlice<u32>,
+    out: &mut CudaSlice<bf16>,
+    seq: usize,
+    hidden: usize,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (seq as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (s_i, h_i) = (seq as i32, hidden as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(table);
+    l.arg(ids);
+    l.arg(out);
+    l.arg(&s_i);
+    l.arg(&h_i);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }

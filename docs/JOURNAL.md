@@ -29,19 +29,19 @@ Server (one resident process, 16 unique prompts/level, cache off):
 
 | level | req/s | p50 | GPU util | power |
 |---|---:|---:|---:|---:|
-| c1 | 24.4-24.9 | 40.5-41.0 ms | 81-96% | 82-372 W |
-| c2 | 38.4-38.5 | 52.7-52.9 ms | 91-93% | 172-342 W |
-| c4 | 49.4-49.6 | 80.3-80.6 ms | 92-93% | 288-320 W |
-| c8 | 48.4-55.9 | 141-159 ms | 82-93% | 315-336 W |
-| c16 | 52.6-56.5 | 206-230 ms | 80-99% | 342-372 W |
+| c1 | 25.08 | 40.2 ms | 97% | 376 W |
+| c2 | 38.95 | 51.9 ms | 93% | 349 W |
+| c4 | 50.18 | 79.2 ms | 93% | 328 W |
+| c8 | 53.20 | 148.4 ms | 96% | 334 W |
+| c16 | 53.44 | 240.5 ms | 95% | 353 W |
 
-Long single request: **4K 0.937 s (4,366 tok/s, 100% GPU, 384-428 W)**,
-**8K 1.917 s (4,265 tok/s, 100%, 422 W)**,
-**16K 4.150 s (3,947 tok/s, 100%, 420-423 W)**.
+Long single request: **4K 0.913 s (4,477 tok/s, 100% GPU, 384-428 W)**,
+**8K 1.871 s (4,371 tok/s, 100%, 422 W)**,
+**16K 4.051 s (4,045 tok/s, 100%, 430 W)**.
 
-Resident/peak memory: 16.85 GiB short, **18.10 GiB during 16K**, flat across six
-consecutive 16K requests after lowering the low-memory pool threshold from 24,576 to
-**12,288 tokens**. Before the change, repeated 16K requests climbed 22.8 -> 23.9 GiB.
+Resident/peak memory: **18.83 GiB** short, **20.17 GiB during 16K**, flat across
+repeated 16K requests. The 2.37 GiB embedding table is resident and rows are gathered
+on-device; the low-memory pool threshold is 12,288 tokens.
 
 LiteLLM verified end-to-end against the live server (non-streaming + SSE streaming,
 usage included): `/tmp/litellm-venv`.
@@ -80,8 +80,10 @@ the shipped default.
 - **Marlin launch-path caching**: device attributes and `cudaFuncSetAttribute` are queried
   once per thread instead of every GEMM; `JEV_MARLIN_CHUNK`, `JEV_GEMM_DEBUG*` and
   `JEV_MARLIN_DEBUG` are cached (`LazyLock`) instead of read per GEMM.
-- **Parallel embedding gather** (up to 8 threads): 23.7 ms -> measured next; 4K host
-  gather was 3.3% of the forward.
+- **Resident GPU embedding table** (2.37 GiB): rows are gathered on-device with a
+  16-byte-vector kernel, bit-identical to the host gather. 4K 938.8 -> 915.8 ms
+  (-2.5%), 16K 4096 -> 4004 ms (-2.2%), short min 40.8 -> 37.2 ms. The host gather
+  (parallel, up to 8 threads) remains the fallback when disabled.
 - **CLI benchmark parity**: `jev-native layer/batch` now enables chunked+TC GDN by
   default (the server already did); `--legacy-gdn` disables all chunked paths. Earlier CLI
   numbers measured the scalar f32 GDN by mistake.
@@ -93,6 +95,25 @@ the shipped default.
 - Diagnostics: `JEV_CPU_PROFILE` (host enqueue/alloc timing), `JEV_GDN_PROF` (chunked GDN
   phase clocks), and `JEV_INT8_GROUP_UNIFORM` (forced per-row scales; the group kernel
   must then match the per-token kernel — it does).
+
+### Experiments (results)
+
+- **BN=128 Marlin tiles** (thread_n_blocks=8, thread_k_blocks=4, tmb 2..4) for small M:
+  after fixing the group-scale application to run at the last k of the stage
+  (`k == b_sh_wr_iters - 1`, not hard-coded `k == 1`), the kernel is bit-identical to
+  BN=256 but **neutral** at c1/c4/c16 and long (c1 23.75 vs 24.65, within run noise).
+  The small-M path is weight-bound, not block-bound. Reverted; the instantiations and
+  selection code were removed.
+- **Per-token INT8 for the expanded set with clipping** (clip 0.995/0.99/0.98):
+  fails the gate (MAE 2.5-3.7e-3, max up to 0.052). Group-64 scales are required for
+  `up/down/in_qkv/out/q`; clipping is not a substitute.
+- **All-linear group-64** (includes o/v/k): passes (28/28, MAE 9.692e-4, max 8.469e-3)
+  but trades away most of the MAE margin for ~1.4% long-context speed. Kept opt-in via
+  `JEV_NATIVE_INT8_EXCLUDE=none`; the default keeps o/v/k on W4A16.
+- **GPU-resident embedding table** (2.37 GiB, device row gather): bit-identical logits,
+  -2.5% at 4K and -2.2% at 16K; memory 16.85/18.10 -> 18.83/20.17 GiB. Upload first:
+  a 2.4 GiB contiguous block can fail after 13.1 GiB of repacked weights fragment the
+  pool.
 
 ### Measured saturation (expanded group config, server)
 

@@ -195,6 +195,7 @@ fn cmd_batch(args: &[String]) -> Result<()> {
     // Benchmark parity with the server, which enables both chunked GDN paths.
     eng.set_gdn_chunked(true);
     eng.set_gdn_chunked_tc(true);
+    eng.set_gpu_embed(!args.iter().any(|a| a == "--no-gpu-embed"));
     if args.iter().any(|a| a == "--marlin") {
         eng.set_marlin(true);
     }
@@ -480,6 +481,7 @@ fn cmd_layer(args: &[String]) -> Result<()> {
     // Benchmark parity with the server, which enables both chunked GDN paths.
     eng.set_gdn_chunked(true);
     eng.set_gdn_chunked_tc(true);
+    eng.set_gpu_embed(!args.iter().any(|a| a == "--no-gpu-embed"));
     eng.set_logits_opts(head_ids.clone(), full_logits);
     if args.iter().any(|a| a == "--fused-w4a16") {
         eng.set_fused_w4a16(true);

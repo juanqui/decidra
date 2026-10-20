@@ -221,6 +221,28 @@ impl Store {
         Ok(())
     }
 
+    /// Borrow a whole BF16 tensor from the mmap (no copy).
+    pub fn bf16_slice(&self, name: &str) -> Result<&[bf16]> {
+        let info = self
+            .map
+            .get(name)
+            .with_context(|| format!("tensor {name} not found"))?;
+        if info.dtype != DType::BF16 {
+            bail!("{name}: expected BF16, got {:?}", info.dtype);
+        }
+        let bytes = &self.shards[info.shard].mmap[info.start..info.end];
+        if bytes.len() % 2 != 0 {
+            bail!("{name}: odd BF16 byte length");
+        }
+        let ptr = bytes.as_ptr();
+        if ptr as usize % 2 != 0 {
+            bail!("{name}: unaligned BF16 storage");
+        }
+        // SAFETY: BF16 is two bytes, the range is aligned, and the mmap lives
+        // as long as the Store.
+        Ok(unsafe { std::slice::from_raw_parts(ptr as *const bf16, bytes.len() / 2) })
+    }
+
     /// Build a name-to-shape summary, used for startup diagnostics.
     pub fn tensor_names(&self) -> impl Iterator<Item = (&String, &TensorInfo)> {
         self.map.iter()

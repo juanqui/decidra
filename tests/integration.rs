@@ -81,6 +81,7 @@ fn test_config() -> Config {
         native_int8_exclude: Vec::new(),
         native_int8_all_layers: String::new(),
         decision_cache_size: 256,
+        native_gpu_embed: false,
         signing_key: None,
         metrics_enabled: false,
         max_body_bytes: 8 * 1024 * 1024,

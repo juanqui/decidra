@@ -81,7 +81,7 @@ the reference GPTQ-Marlin repack / scale / zero-point permutations bit-exactly f
 
 Marlin resident weights use **13.1 GiB**; preload/repack takes **10.1 s**. Tiled FA2
 attention plus gated split-dk GDN and the mixed W4A8-INT8 linears make long context
-**GEMM-bound** at ~0.23-0.25 ms/token:
+**GEMM-bound** at ~0.22-0.25 ms/token:
 
 | tokens | engine CLI (warm) | resident server | GPU util |
 |---|---:|---:|---:|
@@ -90,8 +90,8 @@ attention plus gated split-dk GDN and the mixed W4A8-INT8 linears make long cont
 | 16K (16,383) | **3.900 s** | **4.151 s** | 100% |
 | 32K (32,763) | not rerun | not rerun | — |
 
-Peak memory at 16K is **18.10 GiB** and stays flat across repeated requests (low-memory
-pool from 12,288 tokens). The earlier W4A16-only stack measured 2.12 s (4K), 4.23-4.32 s
+Peak memory at 16K is **20.17 GiB** (including the 2.37 GiB resident embedding table)
+and stays flat across repeated requests (low-memory pool from 12,288 tokens). The earlier W4A16-only stack measured 2.12 s (4K), 4.23-4.32 s
 (8K) and 8.62-8.97 s (16K); the current stack is 2.2-2.3x faster at every length.
 Attention is <1% at 1K and still small at 16K; the remaining time is dominated by the
 Marlin GEMMs (see the per-op table in [`RESULTS.md`](RESULTS.md)).
@@ -104,7 +104,7 @@ the state dot products enough to shift a rare short-prompt logit. Suite row `r22
 
 For **seq >= 12,288** the engine enables a low-memory buffer-pool mode: dropped large
 tensors are released instead of retained, and large MLP/attention/GDN intermediates are
-freed as soon as they are consumed. This keeps repeated 16K requests flat at **18.10 GiB**
+freed as soon as they are consumed. This keeps repeated 16K requests flat at **20.17 GiB**
 and is what makes **32K fit and run on 24 GB** (19.09 GiB peak, ~4.4 GiB headroom).
 
 Long-context correctness against CPU AWQ/SDPA probes (Marlin + tiled FA2 + split GDN):
@@ -130,9 +130,10 @@ fused path ignores the Marlin-specific repacked layout.
 ## Residency
 
 `preload_all()` repacks/upload every packed decoder layer once and keeps it resident.
-With Marlin the repacked layout uses **13.1 GiB** and preload takes **10.1 s**; the
-dequant fallback uses ~12.7 GiB / 5.8 s. Embedding rows are gathered from the
-mmap (a few KiB per request); lm_head rows are gathered/streamed so the 2.5 GiB head is
+With Marlin the repacked layout uses **13.1 GiB**, the resident embedding table adds
+**2.37 GiB**, and preload takes **9.1 s**; the
+dequant fallback uses ~12.7 GiB / 5.8 s. Embedding rows are gathered on-device from the resident table
+(the host mmap gather remains as the `JEV_NATIVE_GPU_EMBED=false` fallback); lm_head rows are gathered/streamed so the 2.5 GiB head is
 never required in full.
 
 The alternative `--no-cache` CLI mode streams one layer at a time (needed for the 51 GiB

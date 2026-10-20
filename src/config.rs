@@ -91,6 +91,9 @@ pub struct Config {
     /// Exact-decision logits cache entries (`JEV_DECISION_CACHE_SIZE`).
     /// Zero disables the cache.
     pub decision_cache_size: usize,
+    /// Keep the embedding table resident on the GPU (`JEV_NATIVE_GPU_EMBED`,
+    /// default on; costs 2.4 GiB and removes the host row gather).
+    pub native_gpu_embed: bool,
     pub signing_key: Option<Vec<u8>>,
     pub metrics_enabled: bool,
     pub max_body_bytes: usize,
@@ -178,6 +181,7 @@ impl Config {
             env_string("JEV_NATIVE_INT8_ALL_LAYERS").unwrap_or_else(|| "last:8".to_owned());
         let decision_cache_size =
             env_usize("JEV_DECISION_CACHE_SIZE")?.unwrap_or(DEFAULT_DECISION_CACHE_SIZE);
+        let native_gpu_embed = env_bool("JEV_NATIVE_GPU_EMBED")?.unwrap_or(true);
 
         let signing_key = match std::env::var("JEV_SIGNING_KEY") {
             Ok(key) if !key.is_empty() => Some(key.into_bytes()),
@@ -217,6 +221,7 @@ impl Config {
             native_int8_exclude,
             native_int8_all_layers,
             decision_cache_size,
+            native_gpu_embed,
             signing_key,
             metrics_enabled,
             max_body_bytes,

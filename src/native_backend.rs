@@ -118,6 +118,7 @@ impl NativeBackend {
         // Must be set before preload_all: Marlin repacks into its resident layout.
         engine.set_marlin(config.native_marlin);
         engine.set_cache_weights(config.native_cache);
+        engine.set_gpu_embed(config.native_gpu_embed);
         // Chunked prefill engages at >=64 tokens; shorter prompts keep the
         // shared/split recurrence. Both flags must be set before preload_all.
         engine.set_gdn_chunked(config.native_gdn_chunked);
@@ -144,6 +145,7 @@ impl NativeBackend {
             model = %config.native_model.display(),
             tokenizer = %tokenizer_path.display(),
             cache = config.native_cache,
+            gpu_embed = config.native_gpu_embed,
             marlin = config.native_marlin,
             fused_w4a16 = config.native_fused_w4a16 && !config.native_marlin,
             hidden = engine.cfg.hidden_size,

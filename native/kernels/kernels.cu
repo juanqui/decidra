@@ -79,6 +79,20 @@ extern "C" __global__ void quant_int8_group_bf16(
   }
 }
 
+// Gather BF16 embedding rows on the device: table [vocab, h], ids [seq].
+// One CTA per token; each copies its 5120-value row as 16-byte vectors.
+extern "C" __global__ void embed_gather_bf16(
+    const bf16* __restrict__ table, const unsigned int* __restrict__ ids,
+    bf16* __restrict__ out, int seq, int h) {
+  int row = blockIdx.x;
+  if (row >= seq) return;
+  const int4* src =
+      reinterpret_cast<const int4*>(table + (size_t)ids[row] * h);
+  int4* dst = reinterpret_cast<int4*>(out + (size_t)row * h);
+  int n = h / 8;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) dst[i] = src[i];
+}
+
 // Per-token symmetric INT8 quantization of bf16 activations (full-model path).
 extern "C" __global__ void quant_int8_per_token_bf16(
     const bf16* __restrict__ x, int8_t* __restrict__ out,
@@ -1906,19 +1920,6 @@ extern "C" __global__ void gather_rows_bf16(const bf16* __restrict__ src,
        j += blockDim.x * gridDim.y)
     out[(size_t)r * cols + j] = src[(size_t)row * cols + j];
 }
-
-// ---------------------------------------------------------------------------
-// Embedding gather (device-side variant, not used by the CPU-gather path).
-// ---------------------------------------------------------------------------
-extern "C" __global__ void embed_gather_bf16(const bf16* __restrict__ table,
-                                             const int* __restrict__ tokens,
-                                             bf16* __restrict__ out, int hidden) {
-  int t = blockIdx.x;
-  int tok = tokens[t];
-  for (int j = threadIdx.x; j < hidden; j += blockDim.x)
-    out[(size_t)t * hidden + j] = table[(size_t)tok * hidden + j];
-}
-
 
 // ===========================================================================
 // Tiled causal GQA attention (FlashAttention-2 style) for sm_89, BF16.

@@ -319,6 +319,9 @@ pub struct Engine {
     /// BF16 checkpoint (51 GiB) on a 24 GiB card; the shipped AWQ path keeps
     /// every packed layer resident instead.
     cache_weights: AtomicBool,
+    /// Keep the embedding table resident on the GPU and gather rows on-device.
+    gpu_embed: AtomicBool,
+    embedding_table: Mutex<Option<CudaSlice<bf16>>>,
     /// Use the fused in-shared-memory dequant + tensor-core GEMM. The
     /// dequant-to-BF16 + cuBLAS path remains available as the reference.
     fused_w4a16: AtomicBool,
@@ -471,6 +474,8 @@ impl Engine {
                 low_mem: AtomicBool::new(false),
             }),
             cache_weights: AtomicBool::new(true),
+            gpu_embed: AtomicBool::new(false),
+            embedding_table: Mutex::new(None),
             fused_w4a16: AtomicBool::new(false),
             fused_min_n: std::sync::atomic::AtomicUsize::new(5120),
             fused_max_m: std::sync::atomic::AtomicUsize::new(128),
@@ -743,6 +748,11 @@ impl Engine {
         self.cache_weights.store(enabled, Ordering::Relaxed);
     }
 
+    /// Keep the embedding table resident on the GPU (set before `preload_all`).
+    pub fn set_gpu_embed(&self, enabled: bool) {
+        self.gpu_embed.store(enabled, Ordering::Relaxed);
+    }
+
     pub fn set_dump(&self, dir: &std::path::Path) {
         *self.dump_dir.lock().unwrap() = Some(dir.to_path_buf());
     }
@@ -779,6 +789,24 @@ impl Engine {
     }
 
     pub fn preload_all(&self) -> Result<()> {
+        // Upload the embedding table first: a 2.4 GiB contiguous block is easy
+        // to place before the packed decoder weights fragment the pool.
+        if self.gpu_embed.load(Ordering::Relaxed) {
+            let name = self.provider()?.embedding();
+            match self.store.bf16_slice(&name) {
+                Ok(host) => {
+                    eprintln!(
+                        "gpu embedding: {:.2} GiB resident",
+                        (host.len() * 2) as f64 / (1u64 << 30) as f64
+                    );
+                    let dev = self.gpu.stream.clone_htod(host)?;
+                    *self.embedding_table.lock().unwrap() = Some(dev);
+                }
+                Err(error) => eprintln!("gpu embedding disabled: {error}"),
+            }
+        } else {
+            eprintln!("gpu embedding: flag off");
+        }
         // One upload at startup; no per-forward PCIe traffic for decoder weights.
         for i in 0..self.cfg.num_hidden_layers {
             self.layer_weights(i)?;
@@ -861,8 +889,6 @@ impl Engine {
 
     pub fn embed(&self, tokens: &[u32]) -> Result<Buf> {
         let h = self.cfg.hidden_size;
-        let name = self.provider()?.embedding();
-        let mut host = vec![bf16::ZERO; tokens.len() * h];
         for &tok in tokens {
             if tok as usize >= self.cfg.vocab_size {
                 bail!(
@@ -871,6 +897,25 @@ impl Engine {
                 );
             }
         }
+        if self.gpu_embed.load(Ordering::Relaxed) {
+            let table = self.embedding_table.lock().unwrap();
+            if let Some(table) = table.as_ref() {
+                let ids = self.gpu.stream.clone_htod(tokens)?;
+                let mut buf = self.alloc_bf16(tokens.len() * h)?;
+                kernels::embed_gather(
+                    &self.gpu,
+                    &self.kernels.embed_gather,
+                    table,
+                    &ids,
+                    &mut buf,
+                    tokens.len(),
+                    h,
+                )?;
+                return Ok(buf);
+            }
+        }
+        let name = self.provider()?.embedding();
+        let mut host = vec![bf16::ZERO; tokens.len() * h];
         // The gather is host-side mmap traffic and is the only serial CPU step
         // in a long prefill (23 ms at 4K, ~95 ms at 16K). Rows are independent,
         // so split them across cores; errors are recorded once and re-raised
