@@ -402,6 +402,13 @@ Held-out 500-row corpus vs W4A16: 488/500 top-1, MAE 1.31e-3, max 1.29e-2; the
 numerical sensitivity as W4A16 (c8: INT8 max 1.07e-2 vs W4A16 1.78e-2), so it
 is a property of the batched GEMM path, not of the INT8 selection.
 
+Marlin launches the whole M in one kernel by default (`JEV_MARLIN_CHUNK=0`,
+the kernel's internal `parallel` loop); `JEV_MARLIN_CHUNK=N` caps each launch
+at roughly N rows. Full-M removes the outer 1024-row split (16 launches at 16K
+become 2: 16320 + tail) and measures 16K 5991 -> 5935 ms, 4K 1432 -> 1425 ms;
+the 4K/8K/16K probe deltas stay inside the W4A16 envelope and suite28 is
+bit-identical (short rows are a single launch either way).
+
 The environment knobs are `JEV_NATIVE_INT8` (server default true),
 `JEV_NATIVE_INT8_EXCLUDE` (comma-separated module substrings),
 `JEV_NATIVE_INT8_ALL_LAYERS` (layer subset that runs all-linear INT8) and

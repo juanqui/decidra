@@ -2285,8 +2285,17 @@ impl Engine {
                     let locks = locks_guard.as_ref().expect("locks initialized");
                     let mut off = 0usize;
                     let mut rest = rows;
+                    let chunk = std::env::var("JEV_MARLIN_CHUNK")
+                        .ok()
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .unwrap_or(0);
+                    let max_par = if chunk == 0 {
+                        usize::MAX
+                    } else {
+                        (chunk / 64).max(1)
+                    };
                     while rest > 0 {
-                        let par = (rest / 64).min(16);
+                        let par = (rest / 64).min(max_par);
                         let pm = if par > 0 { par * 64 } else { rest };
                         let tmb = pm.div_ceil(16).min(4);
                         let idx = if pm <= 8 { 0 } else { tmb - 1 };
@@ -2311,8 +2320,19 @@ impl Engine {
                 let locks = locks.as_ref().expect("locks initialized");
                 let mut off = 0usize;
                 let mut rest = rows;
+                // 0 = one launch for the whole M (the kernel's internal
+                // `parallel` loop); >0 caps each launch to that many rows.
+                let chunk = std::env::var("JEV_MARLIN_CHUNK")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0);
+                let max_par = if chunk == 0 {
+                    usize::MAX
+                } else {
+                    (chunk / 64).max(1)
+                };
                 while rest > 0 {
-                    let par = (rest / 64).min(16);
+                    let par = (rest / 64).min(max_par);
                     let pm = if par > 0 { par * 64 } else { rest };
                     let tmb = pm.div_ceil(16).min(4);
                     let idx = if pm <= 8 { 0 } else { tmb };

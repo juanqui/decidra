@@ -214,6 +214,17 @@ FI on vs golden [-0.0469,+0.0313], [+0.0156,-0.0313], [+0.0156,0.0], within the
 W4A16 envelope with unchanged top-1. Disable with
 `JEV_FLASHINFER_ATTENTION=0`; `JEV_FLASHINFER_MIN_SEQ` sets the threshold.
 
+## Marlin full-M launches
+
+The W4A16 and INT8 Marlin paths now launch the whole M once by default
+(`JEV_MARLIN_CHUNK=0`, the kernel's internal `parallel` loop) instead of
+splitting into <=1024-row launches; `JEV_MARLIN_CHUNK=N` restores a cap. At
+16K this is 2 launches instead of 16 (16320 + tail): full forward 5991 ->
+5935 ms (-0.9%), 4K 1432 -> 1425 ms (-0.5%), INT8 16K 5184 -> 5133 ms
+(-1.0%), 1K unchanged. suite28 is bit-identical and passes; 4K/8K/16K probe
+deltas vs golden are [-0.0469,0], [+0.0156,+0.0313], [0,-0.0313] with INT8,
+inside the existing envelope and with unchanged top-1.
+
 ## Marlin layer-wise INT8 and tile probes
 
 Layer subsets that run all-linear INT8 on top of the selective bypass
