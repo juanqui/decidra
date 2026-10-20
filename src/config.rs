@@ -74,6 +74,8 @@ pub struct Config {
     pub native_int8_clip: f32,
     /// Module-name substrings kept on W4A16 (`JEV_NATIVE_INT8_EXCLUDE`).
     pub native_int8_exclude: Vec<String>,
+    /// Layers that use all-linear INT8 (`JEV_NATIVE_INT8_ALL_LAYERS`).
+    pub native_int8_all_layers: String,
     /// Exact-decision logits cache entries (`JEV_DECISION_CACHE_SIZE`).
     /// Zero disables the cache.
     pub decision_cache_size: usize,
@@ -152,6 +154,7 @@ impl Config {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .collect();
+        let native_int8_all_layers = env_string("JEV_NATIVE_INT8_ALL_LAYERS").unwrap_or_default();
         let decision_cache_size =
             env_usize("JEV_DECISION_CACHE_SIZE")?.unwrap_or(DEFAULT_DECISION_CACHE_SIZE);
 
@@ -189,6 +192,7 @@ impl Config {
             native_int8,
             native_int8_clip,
             native_int8_exclude,
+            native_int8_all_layers,
             decision_cache_size,
             signing_key,
             metrics_enabled,

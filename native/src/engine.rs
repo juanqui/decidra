@@ -231,6 +231,8 @@ pub struct Engine {
     int8_clip: std::sync::atomic::AtomicU32,
     /// Module-name substrings kept on W4A16 activations under `marlin_int8`.
     int8_exclude: Mutex<Vec<String>>,
+    /// Layers that use all-linear INT8 (overrides `int8_exclude` inside them).
+    int8_all_layers: Mutex<Vec<usize>>,
     /// Marlin split-K barrier workspace (one int per SM), zeroed once.
     marlin_locks: Mutex<Option<CudaSlice<i32>>>,
     /// Warp-per-query attention (fast for long contexts); the original block
@@ -362,6 +364,7 @@ impl Engine {
             marlin_int8: AtomicBool::new(false),
             int8_clip: std::sync::atomic::AtomicU32::new(1.0f32.to_bits()),
             int8_exclude: Mutex::new(Vec::new()),
+            int8_all_layers: Mutex::new(Vec::new()),
             marlin_locks: Mutex::new(None),
             warp_attention: AtomicBool::new(true),
             flashinfer,
@@ -493,6 +496,35 @@ impl Engine {
         *self.int8_exclude.lock().unwrap() = exclude;
     }
 
+    /// Select layers that run all-linear INT8. Spec: `first:N`, `last:N`,
+    /// `alt:N` (N evenly spaced layers), or a comma-separated list.
+    pub fn set_int8_all_layers(&self, spec: &str) {
+        let l = self.cfg.num_hidden_layers;
+        let spec = spec.trim();
+        let mut v: Vec<usize> = if let Some(n) = spec.strip_prefix("first:") {
+            let n = n.trim().parse::<usize>().unwrap_or(0).min(l);
+            (0..n).collect()
+        } else if let Some(n) = spec.strip_prefix("last:") {
+            let n = n.trim().parse::<usize>().unwrap_or(0).min(l);
+            (l - n..l).collect()
+        } else if let Some(n) = spec.strip_prefix("alt:") {
+            let n = n.trim().parse::<usize>().unwrap_or(0).min(l);
+            if n == 0 {
+                Vec::new()
+            } else {
+                (0..n).map(|i| i * l / n).collect()
+            }
+        } else {
+            spec.split(',')
+                .filter_map(|x| x.trim().parse::<usize>().ok())
+                .filter(|&i| i < l)
+                .collect()
+        };
+        v.sort_unstable();
+        v.dedup();
+        *self.int8_all_layers.lock().unwrap() = v;
+    }
+
     fn prof_begin(&self, _name: &'static str) -> Option<CudaEvent> {
         if !self.prof.enabled {
             return None;
@@ -557,6 +589,7 @@ impl Engine {
         p.marlin_fp8 = self.marlin_fp8.load(Ordering::Relaxed);
         p.marlin_int8 = self.marlin_int8.load(Ordering::Relaxed);
         p.int8_exclude = self.int8_exclude.lock().unwrap().clone();
+        p.int8_all_layers = self.int8_all_layers.lock().unwrap().clone();
         Ok(p)
     }
 

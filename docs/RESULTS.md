@@ -214,6 +214,24 @@ FI on vs golden [-0.0469,+0.0313], [+0.0156,-0.0313], [+0.0156,0.0], within the
 W4A16 envelope with unchanged top-1. Disable with
 `JEV_FLASHINFER_ATTENTION=0`; `JEV_FLASHINFER_MIN_SEQ` sets the threshold.
 
+## Marlin layer-wise INT8 and tile probes
+
+Layer subsets that run all-linear INT8 on top of the selective bypass
+(`JEV_NATIVE_INT8_ALL_LAYERS`): `last:8` (layers 56-63) is the largest passing
+set (28/28, KL 2.37e-5, MAE 6.91e-4, max 7.48e-3); `first:N` and `alt:N` fail
+for N=8..32, and `last:10/12/14/16/24/32` fail. Held-out 500 rows: 481/500
+top-1 vs the selective config, all flips being <=0.008-margin ties. The speed
+gain is under 0.1% (16K 5181.9 -> 5177.7 ms), so it stays opt-in.
+
+Marlin tile probes: the engine already runs BM=64/BN=256/stages=4 with
+101,376 B of dynamic shared memory (the exact limit, no spill), so the
+vendor's BM=48 fallback does not apply here. New BM=64/BN=256/stages=3
+(84,480 B) and BM=64/BN=128/stages=3 (55,808 B) instantiations measured
+16.53/17.09 ms for up_proj and 16.47/16.35 ms for down_proj at 16K, versus
+16.61/16.50 for the current config: neutral to worse, reverted. `q_proj` is
+N=12288 (48 N tiles, 768 tiles over 128 blocks) and measures 11.84 ms/op =
+174 TFLOP/s, so its grid is not idle; `in_proj_z` is the N=6144 INT8 module.
+
 ## Request batching
 
 The native backend runs one engine thread. HTTP handlers tokenize on the reactor,

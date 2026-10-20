@@ -129,6 +129,9 @@ pub struct WeightProvider<'a> {
     pub marlin_int8: bool,
     /// Module-name substrings kept on W4A16 activations when `marlin_int8`.
     pub int8_exclude: Vec<String>,
+    /// Layer indices that use all-linear INT8 (sorted), overriding the
+    /// per-module exclusion list inside those layers.
+    pub int8_all_layers: Vec<usize>,
     stream: Arc<CudaStream>,
     gpu: &'a crate::cuda::Gpu,
     kernels: &'a crate::kernels::Kernels,
@@ -156,6 +159,7 @@ impl<'a> WeightProvider<'a> {
             marlin_fp8: false,
             marlin_int8: false,
             int8_exclude: Vec::new(),
+            int8_all_layers: Vec::new(),
             stream: gpu.stream.clone(),
             gpu,
             kernels,
@@ -221,11 +225,19 @@ impl<'a> WeightProvider<'a> {
             if scale.len() != out * groups || zp.len() != zp_rows * groups {
                 bail!("{module}: scale/zp size mismatch");
             }
+            let layer = module
+                .split_once("layers.")
+                .and_then(|(_, rest)| rest.split('.').next())
+                .and_then(|n| n.parse::<usize>().ok());
+            let all_int8 = layer
+                .map(|i| self.int8_all_layers.binary_search(&i).is_ok())
+                .unwrap_or(false);
             let use_int8 = self.marlin_int8
-                && !self
-                    .int8_exclude
-                    .iter()
-                    .any(|p| !p.is_empty() && module.contains(p));
+                && (all_int8
+                    || !self
+                        .int8_exclude
+                        .iter()
+                        .any(|p| !p.is_empty() && module.contains(p)));
             if self.marlin && out % 64 == 0 && in_ % 64 == 0 {
                 if (self.marlin_fp8 || use_int8) && group_size != 64 {
                     bail!("W4A8 transform requires group_size 64, got {group_size}");

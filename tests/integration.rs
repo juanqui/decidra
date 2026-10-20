@@ -77,6 +77,7 @@ fn test_config() -> Config {
         native_int8: false,
         native_int8_clip: 1.0,
         native_int8_exclude: Vec::new(),
+        native_int8_all_layers: String::new(),
         decision_cache_size: 256,
         signing_key: None,
         metrics_enabled: false,

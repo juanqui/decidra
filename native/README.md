@@ -403,7 +403,17 @@ numerical sensitivity as W4A16 (c8: INT8 max 1.07e-2 vs W4A16 1.78e-2), so it
 is a property of the batched GEMM path, not of the INT8 selection.
 
 The environment knobs are `JEV_NATIVE_INT8` (server default true),
-`JEV_NATIVE_INT8_EXCLUDE` (comma-separated module substrings) and
+`JEV_NATIVE_INT8_EXCLUDE` (comma-separated module substrings),
+`JEV_NATIVE_INT8_ALL_LAYERS` (layer subset that runs all-linear INT8) and
 `JEV_NATIVE_INT8_CLIP` (abs-max clip factor, default 1.0). The CLI equivalents
-are `--marlin-int8`, `--int8-exclude`, `--int8-clip`, and `--gdn-chunked-min-seq`
-for the GDN threshold. `--marlin-int8` without exclusions runs all-linear INT8.
+are `--marlin-int8`, `--int8-exclude`, `--int8-all-layers`, `--int8-clip`, and
+`--gdn-chunked-min-seq` for the GDN threshold. `--marlin-int8` without
+exclusions runs all-linear INT8.
+
+Layer-wise expansion (all-linear INT8 for one layer subset, current selective
+set elsewhere): `first:N` and `alt:N` fail suite28 for N=8..32; the largest
+passing subset is **`last:8`** (layers 56-63): 28/28, KL 2.37e-5, MAE 6.91e-4,
+max 7.48e-3. On the 500-row holdout it agrees with the selective config on
+481/500 top-1; every flip is a 0.5/0.5 or <0.008-margin tie. Speed is
+negligible (16K 5181.9 -> 5177.7 ms, 1K unchanged), so it is **opt-in**
+(default empty).

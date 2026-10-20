@@ -214,6 +214,9 @@ fn cmd_batch(args: &[String]) -> Result<()> {
                 .collect(),
         );
     }
+    if let Some(v) = opt(args, "--int8-all-layers") {
+        eng.set_int8_all_layers(v);
+    }
     if args.iter().any(|a| a == "--legacy-gdn") {
         eng.set_gdn_shared(false);
         eng.set_gdn_split(false);
@@ -339,6 +342,9 @@ fn cmd_matmul(args: &[String]) -> Result<()> {
                 .map(str::to_owned)
                 .collect(),
         );
+    }
+    if let Some(v) = opt(args, "--int8-all-layers") {
+        eng.set_int8_all_layers(v);
     }
     let marlin_fp8 = args.iter().any(|a| a == "--marlin-fp8");
     let marlin_int8 = args.iter().any(|a| a == "--marlin-int8");
@@ -474,6 +480,9 @@ fn cmd_layer(args: &[String]) -> Result<()> {
                 .map(str::to_owned)
                 .collect(),
         );
+    }
+    if let Some(v) = opt(args, "--int8-all-layers") {
+        eng.set_int8_all_layers(v);
     }
     if args.iter().any(|a| a == "--legacy-gdn") {
         eng.set_gdn_shared(false);
