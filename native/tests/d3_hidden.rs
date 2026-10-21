@@ -17,6 +17,7 @@ fn d3_hidden() {
     let data: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&probe).expect("probe")).expect("json");
     let engine = Engine::new(Path::new(&model)).expect("engine");
+    let last = engine.cfg.num_hidden_layers.saturating_sub(1) as isize;
     let h = engine.cfg.hidden_size;
     let mut results = Vec::new();
     for row in data["rows"].as_array().expect("rows") {
@@ -27,7 +28,12 @@ fn d3_hidden() {
             .iter()
             .map(|v| v.as_u64().expect("token") as u32)
             .collect();
-        let hidden = engine.forward_last_hidden(&tokens).expect("final norm hidden");
+        let split = row["split"].as_u64().expect("split") as usize;
+        let all = engine
+            .forward_split(&tokens, split, last, decidra_native::engine::Stage::FinalNorm, true)
+            .expect("final norm hidden");
+        assert_eq!(all.len(), h);
+        let hidden = all;
         assert_eq!(hidden.len(), h);
         results.push(serde_json::json!({"id": id, "hidden": hidden}));
     }
