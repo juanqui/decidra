@@ -210,6 +210,27 @@ docker compose logs -f
 
 The health check starts after a 180 s grace period.
 
+### d3-turbo in the image
+
+The image is the same binary: the d3 state-once path is compiled in, and the
+server detects `decision_config.json` with `attention_mode: prefix_bidir`.
+Mount the artifact as `/models` and set the d3 profile:
+
+```bash
+docker run --rm   --gpus '"device=1"'   --user "$(id -u):$(id -g)"   -p 8502:8080   -v /srv/models/d3-turbo-w4a8-g64-v4:/models:ro   -e DECIDRA_D3=1   -e DECIDRA_MODEL=d3-turbo   -e DECIDRA_NATIVE_GPU_EMBED=false   -e DECIDRA_NATIVE_GDN_CHUNKED_MIN_SEQ=16   -e DECIDRA_NATIVE_INT8_GROUP_SCALE=true   -e DECIDRA_NATIVE_INT8_EXCLUDE=self_attn.o_proj,self_attn.v_proj,self_attn.k_proj,mlp.gate_proj   decidra:0.1.0
+```
+
+For Compose, keep the models root mounted and set the subdir:
+
+```bash
+DECIDRA_MODELS_DIR=/srv/models DECIDRA_MODEL_SUBDIR=d3-turbo-w4a8-g64-v4 DECIDRA_MODEL=d3-turbo DECIDRA_SERVER_PORT=8502 DECIDRA_D3=1 DECIDRA_NATIVE_GPU_EMBED=false DECIDRA_NATIVE_GDN_CHUNKED_MIN_SEQ=16 DECIDRA_NATIVE_INT8_EXCLUDE=self_attn.o_proj,self_attn.v_proj,self_attn.k_proj,mlp.gate_proj docker compose up -d --build
+```
+
+`DECIDRA_D3=1` makes a missing `prefix_bidir` config a startup error instead of
+silently serving the causal path. The image's startup self-test runs the real
+state capture + question pass and refuses to serve on a mask/cache mismatch.
+Images and video states return 400 until the vision tower is ported.
+
 ## systemd
 
 See the unit example in the README. Keep `CUDA_VISIBLE_DEVICES=1` and `DECIDRA_CUDA_LIBS` in

@@ -64,6 +64,8 @@ convolution tail. `DECIDRA_D3=1` enables the `/v1/systemone` d3 path
 `d3-turbo-w4a8-g64-v4` artifact with the environment in
 [`docs/D3TURBO.md`](docs/D3TURBO.md); the design and review log are in
 [`docs/specs/2026-10-21-d3turbo-state-once.md`](docs/specs/2026-10-21-d3turbo-state-once.md).
+The same binary is in the Docker image; [`docs/DEPLOY.md`](docs/DEPLOY.md) has
+the `docker run`/Compose profile with `DECIDRA_D3=1`.
 
 Measured on one RTX 4090 with a 2,048-token state and 64 questions: 465 ms
 state capture, 734 ms question pass, ~1.20 s in the engine and 1.65 s through

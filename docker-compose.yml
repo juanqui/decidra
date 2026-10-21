@@ -24,15 +24,24 @@ services:
     ports:
       - "${DECIDRA_SERVER_PORT:-8501}:8080"
     environment:
-      DECIDRA_TOKENIZER: /models/awq-w4a16-v2/tokenizer.json
-      DECIDRA_NATIVE_MODEL: /models/awq-w4a16-v2
-      DECIDRA_CHECKPOINT: /models/awq-w4a16-v2
+      DECIDRA_MODEL: ${DECIDRA_MODEL:-jev-awq}
+      DECIDRA_TOKENIZER: /models/${DECIDRA_MODEL_SUBDIR:-awq-w4a16-v2}/tokenizer.json
+      DECIDRA_NATIVE_MODEL: /models/${DECIDRA_MODEL_SUBDIR:-awq-w4a16-v2}
+      DECIDRA_CHECKPOINT: /models/${DECIDRA_MODEL_SUBDIR:-awq-w4a16-v2}
       DECIDRA_NATIVE_CACHE: "true"
       DECIDRA_NATIVE_MARLIN: ${DECIDRA_NATIVE_MARLIN:-true}
       # Fallback only: DECIDRA_NATIVE_MARLIN=false DECIDRA_NATIVE_FUSED_W4A16=true
       DECIDRA_NATIVE_FUSED_W4A16: ${DECIDRA_NATIVE_FUSED_W4A16:-false}
       DECIDRA_BIND_ADDR: 0.0.0.0:8080
       DECIDRA_METRICS_ENABLED: "true"
+      # d3-turbo: set DECIDRA_D3=1 and the model subdir above.
+      DECIDRA_D3: ${DECIDRA_D3:-0}
+      DECIDRA_NATIVE_INT8: ${DECIDRA_NATIVE_INT8:-true}
+      DECIDRA_NATIVE_INT8_GROUP_SCALE: ${DECIDRA_NATIVE_INT8_GROUP_SCALE:-true}
+      DECIDRA_NATIVE_INT8_EXCLUDE: ${DECIDRA_NATIVE_INT8_EXCLUDE:-self_attn.o_proj,self_attn.v_proj,self_attn.k_proj}
+      DECIDRA_NATIVE_GDN_CHUNKED: ${DECIDRA_NATIVE_GDN_CHUNKED:-true}
+      DECIDRA_NATIVE_GDN_CHUNKED_MIN_SEQ: ${DECIDRA_NATIVE_GDN_CHUNKED_MIN_SEQ:-64}
+      DECIDRA_NATIVE_GPU_EMBED: ${DECIDRA_NATIVE_GPU_EMBED:-true}
       # Set in the host environment or a .env file (never commit it).
       DECIDRA_SIGNING_KEY: ${DECIDRA_SIGNING_KEY:-}
     volumes:

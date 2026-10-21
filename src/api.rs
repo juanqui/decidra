@@ -189,7 +189,14 @@ impl AppState {
     }
 }
 
-async fn health(State(_state): State<AppState>) -> Json<Value> {
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    if state.engine.backend.d3_enabled() {
+        return Json(json!({
+            "status": "ready",
+            "model": state.config.model_id,
+            "head": "d3-code-readout",
+        }));
+    }
     Json(json!({
         "status": "ready",
         "model": PUBLIC_MODEL,
@@ -198,7 +205,12 @@ async fn health(State(_state): State<AppState>) -> Json<Value> {
 }
 
 async fn models(State(state): State<AppState>) -> Json<Value> {
-    let data: Vec<Value> = [PUBLIC_MODEL, PUBLIC_ALIAS, state.config.model_id.as_str()]
+    let names: Vec<&str> = if state.engine.backend.d3_enabled() {
+        vec![state.config.model_id.as_str()]
+    } else {
+        vec![PUBLIC_MODEL, PUBLIC_ALIAS, state.config.model_id.as_str()]
+    };
+    let data: Vec<Value> = names
         .into_iter()
         .map(|name| {
             json!({
