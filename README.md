@@ -377,7 +377,7 @@ Decision request:
 options and uses `false`/`true`. `score` uses the six labels `0`–`5`.
 `strategy` is `auto`, `single`, `tournament`, or `permute`; `model` is accepted
 and ignored. The protocol and response fields are specified in
-[`docs/SPEC.md`](docs/SPEC.md).
+[`docs/specs/2026-10-19-api-specification.md`](docs/specs/2026-10-19-api-specification.md).
 
 ## Configuration
 

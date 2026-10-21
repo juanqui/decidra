@@ -335,7 +335,7 @@ W4A16. Current server suite at batch=1 is 28/28, KL 3.269e-5, **MAE 7.166e-4**,
 max 1.027e-2 — every strict gate passes. All-linear per-token INT8 fails
 (max 0.0482, top-1 0.9643); all-linear group-64 fails only max (0.01349) and is
 not the default. FP8 remains off. For the ranked, gated plan to close the
-remaining gaps, see [`OPTIMIZATION-PROPOSAL.md`](OPTIMIZATION-PROPOSAL.md).
+remaining gaps, see [`specs/2026-10-19-optimization-proposal.md`](specs/2026-10-19-optimization-proposal.md).
 
 Resident native engine on GPU 1 (`--preload`, Marlin repacked layout 13.1 GiB), measured
 in `native/README.md`:
