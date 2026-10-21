@@ -377,6 +377,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "decidra-cache"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "sha2",
+]
+
+[[package]]
 name = "decidra-native"
 version = "0.1.0"
 dependencies = [

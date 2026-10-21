@@ -1,0 +1,10 @@
+[package]
+name = "decidra-cache"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "CUDA-free prefix-cache logic for Decidra: mask algebra, keys, LRU, prefix matching"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
