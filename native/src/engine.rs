@@ -309,6 +309,8 @@ struct LoraHead {
 pub struct Engine {
     pub gpu: Gpu,
     pub cfg: Config,
+    /// Full-attention layers run noncausally (AutoTrust/d3/d3-turbo/pplx).
+    pub noncausal_full: bool,
     pub store: Store,
     pub kernels: Kernels,
     /// Resident weights. Populated lazily by the CLI layer tests (merged BF16 is
@@ -468,9 +470,11 @@ impl Engine {
             .and_then(|v| v.parse().ok())
             .unwrap_or(1024usize);
         let weight_cache = Mutex::new(vec![None; cfg.num_hidden_layers]);
+        let noncausal_full = cfg.noncausal_full;
         let mut engine = Self {
             gpu,
             cfg,
+            noncausal_full,
             store,
             kernels,
             weight_cache,
@@ -1473,7 +1477,11 @@ impl Engine {
                 None
             };
             if let Some(fi) = fi {
-                fi.prefill(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+                if self.noncausal_full {
+                    fi.prefill_noncausal(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+                } else {
+                    fi.prefill(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+                }
             } else {
                 match (use_warp, tc) {
                     (true, Some(tc)) => kernels::attention_tc(
@@ -2205,7 +2213,11 @@ impl Engine {
         let mut attn = self.alloc_bf16(seq * heads * hd)?;
         let __attn_t = self.prof_begin("attn");
         if let Some(fi) = self.flashinfer_for(seq, hd, heads, kv) {
-            fi.prefill(&self.gpu, &*qn, &*kn, &*vv, &mut *attn, seq)?;
+            if self.noncausal_full {
+                fi.prefill_noncausal(&self.gpu, &*qn, &*kn, &*vv, &mut *attn, seq)?;
+            } else {
+                fi.prefill(&self.gpu, &*qn, &*kn, &*vv, &mut *attn, seq)?;
+            }
         } else if self.warp_attention.load(Ordering::Relaxed) {
             let tc = match hd {
                 64 => Some(&self.kernels.attention_tc_64),

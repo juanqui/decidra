@@ -22,6 +22,9 @@ pub struct Config {
     pub rope_theta: f32,
     pub partial_rotary_factor: f32,
     pub attn_output_gate: bool,
+    /// Full-attention layers attend noncausally (AutoTrust/d3/d3-turbo/pplx).
+    /// GDN layers remain causal regardless.
+    pub noncausal_full: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +74,14 @@ impl Config {
             .or_else(|| c.get("partial_rotary_factor").and_then(|x| x.as_f64()))
             .unwrap_or(1.0) as f32;
 
+        let noncausal_full = v
+            .get("jev_prompt_attention")
+            .and_then(|x| x.as_str())
+            .map(|x| x == "bidirectional")
+            .unwrap_or(false)
+            || v.get("attention_mode").and_then(|x| x.as_str())
+                == Some("noncausal_full_attention");
+
         Ok(Self {
             hidden_size,
             intermediate_size,
@@ -103,6 +114,7 @@ impl Config {
                 .get("attn_output_gate")
                 .and_then(|x| x.as_bool())
                 .unwrap_or(true),
+            noncausal_full,
         })
     }
 

@@ -58,6 +58,7 @@ fn materialize() -> Option<PathBuf> {
 pub struct FlashInfer {
     handle: *mut c_void,
     func: PrefillFn,
+    func_noncausal: PrefillFn,
 }
 
 // The handle is opened once and only used on the engine's single CUDA stream.
@@ -97,7 +98,22 @@ impl FlashInfer {
                 return None;
             }
             let func: PrefillFn = std::mem::transmute(p);
-            Some(Arc::new(Self { handle, func }))
+            let sym_nc = CString::new("fi_prefill_bf16_noncausal").ok()?;
+            let p_nc = dlsym(handle, sym_nc.as_ptr());
+            if p_nc.is_null() {
+                eprintln!(
+                    "flashinfer: fi_prefill_bf16_noncausal missing in {}",
+                    path.display()
+                );
+                dlclose(handle);
+                return None;
+            }
+            let func_noncausal: PrefillFn = std::mem::transmute(p_nc);
+            Some(Arc::new(Self {
+                handle,
+                func,
+                func_noncausal,
+            }))
         }
     }
 
@@ -133,6 +149,44 @@ impl FlashInfer {
         };
         if rc != 0 {
             bail!("FlashInfer prefill failed with cudaError {rc}");
+        }
+        Ok(())
+    }
+
+    /// Noncausal (full) attention over the whole sequence. Used by the
+    /// AutoTrust/d3/d3-turbo/pplx decision family; the GDN layers stay causal.
+    pub fn prefill_noncausal<Q, K, V, O>(
+        &self,
+        gpu: &crate::cuda::Gpu,
+        q: &Q,
+        k: &K,
+        v: &V,
+        out: &mut O,
+        seq: usize,
+    ) -> Result<()>
+    where
+        Q: DevicePtr<bf16>,
+        K: DevicePtr<bf16>,
+        V: DevicePtr<bf16>,
+        O: DevicePtrMut<bf16>,
+    {
+        let (qp, _g0) = q.device_ptr(&gpu.stream);
+        let (kp, _g1) = k.device_ptr(&gpu.stream);
+        let (vp, _g2) = v.device_ptr(&gpu.stream);
+        let (op, _g3) = out.device_ptr_mut(&gpu.stream);
+        let stream = gpu.stream.cu_stream() as *mut c_void;
+        let rc = unsafe {
+            (self.func_noncausal)(
+                qp as *const c_void,
+                kp as *const c_void,
+                vp as *const c_void,
+                op as *mut c_void,
+                seq as c_int,
+                stream,
+            )
+        };
+        if rc != 0 {
+            bail!("FlashInfer noncausal prefill failed with cudaError {rc}");
         }
         Ok(())
     }

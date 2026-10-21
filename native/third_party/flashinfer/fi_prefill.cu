@@ -1,5 +1,6 @@
-// Standalone FlashInfer FA2 prefill for BF16 q[S,24,256], k/v[S,4,256], causal.
+// Standalone FlashInfer FA2 prefill for BF16 q[S,24,256], k/v[S,4,256].
 // No PyTorch / ATen / TVM-FFI linkage: only FlashInfer headers + cudart.
+// Two entries: causal (JEV) and noncausal (AutoTrust/d3/d3-turbo/pplx full layers).
 #include <flashinfer/attention/prefill.cuh>
 #include <flashinfer/attention/default_prefill_params.cuh>
 
@@ -7,10 +8,7 @@ using bf16 = __nv_bfloat16;
 using Params = flashinfer::SinglePrefillParams<bf16, bf16, bf16>;
 using Variant = flashinfer::DefaultAttention<false, false, false, false>;
 
-extern "C" __attribute__((visibility("default")))
-int fi_prefill_bf16(const void* q, const void* k, const void* v, void* out,
-                    int seq, cudaStream_t stream) {
-  if (seq <= 0) return -1;
+static Params make_params(const void* q, const void* k, const void* v, void* out, int seq) {
   Params p;
   p.q = const_cast<bf16*>(static_cast<const bf16*>(q));
   p.k = const_cast<bf16*>(static_cast<const bf16*>(k));
@@ -37,9 +35,29 @@ int fi_prefill_bf16(const void* q, const void* k, const void* v, void* out,
   p.rope_rcp_scale = 1.0f;
   p.rope_rcp_theta = 1.0f;
   p.partition_kv = false;
+  return p;
+}
+
+extern "C" __attribute__((visibility("default")))
+int fi_prefill_bf16(const void* q, const void* k, const void* v, void* out,
+                    int seq, cudaStream_t stream) {
+  if (seq <= 0) return -1;
+  Params p = make_params(q, k, v, out, seq);
   cudaError_t e = flashinfer::SinglePrefillWithKVCacheDispatched<
       256, 256, flashinfer::PosEncodingMode::kNone,
       /*USE_FP16_QK_REDUCTION=*/false, flashinfer::MaskMode::kCausal,
+      Variant>(p, nullptr, stream);
+  return static_cast<int>(e);
+}
+
+extern "C" __attribute__((visibility("default")))
+int fi_prefill_bf16_noncausal(const void* q, const void* k, const void* v, void* out,
+                              int seq, cudaStream_t stream) {
+  if (seq <= 0) return -1;
+  Params p = make_params(q, k, v, out, seq);
+  cudaError_t e = flashinfer::SinglePrefillWithKVCacheDispatched<
+      256, 256, flashinfer::PosEncodingMode::kNone,
+      /*USE_FP16_QK_REDUCTION=*/false, flashinfer::MaskMode::kNone,
       Variant>(p, nullptr, stream);
   return static_cast<int>(e);
 }
