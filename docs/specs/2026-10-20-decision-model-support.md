@@ -1,94 +1,100 @@
 # Decision-model support specification
 
-Status: proposed. Targets: `autotrust/AutoTrust-JEV-27B-v1.1`, `vllm-sr/d3`,
-`vllm-sr/d3-turbo`, `perplexity-ai/pplx-decider-v1.2` (and the existing JEV
-production model). Goal: be the best decision-model inference engine — one
-resident runtime, decision-specific optimizations vLLM cannot express, measured
-against vLLM on the same GPU and the same quantized artifact.
+Status: reviewed against the checkpoints and the engine sources (Claude Code
+`claude-opus-5-5` review, 2026-10-20). Targets:
+`autotrust/AutoTrust-JEV-27B-v1.1`, `vllm-sr/d3`, `vllm-sr/d3-turbo`,
+`perplexity-ai/pplx-decider-v1.2`, plus the existing JEV production model.
+Goal: one resident runtime for the family, decision-specific optimizations
+vLLM cannot express, measured against vLLM on the same GPU and quantized
+artifact.
 
 ## 1. Research summary
 
-All four target checkpoints share the same backbone, which changes the problem
-from "port four models" to "support one family as data":
+All four targets share the Qwen3.8-27B hybrid backbone (64 layers: 48 GDN +
+16 full at indices 3,7,...,63; hidden 5120; 24 q / 4 kv; head_dim 256;
+inter 17408; vocab 248320; GDN 16 k / 48 v heads, 128 dim, conv 4; mRoPE
+[11,11,10], partial rotary 0.25; swish output gate; eps 1e-6; 0.46B vision
+tower in the checkpoint). The differences are masks, readout sites, prompts and
+post-processing:
 
 | | AutoTrust v1.1 | d3 | d3-turbo | pplx-decider v1.2 |
 |---|---|---|---|---|
-| Backbone | Qwen3.8-27B, Qwen3_5Model | same | same | same |
-| Layers | 64 (48 GDN + 16 full) | same | same | same |
-| Hidden / heads | 5120, 24 q / 4 kv, d=256 | same | same | same |
-| Vision | 0.46B tower | same | same | same |
-| Attention (full layers) | `bidirectional` / `prefix_bidir` | `noncausal_full_attention` | `prefix_bidir` | `noncausal_full_attention` |
+| Full-attention mask | **noncausal full** | noncausal full | **prefix_bidir**: state prefix + bidirectional question block | noncausal full |
 | GDN | causal | causal | causal | causal |
-| Readout | 255 code rows folded into `lm_head` | separate `readout.safetensors` F32 [255,5120] | same, F32 | separate BF16 [255,5120] |
-| Pooling | last | last | last | one marker `<|fim_suffix|>` per question |
-| Multi-question | one per forward | one per forward | state-once (one read, many questions) | joint protocol v3, markers |
-| Temperature | 1.0 | 1.0 | 1.0 | 1.382 |
-| Options | 2..255 | 1..255 | 1..255 (+box/track) | 1..255 |
-| Context | 32K | 32K | 32K default / 131K option | 32K validated / 262K max |
-| Upstream serving | vLLM 0.31 + StartLux plugin | vLLM main `/v1/systemone` (0.31 lacks it) | vLLM SR Engine | reference package + fast path |
+| Readout head | 255 bf16 rows folded in `lm_head` (other rows zero) | separate F32 [255,5120] | same F32 | separate BF16 [255,5120] |
+| Sites | last | last | last; **Box/track multi-site** | one `<|fim_suffix|>` marker per question |
+| Multi-question | one per forward | one per forward | state-once (text/state media); assets/Box/track one row/problem | joint protocol v3; all tokens see all questions |
+| Post-process | p(chosen) confidence | package: 1−H/ln n; vLLM: p(chosen) | box QMC confidence + calibration | (p1−1/n)/(1−1/n) |
+| Vision | tower present, **serving is text-only** | yes (1.6 MP) | yes; images in options; video | yes (1.6 MP) |
+| Context | — | 32K | 32K/131K | 32K validated / 262K max |
+| T | 1.0 | 1.0 | 1.0 | 1.382 (post-hoc calibration; overridable) |
 
-Key contract facts from the checkpoints:
+Contract facts from the artifacts:
 
-- `decision_config.json` carries `codes` (A..), `token_ids`, `temperature`,
-  `attention_mode`, `pooling`, `readout_dtype`, `max_length`/`max_pixels`.
-  Readout row `i` corresponds to vocabulary token `token_ids[i]`; the head is a
-  separate `[255,5120]` matrix (AutoTrust folds the same rows into `lm_head`).
-- The d3/d3-turbo prompt (`d3_format.py`) and the AutoTrust prompt
-  (`jev_format.py`) are the same upstream code-readout template: system prompt,
-  chat template, coded option lines, readout at the last position. The pplx
-  protocol is joint: state, then every question with options and a
-  `<|fim_suffix|>` marker; readout at each marker.
-- pplx explicitly states: full-attention layers are noncausal over the whole
-  request; linear-attention layers keep native causal behavior; default causal
-  inference does not reproduce the checkpoint. The d3 card and the AutoTrust
-  config state the same requirement in their own terms.
-- d3/d3-turbo share the backbone, tokenizer and readout; they differ in
-  `attention_mode` and the multi-question behavior. If the weight shards hash
-  identical, **one resident weight set can serve both model ids** (hash first,
-  §11).
-- vLLM support: d3 is native on vLLM main (PR #61565, not in 0.31.0);
-  d3-turbo is served by vLLM SR Engine; pplx ships its own reference/fast
-  package (packing, varlen FlashAttention, compile, CUDA graphs, last-layer
-  pruning, optional FP8). Vendor throughput numbers were measured on MI325X /
-  GB200, not on a 4090; they are claims to reproduce, not baselines.
+- `decision_config.json` carries `codes`, `token_ids`, `temperature`,
+  `attention_mode`, `pooling`, `readout_dtype`. Readout row `i` maps to
+  vocabulary token `token_ids[i]`. The code list **skips non-single-token
+  pairs** (BQ, CJ, ...); never compute codes base-26.
+- AutoTrust's `decision_config.json` says `noncausal_full_attention`; its
+  "StartLux prefix-bidirectional" means the whole prefill is the bidirectional
+  prefix. It is served with no prefix caching and no chunked prefill. There is
+  no state cache for AutoTrust: its state rows depend on the question.
+- d3-turbo's `prefix_bidir`: the state (system + media + `State:`) is a
+  bidirectional prefix; the question block attends to the state and to itself
+  **bidirectionally** (both passes are unmasked). The mask is all-true except
+  padding. A causal question block is the wrong model.
+- d3-turbo state-once covers text and state-media requests only. Requests with
+  `assets`, Box or track run one row per question under the block mask with no
+  shared compute; an image token inside a question block errors on the
+  state-once path.
+- pplx joint: one sequence with the state and every question; every token,
+  including the state, sees every question. Order and numbering matter.
+- d3-turbo Box/track: prompts append `top:\nbottom:\nleft:\nright:` (track adds
+  `visible:` first); readout at each colon token by offset from the end. Edges
+  use the first 128 codes, `visible` the first 2; Box confidence uses QMC
+  IoU≥0.5 over 512 R4 points with a piecewise-linear calibration.
+- pplx readout logits are BF16 in the reference; an fp32 engine will differ
+  near ties.
+- d3/d3-turbo weight sharing is **unlikely**: different scores, different
+  capabilities, different build times; the API alias is not weight sharing.
+  Fetch d3's `MODEL_MANIFEST.json` and compare hashes before planning one
+  resident weight set.
+- Upstream serving: d3 is native on vLLM main (PR #61565; not in 0.31.0) but its
+  CUDA W4 path is unverified; pplx ships its own reference/fast package; d3-turbo
+  is served by vLLM SR Engine. Vendor throughput numbers are MI325X/GB200
+  claims, not 4090 baselines.
 
-## 2. Current engine: what is true, what is missing
+## 2. Current engine
 
-True today (verified in code and production):
+Verified: JEV W4A8 production 28/28 vs the CPU artifact golden, max Δ 0.0176,
+KL 2.7e-4; 21/24/35–39/49–50/53–54 req/s c1–c16; 0.91/1.85/4.18 s at
+4K/8K/16K; 21.6 GB peak. Prefill-only; no decode; exact-decision LRU only.
+Norm handling already uses `(1+w)` for input/post/final/q/k norms and plain `w`
+for the GDN gated norm. BF16 weights path exists for parity.
 
-- JEV W4A8 production: 28/28 vs the CPU artifact golden, max Δ 0.0176,
-  KL 2.7e-4; 21/24/35–39/49–50/53–54 req/s c1–c16; 0.91/1.85/4.18 s at
-  4K/8K/16K on the 4090; 21.6 GB peak.
-- The engine is prefill-only: one forward, last-token readout, no decode.
-- Norm handling already uses the zero-centered `(1+w)` convention for input,
-  post-attention, final and q/k norms, and plain `w` for the GDN gated norm.
-  Do not change this without evidence.
-- A BF16 weight path (`LinearWeight::Bf16`) exists for parity tests.
-- Batch 2–8 does **not** use FlashInfer: `flashinfer_for` is only called when
-  `batch == 1`; batched prefill falls back to the custom attention kernels.
-- `fi_prefill.cu` is a one-shape shim: `kCausal`, 24/4 heads, head_dim 256,
-  single prefill. There is no mask parameter and no varlen path.
-- RoPE is 1-D. Correct for text-only mRoPE (all three position streams equal),
-  wrong once image tokens appear.
+Gaps:
 
-Missing for the new family:
-
-1. **Noncausal / prefix-bidirectional full attention.** The full-attention layers
-   must attend over the full prompt (or prefix); the GDN layers stay causal.
-   The vendored causal mask silently serves the wrong model and produces the
-   AutoTrust KL 0.15 class of error.
-2. **Separate 255-row readout head** with option-only logits, per-marker
-   pooling, temperature and code mapping.
-3. **Per-model prompt/protocol adapters**: chat template + coded options
-   (AutoTrust/d3/d3-turbo) and the joint marker protocol (pplx).
-4. **Qwen3.8 parity isolation** (AutoTrust engine vs HF KL 0.15). The layer-63
-   probe result is likely a measurement artifact: HF's last hidden state is
-   taken after the final norm; the engine's `Stage::Layer(63)` is pre-norm. That
-   comparison cannot establish a graph bug. The P0 harness below replaces it.
-5. **Vision path** (0.46B tower, 1.6 MP, 3-D mRoPE) for d3/d3-turbo/pplx.
-6. **Quantization calibrated under the real mask**, per family, with
-   margin/flip-rate validation at 255-way (24-way JEV evidence does not
-   transfer).
+1. **Masks.** `fi_prefill.cu` is a one-shape causal shim
+   (`native/third_party/flashinfer/fi_prefill.cu`, `kCausal`, 24/4/256,
+   SinglePrefill, no LSE/varlen). Batched prefill does not use FlashInfer;
+   attention launches per sequence on the native causal kernels. Noncausal
+   Full and the bidirectional d3-turbo question block are not expressible.
+2. **Readout.** The dynamic 255-row head, per-marker sites, Box/track
+   multi-site readout and per-model post-processing are missing. The existing
+   `logits_rows` fetches host rows on every call and runs over all sequence
+   rows; it needs load-time extraction and an F32 GEMM variant.
+3. **GDN state interface.** Ragged batching/conv reset per sequence is already
+   done, but there is no initial-state/conv-history input, no final-state/tail
+   output, and no cascade attention for d3-turbo state-once.
+4. **Prompts/protocols.** Chat templates (`enable_thinking=False`), the pplx
+   joint protocol (numbering, `\n\n`, escaping, semantic bisection) and Box/track
+   composition are missing.
+5. **Config.** `mrope_section`/`mrope_interleaved` are not parsed; 3-D positions
+   are needed for images.
+6. **Vision** (d3/d3-turbo/pplx; not AutoTrust).
+7. **Quantization** recalibration under the real mask; the current AutoTrust
+   W4A16 is asymmetric **group 64**, a different and less-tested kernel path than
+   JEV's production group 128.
 
 ## 3. Architecture: one runtime, models as data
 
@@ -96,290 +102,192 @@ Missing for the new family:
 ModelCard / manifest (TOML, pinned + hashed)
       │ compiler
       ▼
-Program (IR, content-hashed)  ──►  Runtime (Rust) ──► ForwardJob(s) ──► kernels
+Program (IR, content-hashed) ──► Runtime ──► ForwardJob(s) ──► kernels
 ```
 
-The scheduler must never contain `match model_name`. The IR is small:
-
-- `ForwardJob { tokens, pos3 (t,h,w), segments (Prefix/Context/Question(i)/Image(j)),
-  mask, vision refs, readout sites, cache_key }`
-- `MaskSpec { Causal | Full | PrefixBidir { prefix_len } | Blocks { shared, groups } }`
-- `HeadMatrix { file | lm_head[ids], dtype, bias, temperature, code_ids }`
-- `Postprocess { choice | noul | score | box | track }`
-
-Rules:
-
-- Adapters render prompts and emit jobs; they never touch CUDA. Backbone code
-  never sees prompts.
-- The GDN layers ignore `MaskSpec` and stay causal; the mask applies to the 16
-  full-attention layers only.
-- Fail closed: a model id without a manifest returns 404. Never fall back to
-  causal + `lm_head`; that silent fallback is exactly how the AutoTrust
-  checkpoint was validated with the wrong mask.
-- Program hash = cache key prefix, reproducibility stamp and parity-test id.
-
-Family coverage (no new op needed for any row):
-
-| | Mask (full layers) | Readout sites | Pooling | Head |
-|---|---|---|---|---|
-| JEV | causal | 1 | last | lm_head rows (24) |
-| AutoTrust | bidir/prefix | 1 | last | folded lm_head rows (255) |
-| d3 | full | 1/forward | last | separate 255 |
-| d3-turbo | prefix_bidir + forks | 1/fork | last | separate 255 |
-| pplx | full (joint) | M markers | per-marker | separate 255 |
+IR: `ForwardJob { tokens, pos3, segments, mask, vision, readout sites,
+cache_key }`; `MaskSpec { Causal | Full | BlockCascade { shared, group } }` — the
+d3-turbo model is `BlockCascade` with **both parts noncausal**, not a causal
+suffix; `HeadMatrix { file | lm_head[ids], dtype, F32 GEMM, bias, T, code_ids }`;
+`Postprocess` per model. Adapters render prompts and emit jobs; they never touch
+CUDA. The GDN ignores the mask and stays causal. Fail closed: no manifest, 404;
+never fall back to causal + `lm_head`. Program hash is the cache key and parity
+id. Readout sites for pplx come from `joint_config.json`, never from the
+`pooling` field (which says `last` despite marker readout).
 
 ## 4. Attention
 
-Implement the mask modes with FlashInfer's built-in masks; custom bitmasks use
-the slow path.
-
 | Mode | Implementation |
 |---|---|
-| Causal | `BatchPrefillWithRaggedKVCache`, `kCausal` |
-| Full | same call, `kNone` |
-| PrefixBidir(P) | two passes: prefix Q[0,P) vs K/V[0,P) with `kNone`; suffix Q[P,L) vs K/V[0,L) with `kCausal` (FlashInfer aligns causal bottom-right, so suffix i sees prefix + suffix ≤ i). Disjoint output rows; no merge. |
-| Blocks | partial attentions over shared and group spans, merged with `merge_state` on the LSE |
+| Causal (JEV only) | `kCausal` |
+| Full (AutoTrust, d3, pplx) | `kNone` over the whole key range; GDN causal |
+| BlockCascade (d3-turbo) | state prefix Q vs state K/V `kNone`; question Q vs [state + own question block] `kNone`; combine with `merge_state` on the LSE. The question block is **bidirectional**, not causal. |
 
-Required kernel work:
-
-1. **Varlen ragged batched FlashInfer** with `qo_indptr`/`kv_indptr`, one launch
-   per mask class per layer, up to 8 sequences / 16K tokens. This also removes
-   the non-FlashInfer batch fallback and is a prerequisite for state-once.
-2. **Template instantiations**: head_dim 256, GQA 6, bf16, `{kNone, kCausal}`,
-   with/without LSE output.
-3. **GDN packed batches**: reset conv/recurrent state at `cu_seqlens`; carry
-   the 3-token conv tail; keep the recurrent state F32 (BF16 drifts).
-4. **1-D RoPE now, 3-D mRoPE with vision**: for images, position ids are
-   (t,h,w); continue text after an image from `max(pos)+1`; the interleaved
-   [11,11,10] layout over 32 frequency pairs must match HF unit tests.
-
-Correctness traps (ranked):
-
-1. Mask silently differs from training (the AutoTrust bug class). Per-layer
-   cliff test in CI on every model; `mask_mode` in every cache key.
-2. GDN conv tail dropped at a fork/prefix boundary — first 3 tokens wrong,
-   invisible in average KL.
-3. Packed GDN conv/state leaking across sequences; test [A,B] packed vs B alone
-   bit-identical.
-4. Padding entering GDN state or attention keys; use ragged/no padding.
-5. Cached prefix K is already rotated; suffix queries use unrotated RoPE.
-6. GQA mapping `q_head // 6`, not `% 4`.
-7. Split-K nondeterminism vs exact-decision cache; fixed reduction trees for
-   the readout GEMM.
-
-Long context: the engine is layer-major and prefill-only; noncausal 131K prefill
-is tens of seconds on a 4090 and the MLP intermediate alone is 4.5 GB. Gate at
-**32K** (pplx's validated range); 48 GB+ class for longer, and do not advertise
-131K/262K on the 24 GB card.
+- Ragged varlen FlashInfer `{kNone, kCausal}` with LSE, one launch per mask
+  class per layer; this replaces the per-sequence native launches and is the
+  prerequisite for state-once.
+- GDN: add initial-state and conv-history inputs; final-state and conv-tail
+  outputs. The conv tail is the last 3 **pre-conv** `in_proj_qkv` rows
+  (10,240 channels, bf16, left-zero-padded under 3 tokens). Each question row
+  carries its own state copy (~3.1 MB/layer, transient, ~200 MB for 64 rows);
+  "never fork the GDN state" is wrong — the recurrence must be seeded.
+- Positions: cached state K is already rotated; question tokens use
+  `state_len + j` (or `max(state pos)+1+j` with mRoPE). Split state/questions by
+  the full prompt's offset mapping; a straddling token belongs to the question.
+- FlashInfer build list: head_dim 256, GQA 6, bf16, `{kNone, kCausal}`, LSE;
+  include the cascade pair.
+- Full attention cannot skip the upper triangle: it costs ~2× causal. JEV's
+  4K/8K/16K timings are not a d3 baseline.
+- Correctness traps: mask differs from training; conv tail dropped; packed
+  GDN leakage; padding entering state/keys; cached-K RoPE; GQA `q//6`; split-K
+  nondeterminism in the readout GEMM. The engine's GQA, GDN `vh/rep` + q/k L2
+  norm and NeoX RoPE are already correct — keep them as tests.
 
 ## 5. Readout
 
-```
-HeadMatrix { source: lm_head[ids] | readout.safetensors, dtype, bias, T, code_ids }
-```
+`HeadMatrix` sources: JEV `lm_head[24]`; AutoTrust folded `lm_head[255]` (bf16
+rows; other rows zero; no F32 head ships); d3/d3-turbo F32 file; pplx BF16 file.
+At load, pre-extract the rows into a dense `[K,5120]` block; final-norm only the
+readout rows; gather sites; F32 GEMM `[R,5120]×[5120,K]`; K ≤ 255.
 
-- Apply the final RMSNorm to the readout rows only; gather R rows; fp32 GEMM
-  `[R,5120] × [5120,K]`, K ≤ 255. This is megabytes, not the 248K-vocab head.
-- Pre-extract JEV/AutoTrust `lm_head` rows at load into a dense `[K,5120]`
-  block; avoid a strided dequant gather per request.
-- Pooling: `last` = last row; `markers` = each `<|fim_suffix|>` row (assert the
-  marker count equals the question count; never search text for the marker).
-- Mask option codes ≥ n to −∞ before the softmax; apply `T` at runtime (keep
-  the trained temperature separate from post-hoc confidence calibration).
-- Outputs: probabilities over valid options, `confidence`, `margin = p1−p2`,
-  entropy; `score` gives expected level index; `noul` maps to P(true).
-- Fuse final-norm → gather → GEMM into the last block epilogue; for M markers,
-  one `[M,5120]×[5120,255]` GEMM and M softmaxes.
-- Last-layer pruning: only layer 63's MLP at non-readout rows can be skipped
-  (~1–3%); K/V are needed at all rows. Demote it; pplx's gain is packing, not
-  pruning.
-- Numerics: fp32 accumulation; 255-way margins are much tighter than 24-way.
-  Validate with margin-bucket flip rates, not top-1 alone.
+Sites: `last`; per-marker `<|fim_suffix|>` (assert count == questions); Box/track
+colon tokens (4 or 5 sites per question). Option codes ≥ n → −inf/ sliced before
+`softmax(z/T)`. Cache pre-T logits; pplx's 1.382 is the calibration T and is
+overridable. pplx reference rounds logits to bf16 — measure or emulate near ties.
 
-## 6. Prompts, adapters, API
+Post-processing per model (do not genericize):
 
-Manifest per model, e.g.:
+| | choice confidence | noul | score | box |
+|---|---|---|---|---|
+| d3 package | 1 − H/ln n | `{noul}` | Σ i·pᵢ, legend, entropy confidence; 2..10 | — |
+| d3 vLLM `/v1/systemone` | p(chosen) | adds yes/no probs + confidence | — | — |
+| AutoTrust | p(chosen) | `{noul}` | — | — |
+| pplx | (p1−1/n)/(1−1/n) | `{noul}` | 1 − E\|i−best\|/baseline; 2..255 | — |
+| d3-turbo Box | QMC IoU≥0.5 (512 R4) → calibration | — | — | edges first 128 codes; visible first 2 |
 
-```toml
-id = "vllm-sr/d3-turbo"
-backbone = { path = "/srv/models/d3", revision = "<sha>", quant = "w4a8-g128" }
-attention = { mode = "prefix_bidir", prefix = "until_first_question" }
-gdn = "causal"
-prompt = { template = "templates/d3.jinja", multi_question = "state_once" }
-readout = { file = "readout.safetensors", dtype = "f32", codes = "codes.json",
-            bias = false, temperature = 1.0, pooling = "last" }
-decision_types = ["choice", "noul", "score", "box", "track"]
-max_tokens = 32768
-golden = "goldens/d3-turbo-256.jsonl"
-```
+Choose the d3 answer shape per model id (package vs vLLM); they disagree.
+Rewrite the existing `logits_rows` path: load-time extraction, F32 GEMM, sites
+tensor, no full-sequence GEMM.
 
-- `/v1/decide` stays for JEV. Add `/v1/systemone` as a pinned conformance
-  clone of vLLM main `/v1/systemone`: record request/response pairs from the
-  pinned commit and replay them in CI (the schema is not official yet).
-- `/v1/models` exposes `metadata.decidra: {decision_types, options_max,
-  mask_mode, max_ctx, cache_scope, protocol}`.
-- Startup self-test against `golden`; refuse to serve on KL/top-1 gate failure.
-- LiteLLM: route public names to the tinylife port; one backbone per GPU
-  process; keep the OpenAI shape and put the decision payload in
-  `extra_body.questions` or the existing `/v1/decide` JSON content.
+## 6. Prompts and protocols
 
-## 7. Cache and batching
+- AutoTrust/d3 share the upstream code-readout strings but not the format id;
+  add a byte-level render diff. Hard-code `enable_thinking=False` (the template
+  otherwise injects reasoning). Do not tokenize state and question separately;
+  split by offsets.
+- pplx is a different protocol: different system prompt, `Question {index}:`
+  numbering, `\n\n` joins, no closing line, images first, special tokens in user
+  text escaped as full-width brackets. Over-length requests are bisected
+  semantically; `max_length` is part of the program hash and cache key. Order is
+  semantically significant. Add `permutation_average`, video (2 fps, 4–32
+  frames, 16K cap), assets/questions images, per-question
+  `max_length_exceeded` (d3-turbo) vs whole-request `LengthError` (pplx), and
+  usage accounting.
+- API: keep `/v1/decide` for JEV; add `/v1/systemone` as a pinned conformance
+  clone (record fixtures from vLLM main; do not hand-write the schema);
+  `/v1/models` metadata; startup golden self-test; LiteLLM routes per model id.
 
-Three tiers:
+## 7. Cache
 
-| Tier | Key | Contents |
+| Mask | Per-question cache | State/prefix cache |
 |---|---|---|
-| Decision LRU | program hash, prompt/token hash, image hash, pos-id hash, options, T, **mask mode** | decisions/readouts |
-| Prefix (KV+GDN) | program hash, prefix tokens, image hash, pos ids | paged KV blocks + frozen GDN state + conv tails |
-| Image encoder | image hash + tower hash | visual embeddings |
+| Causal JEV | — | valid (not needed) |
+| Full AutoTrust/d3 | valid (one question per forward) | **invalid** (state depends on the question) |
+| Full pplx | **never** (all tokens see all questions) | invalid past layer 2 (~5%, not worth it) |
+| BlockCascade d3-turbo | valid for text/state-media | **valid** (state rows never see questions); not for assets/Box/track |
 
-Feasibility by mask:
-
-- **PrefixBidir (AutoTrust, d3-turbo): yes**, all layers. Prefix rows never
-  attend to the suffix; the 16 full-attention K/V and the 48 GDN states depend
-  only on the prefix.
-- **Full (d3, pplx): effectively no.** From the first full-attention layer,
-  every prefix row depends on the question; only layers 0–2 are reusable (~5%).
-- **Blocks/shared: yes** for the shared span, if the shared rows do not see the
-  questions.
-
-Costs on this model: 64 KB/token full-attention K/V (16 layers × 4 heads × 256
-× 2 × 2 B); GDN state ~151 MB fixed per prefix entry (48 layers × 48 heads ×
-128² × 4 B) plus the conv tail. GPU1 has ~1.5 GB headroom; use a host-RAM LRU
-(122 GB) and restore over PCIe; a 4K prefix is ~400 MB (~60 ms restore vs
-~900 ms recompute).
-
-State-once (d3-turbo): prefix stage produces shared KV blocks + frozen GDN
-state; fork with shared page tables and `state_mode = shared_ro`; query stage
-uses `prefix_lm` with the cached prefix. Never duplicate the prefix KV; never
-fork the GDN state; copy-on-write per row only for the short query recurrence.
-Batch 64 rows (raise the cap from 8; tail KV is ~168 MB).
-
-Joint cache scope: pplx's markers may attend to all questions; if so, a
-question's answer depends on the whole set and per-question cache entries are
-invalid. The IR declares `cache_scope: PerSite | PerStage`; settle the semantics
-from the reference code before P3, and include question order in the key.
-
-Batching: ragged/varlen FlashInfer; group jobs by mask class + head; CUDA
-graphs bucketed by total tokens (128/256/512/1K/2K) with ragged metadata in
-fixed device buffers; cascade (d3-flash/edge → full) only after per-model margin
-calibration.
+pplx caches whole chunks keyed on exact tokens/images/`max_length` and order.
+d3-turbo state cache: paged KV + frozen GDN state + conv tails; fork with shared
+page tables + per-row transient state copies; question blocks all bidirectional.
+Costs: 64 KB/token full-attention K/V; GDN state ~151 MB/entry; host-RAM LRU,
+restore ~60 ms/4K prefix vs ~900 ms recompute. Never duplicate the prefix KV.
 
 ## 8. Quantization
 
-- The four targets are Qwen3.8-27B; on the 4090 only W4A16/W4A8 fit (FP8 27B
-  is ~27 GB). JEV's W4A8 g128 recipe is the starting point; the readout stays
-  BF16/F32.
-- **Recalibrate AWQ/GPTQ under each model's real mask.** The AutoTrust
-  calibration ran causal prompts; bidirectional models have different
-  activation statistics. A causal-calibrated W4A8 on a bidirectional model is
-  silently off-distribution.
-- Validate per family at 255-way with margin histograms and flip rates, not
-  top-1 agreement alone. The 24-way JEV margin (0.0176) is not evidence for
-  255-way.
-- Keep the JEV production artifact and gates unchanged; add per-family gates.
+- On the 4090 only W4A16/W4A8 fit (FP8 27B is ~27 GB). The readout, vision and
+  embeddings stay unquantized.
+- **Recalibrate AWQ/GPTQ under the real mask** using the reference hooks (d3
+  `PromptEncoder`, pplx `enable_noncausal_full_attention`); d3-turbo
+  calibration must include short state-once question blocks.
+- Isolate the **W4A16 asymmetric group-64** path first on AutoTrust — it is not
+  the production g128 JEV path. Validate per family at 255-way with margin
+  histograms/flip rates, not top-1 alone.
 
-## 9. Qwen3.8 / AutoTrust parity program (P0)
+## 9. Parity program (P0)
 
-The layer-63 result is not yet a diagnosis. The four-number probe and ordered
-tests:
+The journaled AutoTrust measurement is **engine vs HF, both causal: KL 6.65e-2,
+top-1 11/16 on 16 rows** — not 0.15, and the mask cannot explain it because both
+sides were causal. Use ≥256 rows.
 
-1. Dump from HF-BF16 and engine for a fixed 512-token text and a fixed image:
-   embedding, hidden at layers 0,1,2,3,7,...,63, `final_norm_out`,
-   `readout_logits`. Report `cos`, `relL2`, `‖a‖/‖b‖`, top divergent channels.
-2. L2-normalize both tensors and re-measure cos. A jump to ≥0.999 indicates a
-   scale/norm or pre/post-norm comparison artifact; ~0.85 indicates a
-   directional (mask/attention) bug.
-3. Compare the engine's final-norm output with HF's post-norm last hidden;
-   compare the engine's layer-63 pre-norm with HF's layer-63 hook directly.
-4. Run the engine with BF16 weights against HF-BF16, both causal; then enable
-   W4 kernels to isolate the quantized kernels; only then enable the mask.
-5. Checks: norm weight mean (≈1.0 plain, ≈0.0 delta ⇒ 1+w); mRoPE unit test at
-   positions 1/100/1000; output gate `silu` vs `sigmoid`; GDN A_log/softplus;
-   first full-attention layer index (3,7,...).
-6. Gates: final KL ≤ 0.01 (target ≤ 3e-3), top-1 ≥ 99.5%, layer-63 cos ≥ 0.999
-   after correct indexing; JEV stays 28/28 and max Δ ≤ 0.0176.
-
-Vision (P4): run the 0.46B tower in a sidecar (HF, fp16, ~1 GB) that returns
-embeddings; splice at image segments with 3-D mRoPE; cache by image hash. Build
-it with the prefix cache, not after. Port natively only if profiles demand it.
+1. **Teacher-forced per-layer parity on CPU** (BF16 27B needs ~52 GB; the 4090
+   cannot hold both): feed HF's captured layer-i input into engine layer i with
+   one layer resident; compare relL2 and norm ratio (**not** L2-normalized cos:
+   cosine is already scale-invariant and that step is a no-op) against the JEV
+   envelope. CPU goldens on the 122 GB host.
+2. Isolate the **g64 asymmetric W4A16** kernel against a BF16 single-layer run;
+   then enable fused kernels one at a time.
+3. Only then compare the HF reference with the correct noncausal hook against
+   the engine with the mask on.
+4. Gates: ≥256 rows, KL ≤ 3e-3, top-1 ≥ 99.5%, JEV still 28/28 and Δ ≤ 0.0176.
 
 ## 10. Benchmarks and gates
 
-Same 4090, same quantized artifact, vLLM main (pinned commit, native
-`/v1/systemone` for d3) versus Decidra. Never compare across vendor GPUs.
+Same 4090, same artifact, vLLM main where it actually runs; verify vLLM main
+loads the W4 d3 artifact on CUDA and that the d3 CUDA path exists (upstream says
+it is unverified). pplx's baseline is the package fast path, not vLLM. Report
+TMAC/s so GPU differences cannot hide.
 
-Per model × {1K, 4K, 16K, 32K} × {c1, c8, 64-question}:
-- decisions/s, p50/p99 time-to-all-decisions, peak VRAM, TMAC/s (normalize the
-  hardware), cache hit/miss and prefix restore-vs-recompute curves;
-- accuracy vs the correct-mask BF16 reference: top-1, max |Δp|, KL, and
-  margin-bucket flip rates, ≥256 held-out rows per family.
-
-Targets:
-
-| Model | Target |
+| Model | Gate |
 |---|---|
-| JEV | hold 28/28, Δ ≤ 0.0176; ≥1.2× vLLM at c1 and c8 |
-| AutoTrust | KL ≤ 0.01 vs correct-mask reference; ≥99.5% top-1; ≥1.2× vLLM |
-| d3 | match vLLM `/v1/systemone` within KL ≤ 0.01; ≥1.2× same-hardware |
-| d3-turbo | 64-question/photo ≤ 0.10× the 64-prefill reference; bit-identical to 64 independent forwards on 200 photos |
-| pplx | joint decisions match reference; 32K; ≥ vLLM fast path normalized |
+| JEV | hold 28/28, Δ ≤ 0.0176; ≥1.2× vLLM c1/c8 |
+| AutoTrust | KL ≤ 3e-3 vs correct-mask reference; ≥99.5% top-1; no state cache |
+| d3 | match vLLM `/v1/systemone` within KL ≤ 0.01 (shape chosen per id) |
+| d3-turbo | text state-once: identical argmax + max\|Δp\| ≤ 1e-3 vs the per-row path in the same engine (not bit-identical: GDN recurrence and Marlin M differ); Box/track multi-site; no state-once for assets/Box/track |
+| pplx | joint decisions match the package; whole-chunk cache; 32K validated |
 
-## 11. Phases and gates
+No free GPU: GPU1 runs JEV production (~21.8 GiB); GPU0 is full. Any 27B test
+requires hot-swapping JEV, and that is the owner's call.
 
-| Phase | Scope | Gate |
+## 11. Phases
+
+| Phase | Work | Gate |
 |---|---|---|
-| P0 Parity | 4-number probe, layer/sublayer dumps, HF hooks; norm/mask/quant isolation; AutoTrust fix | KL ≤ 0.01, layer-63 cos ≥ 0.999, JEV unchanged |
-| P1 Attention | Ragged varlen FlashInfer `{kNone,kCausal}`; PrefixBidir two-pass; GDN `cu_seqlens`/conv tail; mask unit tests | dense fp32 reference per mask; pack isolation; JEV no regression |
-| P2 Adapters/readout | Manifest/IR, ForwardJob, HeadMatrix, postprocess; AutoTrust + d3 single-question | ≥99% top-1, KL ≤ 3e-3 vs reference on 256 rows |
-| P3 Joint/markers | pplx protocol v3, marker readout, cache_scope; last-layer pruning | joint output matches reference; order sensitivity measured |
-| P4 State-once/vision | PrefixBidir cache (VRAM + host), vision sidecar, 3-D mRoPE, image cache | cached vs uncached ≤ 1e-5; image goldens |
-| P5 Perf/quant | CUDA graphs, quant recalibration under the real mask, margin gates | ≥97% of BF16 quality; same-hardware benchmark table |
-| P6 Routing | Margin-calibrated cascade | accuracy cost measured; p99 SLO |
-
-Sequencing warning: P1 before P2; P0 before P4. Building state-once on a broken
-mask attributes mask errors to the cache.
+| P0 | CPU teacher-forced layer goldens; g64 kernel isolation; AutoTrust causal-vs-causal; then correct-mask comparison | KL ≤ 3e-3; JEV unchanged |
+| P1 | ragged FlashInfer `{kNone,kCausal}` + LSE; GDN initial/final state + conv tail; BlockCascade merge; mask unit tests | dense fp32 reference per mask; pack isolation; JEV no regression |
+| P2 | AutoTrust/d3 text adapters, per-model post-processing, F32/bf16 heads, golden fixtures (package + vLLM) | ≥99.5% top-1, KL ≤ 3e-3 on 256 rows |
+| P3 | pplx joint (markers, escaping, numbering, bisection, whole-chunk cache); d3-turbo text-only state-once | joint reference match; state-once argmax/Δp gate |
+| P4 | vision sidecar, 3-D mRoPE, images in options, Box/track multi-site + QMC/calibration, video | image/box/track goldens |
+| P5 | quant recalibration under the real mask; CUDA graphs; same-hardware benchmarks | ≥97% BF16 quality; benchmark table |
+| P6 | margin-calibrated cascade | accuracy cost measured |
 
 ## 12. Risks and open questions
 
-Risks: mask semantics silently differ from training (critical); GDN conv tail
-dropped (critical); 24 GB cannot serve 131K/262K (high; gate at 32K); 255-way
-W4A8 accuracy erodes while 24-way passes (high; margin gates); quant calibrated
-under the wrong mask (high); one 27B per GPU (~21.6 GB, 1.5 GB headroom; several
-families need several GPUs or hot-swap); GPU1 is production (P0 runs need the
-tenant stopped); `/v1/systemone` schema drift (pin + fixtures); vision absent
-(high for d3-turbo/pplx); cascade drift (margin calibration only).
+Risks: mask semantics (critical); g64 kernel path (high); conv tail/state seeding
+(critical); Full attention 2× cost and 24 GB limits (high); 255-way quant
+margins (high); pplx order/whole-chunk cache (high); one 27B per GPU / no free
+GPU (high); vLLM W4 CUDA unverified (med); vision (high); cascade drift (med).
 
-Open questions to settle before P2/P3:
-1. AutoTrust KL 0.15: mask, final-norm comparison, quant kernel, or modeling
-   difference (P0 answers).
-2. Do the 16 full-attention layers include layer 3,7,...,63? (Yes per config;
-   confirm the first cliff.)
-3. pplx markers: do later questions attend to earlier ones? `Full` vs `Blocks`;
-   cache scope.
-4. GDN chunked-parallel or serial today? If serial, largest remaining kernel
-   win.
-5. d3/d3-turbo weight shards hash-identical? If yes, one resident weight set.
-6. d3-flash/edge are not in the target list; treat them as candidate cascade
-   models, not supported ids yet.
-7. Box/track: settle the postprocess spec from the d3-turbo code before P4.
+Resolved: full layers are 3,7,...,63; pplx per-question caching is never valid;
+d3/d3-turbo weight sharing is unlikely (verify hashes); pplx readout sites come
+from `joint_config`, not `pooling`; GDN state seeding is required.
+
+Open: d3 answer shape (package vs vLLM); d3/d3-turbo manifest hash comparison;
+GDN chunked vs serial implementation; the exact vLLM CUDA/W4 d3 support; Box
+calibration/`track` window details; whether the 32K cap is acceptable for pplx
+answers (bisection changes them).
 
 ## 13. Sources and consultations
 
-- HF model cards/configs/custom code: `vllm-sr/d3-turbo`, `vllm-sr/d3`,
-  `vllm-sr/d3-flash`, `vllm-sr/d3-edge`, `perplexity-ai/pplx-decider-v1.2`,
+- Checkpoints and cards: `vllm-sr/d3`, `vllm-sr/d3-turbo`, `vllm-sr/d3-flash`,
+  `vllm-sr/d3-edge`, `perplexity-ai/pplx-decider-v1.2`,
   `pplx-decider-flash-v1.2`, `pplx-decider-v1.1-27b`,
   `autotrust/AutoTrust-JEV-27B-v1.1`.
-- vLLM PR #61565 (d3 `/v1/systemone`), vLLM SR Engine docs, decision.vllm-sr.ai
-  API docs, pplx `source/src/pplx_decider` reference/fast paths.
-- Engine code: `native/src/engine.rs`, `native/src/flashinfer.rs`,
-  `third_party/flashinfer/fi_prefill.cu`, `native/src/kernels.cu`,
-  `native/src/weights.rs`, `native/src/config.rs`; `docs/JOURNAL.md`.
-- Consultations: the requested `codex`/`gpt-astra` and `opus-5.5` were not
-  available in this environment (`codex` not installed; Claude rejected the
-  model id `opus-5.5`). Reviews were obtained from the harness's default
-  completion model (`/tmp/consult-harness.md`) and the available Claude Code
-  `opus` alias, which read the engine sources (`/tmp/consult-opus.md`). The
-  reviews agree on the ranking: mask/parity first, models as data, then
-  state-once/joint/option-only, then perf. Vendor throughput claims must be
-  reproduced on the same 4090 before they are used as baselines.
+- vLLM PR #61565, vLLM SR Engine docs, decision.vllm-sr.ai API docs, pplx
+  `source/src/pplx_decider`.
+- Engine: `native/src/engine.rs`, `native/src/kernels.cu`, `native/src/config.rs`,
+  `native/third_party/flashinfer/fi_prefill.cu`; `docs/JOURNAL.md`.
+- Consultations: Claude Code CLI `claude-opus-5-5` reviewed this spec and the
+  checkpoint code (`/tmp/consult-opus2.md`); its C1–C7 corrections are
+  incorporated. A second harness-model review is in `/tmp/consult-harness.md`.
+  The `codex`/`gpt-astra` CLI is not installed on this host. Vendor throughput
+  claims must be reproduced on the same 4090.
