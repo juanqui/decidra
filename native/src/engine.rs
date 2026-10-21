@@ -311,6 +311,9 @@ pub struct Engine {
     pub cfg: Config,
     /// Full-attention layers run noncausally (AutoTrust/d3/d3-turbo/pplx).
     pub noncausal_full: bool,
+    /// Separate decision head (`readout.safetensors`) for checkpoints without a
+    /// full lm_head (d3/d3-turbo/pplx). JEV/AutoTrust use lm_head rows instead.
+    readout: Option<HeadMatrix>,
     pub store: Store,
     pub kernels: Kernels,
     /// Resident weights. Populated lazily by the CLI layer tests (merged BF16 is
@@ -454,6 +457,46 @@ impl BatchInfo {
     }
 }
 
+pub struct HeadMatrix {
+    weight: CudaSlice<bf16>,
+    rows: usize,
+    hidden: usize,
+}
+
+impl HeadMatrix {
+    /// Load a separate `[K, hidden]` decision head (d3/d3-turbo F32, pplx BF16).
+    fn load(gpu: &Gpu, path: &std::path::Path) -> Result<Self> {
+        let bytes =
+            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let st = safetensors::SafeTensors::deserialize(&bytes)
+            .with_context(|| format!("parsing {}", path.display()))?;
+        let w = st.tensor("weight").context("readout.weight")?;
+        let shape = w.shape();
+        if shape.len() != 2 {
+            bail!("readout.weight must be 2-D, got {shape:?}");
+        }
+        let (rows, hidden) = (shape[0], shape[1]);
+        let data = w.data();
+        let host: Vec<bf16> = match w.dtype() {
+            safetensors::Dtype::F32 => data
+                .chunks_exact(4)
+                .map(|b| bf16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                .collect(),
+            safetensors::Dtype::BF16 => data
+                .chunks_exact(2)
+                .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+                .collect(),
+            other => bail!("readout.weight dtype {other:?} unsupported"),
+        };
+        if host.len() != rows * hidden {
+            bail!("readout.weight has {} values, expected {rows}x{hidden}", host.len());
+        }
+        let mut weight = gpu.stream.alloc_zeros::<bf16>(rows * hidden)?;
+        gpu.stream.memcpy_htod(&host, &mut weight)?;
+        Ok(Self { weight, rows, hidden })
+    }
+}
+
 impl Engine {
     pub fn new(model_dir: &std::path::Path) -> Result<Self> {
         let cfg = Config::from_dir(model_dir)?;
@@ -471,10 +514,20 @@ impl Engine {
             .unwrap_or(1024usize);
         let weight_cache = Mutex::new(vec![None; cfg.num_hidden_layers]);
         let noncausal_full = cfg.noncausal_full;
+        let readout_path = model_dir.join("readout.safetensors");
+        let readout = if readout_path.exists() {
+            Some(
+                HeadMatrix::load(&gpu, &readout_path)
+                    .with_context(|| format!("loading {}", readout_path.display()))?,
+            )
+        } else {
+            None
+        };
         let mut engine = Self {
             gpu,
             cfg,
             noncausal_full,
+            readout,
             store,
             kernels,
             weight_cache,
@@ -3039,9 +3092,35 @@ impl Engine {
         self.forward(tokens, last, Stage::FinalNorm, true)
     }
 
-    /// Full forward + final norm + lm_head rows for `head_ids`, at the last
-    /// position. `head_ids` are the decision head's verbalizer token ids.
+    /// Full forward + final norm + lm_head rows (or the separate readout head
+    /// for d3/d3-turbo/pplx) for `head_ids`, at the last position.
     pub fn decision_logits(&self, tokens: &[u32], head_ids: &[u32]) -> Result<Vec<f32>> {
+        if let Some(head) = &self.readout {
+            if head_ids.iter().any(|id| *id as usize >= head.rows) {
+                bail!(
+                    "readout head id out of range (head has {} rows)",
+                    head.rows
+                );
+            }
+            let hidden = self.forward_last_hidden(tokens)?;
+            if hidden.len() != head.hidden {
+                bail!(
+                    "readout expects hidden {}, got {}",
+                    head.hidden,
+                    hidden.len()
+                );
+            }
+            let host: Vec<bf16> = hidden.iter().map(|v| bf16::from_f32(*v)).collect();
+            let mut x = self.alloc_bf16(hidden.len())?;
+            self.gpu.stream.memcpy_htod(&host, &mut *x)?;
+            let mut out = self.alloc_bf16(head.rows)?;
+            self.blas_gemm_bf16(&x, 1, head.hidden, &head.weight, head.rows, &mut out)?;
+            let values = self.to_f32(&out, head.rows)?;
+            return Ok(head_ids
+                .iter()
+                .map(|id| values[*id as usize])
+                .collect());
+        }
         self.set_logits_opts(Some(head_ids.to_vec()), false);
         let last = self.cfg.num_hidden_layers.saturating_sub(1) as isize;
         self.forward(tokens, last, Stage::Logits, true)
