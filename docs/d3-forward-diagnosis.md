@@ -27,3 +27,24 @@ Evidence files: `/tmp/d3_engine_hidden.json`, `/tmp/d3_hf_hidden.json`,
 
 The next step is a per-layer hidden comparison (engine vs HF) to find the first layer
 where the cosine collapses, then inspect that layer's weight load and mask.
+
+## Per-layer teacher-forced result (first probe row)
+
+Inputs are the HF backbone's layer inputs; the engine runs one layer with the split path.
+
+| layer | relL2 vs HF next-layer input | cosine |
+|---|---|---|
+| 0 | 16.57 | 0.0015 |
+| 1 | 18.30 | 0.0002 |
+| 2 | 21.43 | 0.0003 |
+| 3 | 14.16 | -0.0005 |
+| 7 | 11.05 | -0.0001 |
+| 15 | 11.77 | 0.0004 |
+| 31 | 13.41 | 0.0014 |
+| 47 | 5.01 | -0.0015 |
+
+The collapse is at **layer 0**: the engine's first GDN layer output is already
+uncorrelated with the HF's. AutoTrust's identical layer 0 passes at 1.5–4.5%, so this is
+not the GDN kernel in general. The difference is the d3 checkpoint's key layout
+(`model.layers.*` vs AutoTrust's `model.language_model.layers.*`) or the per-module W4A8
+scheme attached to those names; both must be verified against the checkpoint.

@@ -46,9 +46,14 @@ fn autotrust_teacher_forced_layers() {
             .iter()
             .map(|v| v.as_f64().expect("f32") as f32)
             .collect();
-        let output = engine
-            .forward_hidden(&input, seq, layer as isize, Stage::Layer, false)
-            .expect("layer forward");
+        let output = match hf.get("split").and_then(|v| v.as_u64()) {
+            Some(split) => engine
+                .forward_split(&tokens, split as usize, layer as isize, Stage::Layer, false)
+                .expect("layer forward"),
+            None => engine
+                .forward_hidden(&input, seq, layer as isize, Stage::Layer, false)
+                .expect("layer forward"),
+        };
         println!("layer {layer}: {} values", output.len());
         layers.insert(layer.to_string(), serde_json::json!(output));
     }
@@ -58,12 +63,21 @@ fn autotrust_teacher_forced_layers() {
         .iter()
         .map(|v| v.as_f64().expect("f32") as f32)
         .collect();
-    let final_norm = engine
-        .forward_hidden(&last_input, seq, 63, Stage::FinalNorm, false)
-        .expect("final norm");
-    let readout = engine
-        .decision_logits(&tokens, &codes)
-        .expect("readout logits");
+    let split = hf.get("split").and_then(|v| v.as_u64()).map(|v| v as usize);
+    let final_norm = match split {
+        Some(split) => engine
+            .forward_split(&tokens, split, 63, Stage::FinalNorm, true)
+            .expect("final norm"),
+        None => engine
+            .forward_hidden(&last_input, seq, 63, Stage::FinalNorm, false)
+            .expect("final norm"),
+    };
+    let readout = match split {
+        Some(split) => engine
+            .decision_logits_split(&tokens, split, &codes)
+            .expect("readout logits"),
+        None => engine.decision_logits(&tokens, &codes).expect("readout logits"),
+    };
     let doc = serde_json::json!({
         "layers": layers,
         "final_norm": final_norm,
