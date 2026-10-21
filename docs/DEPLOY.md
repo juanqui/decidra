@@ -63,7 +63,12 @@ Runtime:
 - NVIDIA driver exposing `libcuda.so.1`.
 - `libcublas.so.13` and `libcublasLt.so.13`. Set `DECIDRA_CUDA_LIBS` if they are not on the
   loader path.
-- RTX 4090 / sm_89.
+- RTX 4090 or L40S / sm_89. L40S: 46 GiB usable, 48 GB SKU; use
+  `DECIDRA_NATIVE_GPU_EMBED=true` if the extra 2.4 GiB is available. See
+  [`L40S.md`](L40S.md) for the 4090 comparison and 64K-context results.
+- H100 SXM / sm_90: build with `DECIDRA_CUDA_ARCH=sm_90`; on a CUDA 12.4 driver
+  use cudarc feature `cuda-12040`. Current kernels are SM89-tuned and run at
+  roughly 4090 throughput; 122K context verified. See [`H100.md`](H100.md).
 - ~13.1 GiB free VRAM for Marlin's resident repacked weights plus workspace; peak is
   **18.86 GiB at 16K** and **19.09 GiB at 32K** (24 GB card, ~4.4 GiB headroom).
 - Marlin + tiled FA2 + gated split GDN full-forward latency: 1K **488 ms**, 4K

@@ -10,7 +10,7 @@ use cudarc::driver::sys::CUevent_flags;
 use cudarc::driver::{CudaEvent, CudaSlice};
 use half::bf16;
 
-use crate::config::Config;
+use crate::config::{AttentionMode, Config};
 use crate::cuda::Gpu;
 use crate::kernels::{self, Kernels};
 use crate::tensor::Store;
@@ -372,10 +372,13 @@ pub struct Engine {
     /// Warp-per-query attention (fast for long contexts); the original block
     /// kernel remains selectable.
     warp_attention: AtomicBool,
-    /// Vendored FlashInfer FA2 prefill (single-request, hd256, 24Q/4KV).
+    /// Vendored FlashInfer prefill (FA2, plus optional SM90a FA3).
     flashinfer: Option<Arc<crate::flashinfer::FlashInfer>>,
     flashinfer_enabled: AtomicBool,
     flashinfer_min_seq: std::sync::atomic::AtomicUsize,
+    /// Use the Hopper FA3 prefill when the device supports it.
+    flashinfer_fa3: AtomicBool,
+    flashinfer_fa3_min_seq: std::sync::atomic::AtomicUsize,
     prof: Prof,
     cpu_prof: CpuProf,
     gdn_prof: Mutex<GdnProf>,
@@ -404,12 +407,102 @@ const _: fn() = || {
     assert_send::<Engine>();
 };
 
+/// Bit-packed `[seq, seq]` block-cascade visibility: state queries see only
+/// the state, question queries see the whole row. Bit `j` of byte `i*seq/8`.
+fn block_cascade_mask(seq: usize, split: usize) -> Result<Vec<u8>> {
+    if split == 0 || split >= seq {
+        bail!("block split {split} out of range for {seq} tokens");
+    }
+    let bits = seq
+        .checked_mul(seq)
+        .context("block mask is too large")?;
+    let mut mask = vec![0u8; bits.div_ceil(8)];
+    for q in 0..seq {
+        let end = if q < split { split } else { seq };
+        for k in 0..end {
+            let bit = q * seq + k;
+            mask[bit / 8] |= 1 << (bit % 8);
+        }
+    }
+    Ok(mask)
+}
+
+/// Per-layer inputs/outputs for a state-once pass.
+///
+/// Every field is optional so the ordinary prefill path passes an empty
+/// `LayerIo`. A state pass fills `k_out`/`v_out` and `gdn_state_out`/
+/// `gdn_hist_out`; a question pass fills `cascade`, `gdn_seed` and `gdn_hist`.
+#[derive(Default)]
+struct LayerIo<'a> {
+    k_out: Option<&'a mut CudaSlice<bf16>>,
+    v_out: Option<&'a mut CudaSlice<bf16>>,
+    gdn_seed: Option<&'a CudaSlice<f32>>,
+    gdn_hist: Option<&'a CudaSlice<bf16>>,
+    gdn_state_out: Option<&'a mut CudaSlice<f32>>,
+    gdn_hist_out: Option<&'a mut CudaSlice<bf16>>,
+    cascade: Option<&'a StateCache>,
+    cascade_layer: Option<usize>,
+    /// Bit-packed `[seq, seq]` block mask, built once per per-row forward.
+    custom_mask: Option<&'a CudaSlice<u8>>,
+}
+
+/// A d3-turbo state block, encoded once and forked by every question.
+///
+/// Full-attention layers store post-RoPE K/V (`[state_len, kv_heads, head_dim]`
+/// each); Gated DeltaNet layers store their final f32 recurrent state and the
+/// last three pre-convolution `in_proj_qkv` rows. This is the block-cascade
+/// invariant: no state token ever sees a question.
+pub struct StateCache {
+    pub state_len: usize,
+    kv: Vec<Option<(CudaSlice<bf16>, CudaSlice<bf16>)>>,
+    gdn_state: Vec<Option<CudaSlice<f32>>>,
+    gdn_hist: Vec<Option<CudaSlice<bf16>>>,
+}
+
+impl StateCache {
+    pub fn state_tokens(&self) -> usize {
+        self.state_len
+    }
+
+    /// Diagnostic: zero one GDN layer's recurrent seed. A correct state-once
+    /// answer must change; the negative-control test asserts that it does.
+    pub fn zero_gdn_state(&mut self, layer: usize) -> Result<()> {
+        let state = self
+            .gdn_state
+            .get_mut(layer)
+            .and_then(|entry| entry.as_mut())
+            .context("state cache has no GDN state for that layer")?;
+        Self::zero(state)
+    }
+
+    /// Diagnostic: zero one GDN layer's convolution tail.
+    pub fn zero_gdn_hist(&mut self, layer: usize) -> Result<()> {
+        let hist = self
+            .gdn_hist
+            .get_mut(layer)
+            .and_then(|entry| entry.as_mut())
+            .context("state cache has no convolution tail for that layer")?;
+        Self::zero(hist)
+    }
+
+    fn zero<T: cudarc::driver::DeviceRepr + cudarc::driver::ValidAsZeroBits>(
+        x: &mut CudaSlice<T>,
+    ) -> Result<()> {
+        let stream = x.stream().clone();
+        stream.memset_zeros(x)?;
+        Ok(())
+    }
+}
+
 /// Flattened multi-sequence batch: sequences are row ranges
 /// `[offsets[s], offsets[s] + lens[s])` of one `[total, ...]` buffer.
 struct BatchInfo {
     offsets: Vec<usize>,
     lens: Vec<usize>,
     total: usize,
+    /// First RoPE position of every row (state-once question passes start
+    /// after the state block; ordinary prefills start at zero).
+    pos_start: usize,
     offsets_dev: CudaSlice<i32>,
     lens_dev: CudaSlice<i32>,
 }
@@ -436,6 +529,7 @@ impl BatchInfo {
             offsets,
             lens,
             total,
+            pos_start: 0,
             offsets_dev: gpu.stream.clone_htod(&off_i)?,
             lens_dev: gpu.stream.clone_htod(&len_i)?,
         })
@@ -450,7 +544,7 @@ impl BatchInfo {
         let mut pos = Vec::with_capacity(self.total);
         for s in 0..self.batch() {
             for t in 0..self.lens[s] {
-                pos.push(t);
+                pos.push(self.pos_start + t);
             }
         }
         pos
@@ -458,7 +552,9 @@ impl BatchInfo {
 }
 
 pub struct HeadMatrix {
-    weight: CudaSlice<bf16>,
+    /// Kept in F32: the d3/d3-turbo reference computes `hidden.float() @
+    /// weight.T` in F32, and a BF16 head rounds logits by 0.03-0.06.
+    weight: CudaSlice<f32>,
     rows: usize,
     hidden: usize,
 }
@@ -466,8 +562,7 @@ pub struct HeadMatrix {
 impl HeadMatrix {
     /// Load a separate `[K, hidden]` decision head (d3/d3-turbo F32, pplx BF16).
     fn load(gpu: &Gpu, path: &std::path::Path) -> Result<Self> {
-        let bytes =
-            std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
+        let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let st = safetensors::SafeTensors::deserialize(&bytes)
             .with_context(|| format!("parsing {}", path.display()))?;
         let w = st.tensor("weight").context("readout.weight")?;
@@ -477,23 +572,30 @@ impl HeadMatrix {
         }
         let (rows, hidden) = (shape[0], shape[1]);
         let data = w.data();
-        let host: Vec<bf16> = match w.dtype() {
+        let host: Vec<f32> = match w.dtype() {
             safetensors::Dtype::F32 => data
                 .chunks_exact(4)
-                .map(|b| bf16::from_f32(f32::from_le_bytes([b[0], b[1], b[2], b[3]])))
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect(),
             safetensors::Dtype::BF16 => data
                 .chunks_exact(2)
-                .map(|b| bf16::from_bits(u16::from_le_bytes([b[0], b[1]])))
+                .map(|b| f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16))
                 .collect(),
             other => bail!("readout.weight dtype {other:?} unsupported"),
         };
         if host.len() != rows * hidden {
-            bail!("readout.weight has {} values, expected {rows}x{hidden}", host.len());
+            bail!(
+                "readout.weight has {} values, expected {rows}x{hidden}",
+                host.len()
+            );
         }
-        let mut weight = gpu.stream.alloc_zeros::<bf16>(rows * hidden)?;
+        let mut weight = gpu.stream.alloc_zeros::<f32>(rows * hidden)?;
         gpu.stream.memcpy_htod(&host, &mut weight)?;
-        Ok(Self { weight, rows, hidden })
+        Ok(Self {
+            weight,
+            rows,
+            hidden,
+        })
     }
 }
 
@@ -508,10 +610,34 @@ impl Engine {
             && std::env::var("DECIDRA_FLASHINFER_ATTENTION")
                 .map(|v| v != "0")
                 .unwrap_or(true);
+        if cfg.attention_mode != AttentionMode::Causal && !flashinfer_enabled {
+            bail!(
+                "{} attention requires the vendored FlashInfer library; \
+                 refusing to fall back to the causal native kernels",
+                match cfg.attention_mode {
+                    AttentionMode::Full => "non-causal full",
+                    AttentionMode::BlockCascade => "block-cascade",
+                    AttentionMode::Causal => unreachable!(),
+                }
+            );
+        }
         let flashinfer_min_seq = std::env::var("DECIDRA_FLASHINFER_MIN_SEQ")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1024usize);
+        let sm90 = gpu
+            .compute_capability()
+            .map(|(major, _)| major >= 9)
+            .unwrap_or(false);
+        let fa3_available = sm90 && flashinfer.as_ref().is_some_and(|f| f.has_fa3());
+        let flashinfer_fa3 = fa3_available
+            && std::env::var("DECIDRA_FLASHINFER_FA3")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        let flashinfer_fa3_min_seq = std::env::var("DECIDRA_FLASHINFER_FA3_MIN_SEQ")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(flashinfer_min_seq);
         let weight_cache = Mutex::new(vec![None; cfg.num_hidden_layers]);
         let noncausal_full = cfg.noncausal_full;
         let readout_path = model_dir.join("readout.safetensors");
@@ -566,6 +692,8 @@ impl Engine {
             flashinfer,
             flashinfer_enabled: AtomicBool::new(flashinfer_enabled),
             flashinfer_min_seq: std::sync::atomic::AtomicUsize::new(flashinfer_min_seq),
+            flashinfer_fa3: AtomicBool::new(flashinfer_fa3),
+            flashinfer_fa3_min_seq: std::sync::atomic::AtomicUsize::new(flashinfer_fa3_min_seq),
             prof: Prof::new(),
             cpu_prof: CpuProf::new(),
             gdn_prof: Mutex::new(GdnProf::default()),
@@ -670,7 +798,7 @@ impl Engine {
     ) -> Option<&crate::flashinfer::FlashInfer> {
         // Noncausal models must never fall through to the causal-only native
         // kernels; the FlashInfer minimum sequence guard is for the causal path.
-        let min_seq = if self.noncausal_full {
+        let min_seq = if self.cfg.attention_mode != AttentionMode::Causal {
             0
         } else {
             self.flashinfer_min_seq.load(Ordering::Relaxed)
@@ -1101,7 +1229,37 @@ impl Engine {
     ) -> Result<Vec<f32>> {
         self.prof.entries.lock().unwrap().clear();
         let x = timed!(self, "embed", self.embed(tokens)?);
-        self.forward_dev(x, tokens.len(), 0, layer, stage, last_only)
+        self.forward_dev(x, tokens.len(), 0, layer, stage, last_only, None)
+    }
+
+    /// Single-sequence forward under the d3-turbo block-cascade mask: the
+    /// first `split` tokens are the state block (bidirectional within itself)
+    /// and every later token sees the whole row. Used as the per-row reference
+    /// for the state-once program.
+    pub fn forward_split(
+        &self,
+        tokens: &[u32],
+        split: usize,
+        layer: isize,
+        stage: Stage,
+        last_only: bool,
+    ) -> Result<Vec<f32>> {
+        if split == 0 || split >= tokens.len() {
+            bail!(
+                "block split {split} out of range for {} tokens",
+                tokens.len()
+            );
+        }
+        let x = timed!(self, "embed", self.embed(tokens)?);
+        self.forward_dev(
+            x,
+            tokens.len(),
+            0,
+            layer,
+            stage,
+            last_only,
+            Some(split),
+        )
     }
 
     /// Continue from an externally supplied hidden state (f32, `[seq, hidden]`).
@@ -1129,7 +1287,7 @@ impl Engine {
             bail!("--input requires --layer >= 0");
         }
         self.prof.entries.lock().unwrap().clear();
-        self.forward_dev(x, seq, layer as usize, layer, stage, last_only)
+        self.forward_dev(x, seq, layer as usize, layer, stage, last_only, None)
     }
 
     fn forward_dev(
@@ -1140,6 +1298,7 @@ impl Engine {
         layer: isize,
         stage: Stage,
         last_only: bool,
+        split: Option<usize>,
     ) -> Result<Vec<f32>> {
         if stage == Stage::Embed || layer < 0 {
             return self.to_f32(&x, seq * self.cfg.hidden_size);
@@ -1161,11 +1320,24 @@ impl Engine {
             self.f32_pool.free.lock().unwrap().clear();
         }
         let mut x = x;
+        let custom_mask = match split {
+            Some(split) => Some(
+                self.gpu
+                    .stream
+                    .clone_htod(&block_cascade_mask(seq, split)?)?,
+            ),
+            None => None,
+        };
+        let mut io = LayerIo {
+            custom_mask: custom_mask.as_ref(),
+            ..LayerIo::default()
+        };
         for i in start..=last {
             let w = timed!(self, "weights", self.layer_weights(i)?);
             let mut captured = None;
             self.dump_dev("00_layer_input", &x, seq, self.cfg.hidden_size)?;
-            let next = self.run_layer(&x, seq, &w, i == last, stage, &mut captured)?;
+            let next =
+                self.run_layer(&x, seq, &w, i == last, stage, &mut captured, split, &mut io)?;
             if i == last {
                 self.dump_dev("06_layer_output", &next, seq, self.cfg.hidden_size)?;
             }
@@ -1329,15 +1501,22 @@ impl Engine {
             self.f32_pool.free.lock().unwrap().clear();
         }
         let mut x = timed!(self, "embed", self.embed(&flat)?);
+        let mut io = LayerIo::default();
         for i in 0..self.cfg.num_hidden_layers {
             let w = self.layer_weights(i)?;
-            x = self.run_layer_batch(&x, &b, &w)?;
+            x = self.run_layer_batch(&x, &b, &w, &mut io)?;
         }
         let h = self.final_norm_rows(&x, total)?;
         Ok((h, b))
     }
 
-    fn run_layer_batch(&self, x: &CudaSlice<bf16>, b: &BatchInfo, w: &LayerWeights) -> Result<Buf> {
+    fn run_layer_batch(
+        &self,
+        x: &CudaSlice<bf16>,
+        b: &BatchInfo,
+        w: &LayerWeights,
+        io: &mut LayerIo<'_>,
+    ) -> Result<Buf> {
         let hidden = self.cfg.hidden_size;
         let total = b.total;
         let mut h = self.alloc_bf16(total * hidden)?;
@@ -1357,8 +1536,8 @@ impl Engine {
             )?
         );
         let mix = match &w.mixer {
-            MixerWeights::Full(a) => self.full_attention_batch(&h, b, a)?,
-            MixerWeights::Gdn(a) => self.gdn_batch(&h, b, a)?,
+            MixerWeights::Full(a) => self.full_attention_batch(&h, b, a, io)?,
+            MixerWeights::Gdn(a) => self.gdn_batch(&h, b, a, io)?,
         };
         let mut x1 = self.alloc_bf16(total * hidden)?;
         timed!(
@@ -1411,6 +1590,7 @@ impl Engine {
         h: &CudaSlice<bf16>,
         b: &BatchInfo,
         w: &FullAttentionWeights,
+        io: &mut LayerIo<'_>,
     ) -> Result<Buf> {
         let cfg = &self.cfg;
         let (heads, kv, hd) = (
@@ -1505,6 +1685,77 @@ impl Engine {
         // Attention resets at every sequence boundary; one launch per sequence
         // (attention is a small fraction of the forward).
         let mut attn = self.alloc_bf16(total * heads * hd)?;
+        let __attn_t = self.prof_begin("attn");
+        if self.cfg.attention_mode == AttentionMode::BlockCascade
+            && io.cascade.is_none()
+        {
+            bail!("BlockCascade batch attention needs a StateCache");
+        }
+        if let (Some(cache), Some(layer)) = (io.cascade, io.cascade_layer) {
+            let state_len = cache.state_len;
+            let (state_k, state_v) = cache
+                .kv
+                .get(layer)
+                .and_then(|entry| entry.as_ref())
+                .context("state cache has no K/V for a full-attention layer")?;
+            let max_len = b.lens.iter().copied().max().unwrap_or(0);
+            let kv_cap = state_len + max_len;
+            let mut k_all = self.alloc_bf16(kv_cap * kv * hd)?;
+            let mut v_all = self.alloc_bf16(kv_cap * kv * hd)?;
+            {
+                let mut dst = k_all
+                    .try_slice_mut(..state_len * kv * hd)
+                    .context("batch cascade K state view")?;
+                self.gpu.stream.memcpy_dtod(state_k, &mut dst)?;
+            }
+            {
+                let mut dst = v_all
+                    .try_slice_mut(..state_len * kv * hd)
+                    .context("batch cascade V state view")?;
+                self.gpu.stream.memcpy_dtod(state_v, &mut dst)?;
+            }
+            let fi = self
+                .flashinfer_for(kv_cap, hd, heads, kv)
+                .context("cascade attention needs the vendored FlashInfer library")?;
+            for s in 0..b.batch() {
+                let o = b.offsets[s];
+                let l = b.lens[s];
+                let kv_len = state_len + l;
+                {
+                    let src = kn
+                        .try_slice(o * kv * hd..(o + l) * kv * hd)
+                        .context("batch cascade K question view")?;
+                    let mut dst = k_all
+                        .try_slice_mut(state_len * kv * hd..kv_len * kv * hd)
+                        .context("batch cascade K question destination")?;
+                    self.gpu.stream.memcpy_dtod(&src, &mut dst)?;
+                }
+                {
+                    let src = vv
+                        .try_slice(o * kv * hd..(o + l) * kv * hd)
+                        .context("batch cascade V question view")?;
+                    let mut dst = v_all
+                        .try_slice_mut(state_len * kv * hd..kv_len * kv * hd)
+                        .context("batch cascade V question destination")?;
+                    self.gpu.stream.memcpy_dtod(&src, &mut dst)?;
+                }
+                let qv = qn
+                    .try_slice(o * heads * hd..(o + l) * heads * hd)
+                    .context("batch cascade q view")?;
+                let k_view = k_all
+                    .try_slice(..kv_len * kv * hd)
+                    .context("batch cascade k view")?;
+                let v_view = v_all
+                    .try_slice(..kv_len * kv * hd)
+                    .context("batch cascade v view")?;
+                let mut ov = attn
+                    .try_slice_mut(o * heads * hd..(o + l) * heads * hd)
+                    .context("batch cascade out view")?;
+                fi.prefill_ext(&self.gpu, &qv, &k_view, &v_view, &mut ov, l, kv_len)?;
+            }
+            drop(k_all);
+            drop(v_all);
+        } else {
         let scale = 1.0 / (hd as f32).sqrt();
         let tc = match hd {
             64 => Some(&self.kernels.attention_tc_64),
@@ -1515,7 +1766,6 @@ impl Engine {
         let hv = heads * hd;
         let kvv = kv * hd;
         let use_warp = self.warp_attention.load(Ordering::Relaxed);
-        let __attn_t = self.prof_begin("attn");
         for s in 0..b.batch() {
             let o = b.offsets[s];
             let l = b.lens[s];
@@ -1531,18 +1781,31 @@ impl Engine {
             let mut ov = attn
                 .try_slice_mut(o * hv..(o + l) * hv)
                 .context("attention out view")?;
-            let fi = if b.batch() == 1 || self.noncausal_full {
+            let fi = if b.batch() == 1
+                || self.cfg.attention_mode != AttentionMode::Causal
+            {
                 self.flashinfer_for(l, hd, heads, kv)
             } else {
                 None
             };
             if let Some(fi) = fi {
-                if self.noncausal_full {
-                    fi.prefill_noncausal(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+                let use_fa3 = self.flashinfer_fa3.load(Ordering::Relaxed)
+                    && l >= self.flashinfer_fa3_min_seq.load(Ordering::Relaxed);
+                if self.cfg.attention_mode != AttentionMode::Causal {
+                    if use_fa3 {
+                        fi.prefill_noncausal_fa3(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+                    } else {
+                        fi.prefill_noncausal(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+                    }
+                } else if use_fa3 {
+                    fi.prefill_fa3(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
                 } else {
                     fi.prefill(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
                 }
             } else {
+                if self.cfg.attention_mode != AttentionMode::Causal {
+                    bail!("non-causal attention has no FlashInfer fallback");
+                }
                 match (use_warp, tc) {
                     (true, Some(tc)) => kernels::attention_tc(
                         &self.gpu, tc, &qv, &kvw, &vvw, &mut ov, l, heads, kv, hd, scale,
@@ -1562,6 +1825,7 @@ impl Engine {
                     )?,
                 }
             }
+        }
         }
         self.prof_end("attn", __attn_t);
         drop(qn);
@@ -1592,7 +1856,13 @@ impl Engine {
         Ok(timed!(self, "gemm.o", self.gemm(&gated, total, &w.o_proj)?))
     }
 
-    fn gdn_batch(&self, h: &CudaSlice<bf16>, b: &BatchInfo, w: &GdnWeights) -> Result<Buf> {
+    fn gdn_batch(
+        &self,
+        h: &CudaSlice<bf16>,
+        b: &BatchInfo,
+        w: &GdnWeights,
+        io: &mut LayerIo<'_>,
+    ) -> Result<Buf> {
         let cfg = &self.cfg;
         let (nk, nv) = (cfg.linear_num_key_heads, cfg.linear_num_value_heads);
         let (dk, dv) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
@@ -1600,38 +1870,134 @@ impl Engine {
         let total = b.total;
 
         let qkv = timed!(self, "gemm.in_qkv", self.gemm(h, total, &w.in_proj_qkv)?);
-        let mut conv = self.alloc_bf16(total * conv_dim)?;
-        let max_len = b.lens.iter().copied().max().unwrap_or(0);
-        timed!(
-            self,
-            "gdn.conv",
-            if self.conv_tiled.load(Ordering::Relaxed) {
-                kernels::conv1d_silu_tiled_batched(
-                    &self.gpu,
-                    &self.kernels.conv1d_silu_tiled_batched,
-                    &qkv,
-                    &w.conv1d,
-                    &mut conv,
-                    &b.offsets_dev,
-                    &b.lens_dev,
-                    b.batch(),
-                    conv_dim,
-                    max_len,
-                )?
-            } else {
-                kernels::conv1d_silu_batched(
-                    &self.gpu,
-                    &self.kernels.conv1d_silu_batched,
-                    &qkv,
-                    &w.conv1d,
-                    &mut conv,
-                    &b.offsets_dev,
-                    &b.lens_dev,
-                    b.batch(),
-                    conv_dim,
-                )?
+        let cascade = io.cascade.zip(io.cascade_layer);
+        let mut conv = if cascade.is_some() {
+            self.alloc_bf16(0)?
+        } else {
+            self.alloc_bf16(total * conv_dim)?
+        };
+        let mut conv_body = None;
+        if let Some((cache, layer)) = cascade {
+            // Seed every row's 4-token convolution with the state's last three
+            // pre-conv rows. The rows are laid out `[hist; question]` and the
+            // conv runs over the longer segments; the body is then compacted.
+            let hist = cache
+                .gdn_hist
+                .get(layer)
+                .and_then(|entry| entry.as_ref())
+                .context("state cache has no convolution tail for a GDN layer")?;
+            let rows = b.batch();
+            let mut g_offsets = Vec::with_capacity(rows);
+            let mut g_lens = Vec::with_capacity(rows);
+            let mut goff = 0usize;
+            for &l in &b.lens {
+                g_offsets.push(goff as i32);
+                g_lens.push((l + 3) as i32);
+                goff += l + 3;
             }
-        );
+            let g_offsets_dev = self.gpu.stream.clone_htod(&g_offsets)?;
+            let g_lens_dev = self.gpu.stream.clone_htod(&g_lens)?;
+            let mut gapped = self.alloc_bf16(goff * conv_dim)?;
+            for s in 0..rows {
+                let o = b.offsets[s];
+                let l = b.lens[s];
+                let go = g_offsets[s] as usize;
+                {
+                    let mut dst = gapped
+                        .try_slice_mut(go * conv_dim..(go + 3) * conv_dim)
+                        .context("batched conv history destination")?;
+                    self.gpu.stream.memcpy_dtod(hist, &mut dst)?;
+                }
+                {
+                    let src = qkv
+                        .try_slice(o * conv_dim..(o + l) * conv_dim)
+                        .context("batched conv question view")?;
+                    let mut dst = gapped
+                        .try_slice_mut((go + 3) * conv_dim..(go + 3 + l) * conv_dim)
+                        .context("batched conv question destination")?;
+                    self.gpu.stream.memcpy_dtod(&src, &mut dst)?;
+                }
+            }
+            let mut conv_gapped = self.alloc_bf16(goff * conv_dim)?;
+            let max_len = g_lens.iter().copied().max().unwrap_or(0) as usize;
+            timed!(
+                self,
+                "gdn.conv",
+                if self.conv_tiled.load(Ordering::Relaxed) {
+                    kernels::conv1d_silu_tiled_batched(
+                        &self.gpu,
+                        &self.kernels.conv1d_silu_tiled_batched,
+                        &gapped,
+                        &w.conv1d,
+                        &mut conv_gapped,
+                        &g_offsets_dev,
+                        &g_lens_dev,
+                        rows,
+                        conv_dim,
+                        max_len,
+                    )?
+                } else {
+                    kernels::conv1d_silu_batched(
+                        &self.gpu,
+                        &self.kernels.conv1d_silu_batched,
+                        &gapped,
+                        &w.conv1d,
+                        &mut conv_gapped,
+                        &g_offsets_dev,
+                        &g_lens_dev,
+                        rows,
+                        conv_dim,
+                    )?
+                }
+            );
+            let mut body = self.alloc_bf16(total * conv_dim)?;
+            for s in 0..rows {
+                let o = b.offsets[s];
+                let l = b.lens[s];
+                let go = g_offsets[s] as usize;
+                let src = conv_gapped
+                    .try_slice((go + 3) * conv_dim..(go + 3 + l) * conv_dim)
+                    .context("batched conv body view")?;
+                let mut dst = body
+                    .try_slice_mut(o * conv_dim..(o + l) * conv_dim)
+                    .context("batched conv body destination")?;
+                self.gpu.stream.memcpy_dtod(&src, &mut dst)?;
+            }
+            conv_body = Some(body);
+        } else {
+            let max_len = b.lens.iter().copied().max().unwrap_or(0);
+            timed!(
+                self,
+                "gdn.conv",
+                if self.conv_tiled.load(Ordering::Relaxed) {
+                    kernels::conv1d_silu_tiled_batched(
+                        &self.gpu,
+                        &self.kernels.conv1d_silu_tiled_batched,
+                        &qkv,
+                        &w.conv1d,
+                        &mut conv,
+                        &b.offsets_dev,
+                        &b.lens_dev,
+                        b.batch(),
+                        conv_dim,
+                        max_len,
+                    )?
+                } else {
+                    kernels::conv1d_silu_batched(
+                        &self.gpu,
+                        &self.kernels.conv1d_silu_batched,
+                        &qkv,
+                        &w.conv1d,
+                        &mut conv,
+                        &b.offsets_dev,
+                        &b.lens_dev,
+                        b.batch(),
+                        conv_dim,
+                    )?
+                }
+            );
+        }
+        let conv_rows: &CudaSlice<bf16> = conv_body.as_deref().unwrap_or(&conv);
         let z = timed!(self, "gemm.z", self.gemm(h, total, &w.in_proj_z)?);
         let bb = timed!(self, "gemm.b", self.gemm(h, total, &w.in_proj_b)?);
         let aa = timed!(self, "gemm.a", self.gemm(h, total, &w.in_proj_a)?);
@@ -1647,7 +2013,7 @@ impl Engine {
             kernels::gdn_prepare(
                 &self.gpu,
                 &self.kernels.gdn_prepare,
-                &conv,
+                conv_rows,
                 &bb,
                 &aa,
                 &w.a_log,
@@ -1665,11 +2031,27 @@ impl Engine {
             )?
         );
         drop(qkv);
+        drop(conv_body);
         drop(conv);
         drop(bb);
         drop(aa);
 
-        let mut state = self.alloc_f32_zeros(b.batch() * nv * dk * dv)?;
+        let mut state = self.alloc_f32(b.batch() * nv * dk * dv)?;
+        if let Some((cache, layer)) = cascade {
+            let seed = cache
+                .gdn_state
+                .get(layer)
+                .and_then(|entry| entry.as_ref())
+                .context("state cache has no recurrent state for a GDN layer")?;
+            for s in 0..b.batch() {
+                let mut dst = state
+                    .try_slice_mut(s * nv * dk * dv..(s + 1) * nv * dk * dv)
+                    .context("batched GDN state destination")?;
+                self.gpu.stream.memcpy_dtod(seed, &mut dst)?;
+            }
+        } else {
+            self.gpu.stream.memset_zeros(&mut *state)?;
+        }
         let mut core = self.alloc_bf16(total * nv * dv)?;
         let min_seq = self.gdn_split_min_seq.load(Ordering::Relaxed);
         let all_long = b.lens.iter().all(|&l| l >= min_seq);
@@ -1686,8 +2068,10 @@ impl Engine {
         // One batched TF32 launch when every sequence is long enough; mixed
         // batches keep the per-sequence loop so short items stay on the
         // accurate shared recurrence.
-        let all_chunked =
-            chunked_tc && dk == 128 && dv == 128 && b.lens.iter().all(|&l| l >= chunk_min);
+        let all_chunked = chunked_tc
+            && dk == 128
+            && dv == 128
+            && b.lens.iter().all(|&l| l >= chunk_min);
         let dv_chunks = if dv >= 64 {
             self.gdn_chunks.load(Ordering::Relaxed).max(1).min(dv / 16)
         } else {
@@ -1776,7 +2160,11 @@ impl Engine {
                     let mut ov = core
                         .try_slice_mut(o * nv * dv..(o + l) * nv * dv)
                         .context("gdn out view")?;
-                    if (chunked || chunked_tc) && l >= chunk_min && dk == 128 && dv == 128 {
+                    if (chunked || chunked_tc)
+                        && l >= chunk_min
+                        && dk == 128
+                        && dv == 128
+                    {
                         kernels::gdn_chunked(
                             &self.gpu,
                             if chunked_tc {
@@ -1917,6 +2305,37 @@ impl Engine {
         let hidden = self.cfg.hidden_size;
         let total = b.total;
         let mut out: Vec<Vec<f32>> = vec![Vec::new(); tokens.len()];
+        if let Some(head) = &self.readout {
+            if head_ids
+                .iter()
+                .flat_map(|ids| ids.iter())
+                .any(|id| *id as usize >= head.rows)
+            {
+                bail!("readout head id out of range (head has {} rows)", head.rows);
+            }
+            let rows = self.gather_last_rows(&h, &b, hidden)?;
+            let host = self.to_f32(&rows, b.batch() * hidden)?;
+            let x = self.gpu.stream.clone_htod(&host)?;
+            let mut logits = self
+                .gpu
+                .stream
+                .alloc_zeros::<f32>(b.batch() * head.rows)?;
+            self.blas_gemm_f32(
+                &x,
+                b.batch(),
+                hidden,
+                &head.weight,
+                head.rows,
+                &mut logits,
+            )?;
+            let values: Vec<f32> = self.gpu.stream.clone_dtoh(&logits)?;
+            for (i, ids) in head_ids.iter().enumerate() {
+                let row = &values[i * head.rows..(i + 1) * head.rows];
+                out[i] = ids.iter().map(|id| row[*id as usize]).collect();
+            }
+            self.prof_report();
+            return Ok(out);
+        }
         // One head GEMM per distinct id set, always over all flattened rows so
         // a batch of one is bit-identical to the single-item path.
         let mut groups: HashMap<Vec<u32>, Vec<usize>> = HashMap::new();
@@ -1979,6 +2398,8 @@ impl Engine {
         capture: bool,
         stage: Stage,
         captured: &mut Option<Buf>,
+        split: Option<usize>,
+        io: &mut LayerIo<'_>,
     ) -> Result<Buf> {
         let hidden = self.cfg.hidden_size;
         let h = self.alloc_bf16(seq * hidden)?;
@@ -2001,8 +2422,8 @@ impl Engine {
         self.dump_dev("01_input_norm", &h, seq, hidden)?;
 
         let mix = match &w.mixer {
-            MixerWeights::Full(a) => self.full_attention(&h, seq, a, capture)?,
-            MixerWeights::Gdn(a) => self.gdn(&h, seq, a, capture)?,
+            MixerWeights::Full(a) => self.full_attention(&h, seq, a, capture, split, io)?,
+            MixerWeights::Gdn(a) => self.gdn(&h, seq, a, capture, io)?,
         };
         if capture {
             self.dump_dev("02_mixer_out", &mix, seq, hidden)?;
@@ -2161,8 +2582,19 @@ impl Engine {
         seq: usize,
         w: &FullAttentionWeights,
         capture: bool,
+        split: Option<usize>,
+        io: &mut LayerIo<'_>,
     ) -> Result<Buf> {
         let cfg = &self.cfg;
+        if let (Some(cache), Some(layer)) = (io.cascade, io.cascade_layer) {
+            return self.full_attention_cascade(h, seq, w, capture, cache, layer);
+        }
+        if cfg.attention_mode == AttentionMode::BlockCascade
+            && split.is_none()
+            && io.k_out.is_none()
+        {
+            bail!("BlockCascade requires a split, a state capture, or a StateCache");
+        }
         let (heads, kv, hd) = (
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
@@ -2269,16 +2701,52 @@ impl Engine {
             self.dump_dev("attn_q_rope", &qn, seq, heads * hd)?;
             self.dump_dev("attn_k_rope", &kn, seq, kv * hd)?;
         }
+        if let Some(k_out) = io.k_out.as_deref_mut() {
+            if k_out.len() < seq * kv * hd {
+                bail!("state K cache is too small");
+            }
+            self.gpu.stream.memcpy_dtod(&*kn, k_out)?;
+        }
+        if let Some(v_out) = io.v_out.as_deref_mut() {
+            if v_out.len() < seq * kv * hd {
+                bail!("state V cache is too small");
+            }
+            self.gpu.stream.memcpy_dtod(&*vv, v_out)?;
+        }
 
         let mut attn = self.alloc_bf16(seq * heads * hd)?;
         let __attn_t = self.prof_begin("attn");
         if let Some(fi) = self.flashinfer_for(seq, hd, heads, kv) {
-            if self.noncausal_full {
-                fi.prefill_noncausal(&self.gpu, &*qn, &*kn, &*vv, &mut *attn, seq)?;
+            let use_fa3 = self.flashinfer_fa3.load(Ordering::Relaxed)
+                && seq >= self.flashinfer_fa3_min_seq.load(Ordering::Relaxed);
+            if let Some(split) = split {
+                let owned;
+                let mask = match io.custom_mask {
+                    Some(mask) => mask,
+                    None => {
+                        owned = self
+                            .gpu
+                            .stream
+                            .clone_htod(&block_cascade_mask(seq, split)?)?;
+                        &owned
+                    }
+                };
+                fi.prefill_custom(&self.gpu, &*qn, &*kn, &*vv, mask, &mut *attn, seq)?;
+            } else if cfg.attention_mode != AttentionMode::Causal {
+                if use_fa3 {
+                    fi.prefill_noncausal_fa3(&self.gpu, &*qn, &*kn, &*vv, &mut *attn, seq)?;
+                } else {
+                    fi.prefill_noncausal(&self.gpu, &*qn, &*kn, &*vv, &mut *attn, seq)?;
+                }
+            } else if use_fa3 {
+                fi.prefill_fa3(&self.gpu, &*qn, &*kn, &*vv, &mut *attn, seq)?;
             } else {
                 fi.prefill(&self.gpu, &*qn, &*kn, &*vv, &mut *attn, seq)?;
             }
         } else if self.warp_attention.load(Ordering::Relaxed) {
+            if cfg.attention_mode != AttentionMode::Causal {
+                bail!("non-causal attention has no FlashInfer fallback");
+            }
             let tc = match hd {
                 64 => Some(&self.kernels.attention_tc_64),
                 128 => Some(&self.kernels.attention_tc_128),
@@ -2315,6 +2783,9 @@ impl Engine {
                 )?;
             }
         } else {
+            if cfg.attention_mode != AttentionMode::Causal {
+                bail!("non-causal attention has no FlashInfer fallback");
+            }
             // --legacy-attention: warp-per-query kernel.
             kernels::attention_warp(
                 &self.gpu,
@@ -2365,7 +2836,188 @@ impl Engine {
         Ok(timed!(self, "gemm.o", self.gemm(&gated, seq, &w.o_proj)?))
     }
 
-    fn gdn(&self, h: &CudaSlice<bf16>, seq: usize, w: &GdnWeights, capture: bool) -> Result<Buf> {
+    /// Full attention in the state-once question pass: the question queries
+    /// attend to the cached state K/V followed by their own K/V. K/V were both
+    /// captured after RoPE, so the question is rotated at `state_len + t` and
+    /// the concatenated extent needs no other adjustment.
+    fn full_attention_cascade(
+        &self,
+        h: &CudaSlice<bf16>,
+        seq: usize,
+        w: &FullAttentionWeights,
+        capture: bool,
+        cache: &StateCache,
+        layer: usize,
+    ) -> Result<Buf> {
+        let cfg = &self.cfg;
+        let (heads, kv, hd) = (
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+        );
+        let state_len = cache.state_len;
+        let (state_k, state_v) = cache
+            .kv
+            .get(layer)
+            .and_then(|entry| entry.as_ref())
+            .context("state cache has no K/V for a full-attention layer")?;
+        let kv_len = state_len + seq;
+        let qg = timed!(self, "gemm.q", self.gemm(h, seq, &w.q_proj)?);
+        let kk = timed!(self, "gemm.k", self.gemm(h, seq, &w.k_proj)?);
+        let vv = timed!(self, "gemm.v", self.gemm(h, seq, &w.v_proj)?);
+        let (q, gate) = if cfg.attn_output_gate {
+            let mut q = self.alloc_bf16(seq * heads * hd)?;
+            let mut gate = self.alloc_bf16(seq * heads * hd)?;
+            timed!(
+                self,
+                "attn.split",
+                kernels::split_q_gate(
+                    &self.gpu,
+                    &self.kernels.split_q_gate,
+                    &qg,
+                    &mut q,
+                    &mut gate,
+                    seq,
+                    heads,
+                    hd,
+                )?
+            );
+            drop(qg);
+            (q, Some(gate))
+        } else {
+            (qg, None)
+        };
+        let mut qn = self.alloc_bf16(seq * heads * hd)?;
+        timed!(
+            self,
+            "norm.q",
+            kernels::rmsnorm(
+                &self.gpu,
+                &self.kernels.rmsnorm,
+                &q,
+                &w.q_norm,
+                &mut qn,
+                seq * heads,
+                hd,
+                cfg.rms_norm_eps,
+                true,
+            )?
+        );
+        let mut kn = self.alloc_bf16(seq * kv * hd)?;
+        timed!(
+            self,
+            "norm.k",
+            kernels::rmsnorm(
+                &self.gpu,
+                &self.kernels.rmsnorm,
+                &kk,
+                &w.k_norm,
+                &mut kn,
+                seq * kv,
+                hd,
+                cfg.rms_norm_eps,
+                true,
+            )?
+        );
+        let positions: Vec<usize> = (state_len..state_len + seq).collect();
+        let (cos, sin) = self.rope_tables_positions(&positions)?;
+        timed!(
+            self,
+            "rope",
+            kernels::rope(
+                &self.gpu,
+                &self.kernels.rope,
+                &mut qn,
+                &mut kn,
+                &cos,
+                &sin,
+                seq,
+                heads,
+                kv,
+                hd,
+                cfg.rotary_dim() / 2,
+            )?
+        );
+        drop(cos);
+        drop(sin);
+
+        let mut k_all = self.alloc_bf16(kv_len * kv * hd)?;
+        let mut v_all = self.alloc_bf16(kv_len * kv * hd)?;
+        {
+            let mut dst = k_all
+                .try_slice_mut(..state_len * kv * hd)
+                .context("cascade K state view")?;
+            self.gpu.stream.memcpy_dtod(state_k, &mut dst)?;
+        }
+        {
+            let mut dst = v_all
+                .try_slice_mut(..state_len * kv * hd)
+                .context("cascade V state view")?;
+            self.gpu.stream.memcpy_dtod(state_v, &mut dst)?;
+        }
+        {
+            let mut dst = k_all
+                .try_slice_mut(state_len * kv * hd..)
+                .context("cascade K question view")?;
+            self.gpu.stream.memcpy_dtod(&*kn, &mut dst)?;
+        }
+        {
+            let mut dst = v_all
+                .try_slice_mut(state_len * kv * hd..)
+                .context("cascade V question view")?;
+            self.gpu.stream.memcpy_dtod(&*vv, &mut dst)?;
+        }
+        let mut attn = self.alloc_bf16(seq * heads * hd)?;
+        let fi = self
+            .flashinfer_for(kv_len, hd, heads, kv)
+            .context("cascade attention needs the vendored FlashInfer library")?;
+        fi.prefill_ext(
+            &self.gpu,
+            &*qn,
+            &*k_all,
+            &*v_all,
+            &mut *attn,
+            seq,
+            kv_len,
+        )?;
+        drop(qn);
+        drop(kn);
+        drop(k_all);
+        drop(v_all);
+        drop(vv);
+        if capture {
+            self.dump_dev("attn_weights_out", &attn, seq, heads * hd)?;
+        }
+        let gated = match gate {
+            Some(g) => {
+                let mut o = self.alloc_bf16(seq * heads * hd)?;
+                timed!(
+                    self,
+                    "attn.gate",
+                    kernels::sigmoid_gate(
+                        &self.gpu,
+                        &self.kernels.sigmoid_gate,
+                        &attn,
+                        &g,
+                        &mut o,
+                        seq * heads * hd,
+                    )?
+                );
+                o
+            }
+            None => attn,
+        };
+        Ok(timed!(self, "gemm.o", self.gemm(&gated, seq, &w.o_proj)?))
+    }
+
+    fn gdn(
+        &self,
+        h: &CudaSlice<bf16>,
+        seq: usize,
+        w: &GdnWeights,
+        capture: bool,
+        io: &mut LayerIo<'_>,
+    ) -> Result<Buf> {
         let cfg = &self.cfg;
         let (nk, nv) = (cfg.linear_num_key_heads, cfg.linear_num_value_heads);
         let (dk, dv) = (cfg.linear_key_head_dim, cfg.linear_value_head_dim);
@@ -2382,7 +3034,49 @@ impl Engine {
                 seq * conv_dim
             );
         }
-        let mut conv = self.alloc_bf16(seq * conv_dim)?;
+        // Capture the last three *pre-convolution* rows: the question pass
+        // prepends them to its own rows so the causal convolution is seeded
+        // exactly as if the state and question were one sequence.
+        if let Some(hist_out) = io.gdn_hist_out.as_deref_mut() {
+            if hist_out.len() < 3 * conv_dim {
+                bail!("state convolution-tail cache is too small");
+            }
+            self.gpu.stream.memset_zeros(hist_out)?;
+            let keep = seq.min(3);
+            let src = qkv
+                .try_slice((seq - keep) * conv_dim..seq * conv_dim)
+                .context("state qkv tail view")?;
+            let mut dst = hist_out
+                .try_slice_mut((3 - keep) * conv_dim..)
+                .context("state qkv tail destination")?;
+            self.gpu.stream.memcpy_dtod(&src, &mut dst)?;
+        }
+        let pre = if io.gdn_hist.is_some() { 3usize } else { 0 };
+        let joined = if pre > 0 {
+            let hist = io.gdn_hist.expect("history");
+            if hist.len() < pre * conv_dim {
+                bail!("state convolution history is too small");
+            }
+            let mut joined = self.alloc_bf16((seq + pre) * conv_dim)?;
+            {
+                let mut head = joined
+                    .try_slice_mut(..pre * conv_dim)
+                    .context("convolution history destination")?;
+                self.gpu.stream.memcpy_dtod(hist, &mut head)?;
+            }
+            {
+                let mut body = joined
+                    .try_slice_mut(pre * conv_dim..)
+                    .context("convolution row destination")?;
+                self.gpu.stream.memcpy_dtod(&*qkv, &mut body)?;
+            }
+            Some(joined)
+        } else {
+            None
+        };
+        let conv_len = seq + pre;
+        let mut conv = self.alloc_bf16(conv_len * conv_dim)?;
+        let conv_input: &CudaSlice<bf16> = joined.as_deref().unwrap_or(&qkv);
         timed!(
             self,
             "gdn.conv",
@@ -2390,26 +3084,41 @@ impl Engine {
                 kernels::conv1d_silu_tiled(
                     &self.gpu,
                     &self.kernels.conv1d_silu_tiled,
-                    &qkv,
+                    conv_input,
                     &w.conv1d,
                     &mut conv,
-                    seq,
+                    conv_len,
                     conv_dim,
                 )?
             } else {
                 kernels::conv1d_silu(
                     &self.gpu,
                     &self.kernels.conv1d_silu,
-                    &qkv,
+                    conv_input,
                     &w.conv1d,
                     &mut conv,
-                    seq,
+                    conv_len,
                     conv_dim,
                 )?
             }
         );
+        // Drop the three history rows: they only seed the convolution.
+        let conv_body = if pre > 0 {
+            let mut body = self.alloc_bf16(seq * conv_dim)?;
+            let src = conv
+                .try_slice(pre * conv_dim..)
+                .context("convolution body view")?;
+            self.gpu
+                .stream
+                .memcpy_dtod(&src, &mut *body)
+                .context("convolution body copy")?;
+            Some(body)
+        } else {
+            None
+        };
+        let conv_rows: &CudaSlice<bf16> = conv_body.as_deref().unwrap_or(&conv);
         if capture {
-            self.dump_dev("gdn_mixed_qkv_conv", &conv, seq, conv_dim)?;
+            self.dump_dev("gdn_mixed_qkv_conv", conv_rows, seq, conv_dim)?;
         }
 
         let z = timed!(self, "gemm.z", self.gemm(h, seq, &w.in_proj_z)?);
@@ -2432,7 +3141,7 @@ impl Engine {
             kernels::gdn_prepare(
                 &self.gpu,
                 &self.kernels.gdn_prepare,
-                &conv,
+                conv_rows,
                 &b,
                 &a,
                 &w.a_log,
@@ -2450,6 +3159,8 @@ impl Engine {
             )?
         );
         drop(qkv);
+        drop(joined);
+        drop(conv_body);
         drop(conv);
         drop(b);
         drop(a);
@@ -2466,11 +3177,27 @@ impl Engine {
             self.dump_f32("gdn_beta", &bv, seq, nv)?;
         }
 
-        let mut state = self.alloc_f32_zeros(nv * dk * dv)?;
+        let mut state = if io.gdn_seed.is_some() {
+            self.alloc_f32(nv * dk * dv)?
+        } else {
+            self.alloc_f32_zeros(nv * dk * dv)?
+        };
+        if let Some(seed) = io.gdn_seed {
+            if seed.len() < nv * dk * dv {
+                bail!("state recurrent cache is too small");
+            }
+            self.gpu
+                .stream
+                .memcpy_dtod(seed, &mut *state)
+                .context("seeding GDN recurrent state")?;
+        }
         let mut core = self.alloc_bf16(seq * nv * dv)?;
         let min_seq = self.gdn_split_min_seq.load(Ordering::Relaxed);
         let chunk_min = self.gdn_chunked_min_seq.load(Ordering::Relaxed);
-        if self.gdn_chunked_tc.load(Ordering::Relaxed) && seq >= chunk_min && dk == 128 && dv == 128
+        if self.gdn_chunked_tc.load(Ordering::Relaxed)
+            && seq >= chunk_min
+            && dk == 128
+            && dv == 128
         {
             if std::env::var("DECIDRA_GDN_PROF").is_ok() {
                 let blocks = (dv / kernels::GDN_CHUNK_VC) * nv;
@@ -2613,6 +3340,15 @@ impl Engine {
                 )?
             );
         }
+        if let Some(state_out) = io.gdn_state_out.as_deref_mut() {
+            if state_out.len() < nv * dk * dv {
+                bail!("state recurrent destination is too small");
+            }
+            self.gpu
+                .stream
+                .memcpy_dtod(&*state, state_out)
+                .context("capturing GDN recurrent state")?;
+        }
         drop(qf);
         drop(kf);
         drop(vf);
@@ -2699,7 +3435,7 @@ impl Engine {
         {
             let mut g = self.marlin_locks.lock().unwrap();
             if g.is_none() {
-                *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
+                *g = Some(self.gpu.stream.alloc_zeros::<i32>(self.gpu.sms.max(128))?);
             }
         }
         let locks_guard = self.marlin_locks.lock().unwrap();
@@ -2740,6 +3476,7 @@ impl Engine {
                 n,
                 k,
                 if group_mode { 64 } else { 0 },
+                self.gpu.sms,
             )?;
             off += pm;
             rest -= pm;
@@ -2782,6 +3519,36 @@ impl Engine {
                 .blas
                 .gemm(cfg, w, x, out)
                 .context("cublas lora gemm")?;
+        }
+        Ok(())
+    }
+
+    fn blas_gemm_f32(
+        &self,
+        x: &CudaSlice<f32>,
+        m: usize,
+        k: usize,
+        w: &CudaSlice<f32>,
+        n: usize,
+        out: &mut CudaSlice<f32>,
+    ) -> Result<()> {
+        let cfg = GemmConfig {
+            transa: cublasOperation_t::CUBLAS_OP_T,
+            transb: cublasOperation_t::CUBLAS_OP_N,
+            m: n as i32,
+            n: m as i32,
+            k: k as i32,
+            alpha: 1.0f32,
+            lda: k as i32,
+            ldb: k as i32,
+            beta: 0.0f32,
+            ldc: n as i32,
+        };
+        unsafe {
+            self.gpu
+                .blas
+                .gemm(cfg, w, x, out)
+                .context("cublas f32 readout gemm")?;
         }
         Ok(())
     }
@@ -2964,7 +3731,7 @@ impl Engine {
                 {
                     let mut g = self.marlin_locks.lock().unwrap();
                     if g.is_none() {
-                        *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
+                        *g = Some(self.gpu.stream.alloc_zeros::<i32>(self.gpu.sms.max(128))?);
                     }
                 }
                 let locks = self.marlin_locks.lock().unwrap();
@@ -2991,8 +3758,19 @@ impl Engine {
                         &self.kernels.marlin_cfgs
                     };
                     kernels::marlin_gemm(
-                        &self.gpu, &cfgs[idx], x, qweight, &mut c, scales, zeros, locks, off, pm,
-                        n, k,
+                        &self.gpu,
+                        &cfgs[idx],
+                        x,
+                        qweight,
+                        &mut c,
+                        scales,
+                        zeros,
+                        locks,
+                        off,
+                        pm,
+                        n,
+                        k,
+                        self.gpu.sms,
                     )?;
                     off += pm;
                     rest -= pm;
@@ -3102,35 +3880,362 @@ impl Engine {
     /// Full forward + final norm + lm_head rows (or the separate readout head
     /// for d3/d3-turbo/pplx) for `head_ids`, at the last position.
     pub fn decision_logits(&self, tokens: &[u32], head_ids: &[u32]) -> Result<Vec<f32>> {
-        if let Some(head) = &self.readout {
-            if head_ids.iter().any(|id| *id as usize >= head.rows) {
-                bail!(
-                    "readout head id out of range (head has {} rows)",
-                    head.rows
-                );
-            }
+        if self.readout.is_some() {
             let hidden = self.forward_last_hidden(tokens)?;
-            if hidden.len() != head.hidden {
-                bail!(
-                    "readout expects hidden {}, got {}",
-                    head.hidden,
-                    hidden.len()
-                );
-            }
-            let host: Vec<bf16> = hidden.iter().map(|v| bf16::from_f32(*v)).collect();
-            let mut x = self.alloc_bf16(hidden.len())?;
-            self.gpu.stream.memcpy_htod(&host, &mut *x)?;
-            let mut out = self.alloc_bf16(head.rows)?;
-            self.blas_gemm_bf16(&x, 1, head.hidden, &head.weight, head.rows, &mut out)?;
-            let values = self.to_f32(&out, head.rows)?;
-            return Ok(head_ids
-                .iter()
-                .map(|id| values[*id as usize])
-                .collect());
+            return self.readout_hidden(&hidden, head_ids);
         }
         self.set_logits_opts(Some(head_ids.to_vec()), false);
         let last = self.cfg.num_hidden_layers.saturating_sub(1) as isize;
         self.forward(tokens, last, Stage::Logits, true)
+    }
+
+    /// Per-row block-cascade logits at the last position: the first `split`
+    /// tokens are the bidirectional state block, the rest the question block.
+    pub fn decision_logits_split(
+        &self,
+        tokens: &[u32],
+        split: usize,
+        head_ids: &[u32],
+    ) -> Result<Vec<f32>> {
+        let hidden = {
+            let last = self.cfg.num_hidden_layers.saturating_sub(1) as isize;
+            self.forward_split(tokens, split, last, Stage::FinalNorm, true)?
+        };
+        if self.readout.is_some() {
+            return self.readout_hidden(&hidden, head_ids);
+        }
+        self.set_logits_opts(Some(head_ids.to_vec()), false);
+        let last = self.cfg.num_hidden_layers.saturating_sub(1) as isize;
+        self.forward_split(tokens, split, last, Stage::Logits, true)
+    }
+
+
+    /// Encode one d3-turbo state block and retain everything a question pass
+    /// needs: per-full-layer post-RoPE K/V and per-GDN-layer recurrent state
+    /// and convolution tail. The state runs as one bidirectional row; no state
+    /// token can see a question under the block-cascade mask.
+    pub fn capture_state(&self, tokens: &[u32]) -> Result<StateCache> {
+        let seq = tokens.len();
+        if seq < 2 {
+            bail!("a state block needs at least two tokens, got {seq}");
+        }
+        if self.cfg.attention_mode != AttentionMode::BlockCascade {
+            bail!("a state cache is only valid for BlockCascade checkpoints");
+        }
+        self.prof.entries.lock().unwrap().clear();
+        let low_mem = seq >= 12_288;
+        self.pool.low_mem.store(low_mem, Ordering::Relaxed);
+        self.f32_pool.low_mem.store(low_mem, Ordering::Relaxed);
+        let cfg = &self.cfg;
+        let layers = cfg.num_hidden_layers;
+        let mut kv: Vec<Option<(CudaSlice<bf16>, CudaSlice<bf16>)>> =
+            (0..layers).map(|_| None).collect();
+        let mut gdn_state: Vec<Option<CudaSlice<f32>>> = (0..layers).map(|_| None).collect();
+        let mut gdn_hist: Vec<Option<CudaSlice<bf16>>> = (0..layers).map(|_| None).collect();
+        let mut x = self.embed(tokens)?;
+        for i in 0..layers {
+            let w = self.layer_weights(i)?;
+            let mut captured = None;
+            match &w.mixer {
+                MixerWeights::Full(_) => {
+                    let mut k = self
+                        .gpu
+                        .stream
+                        .alloc_zeros::<bf16>(seq * cfg.num_key_value_heads * cfg.head_dim)?;
+                    let mut v = self
+                        .gpu
+                        .stream
+                        .alloc_zeros::<bf16>(seq * cfg.num_key_value_heads * cfg.head_dim)?;
+                    let mut io = LayerIo {
+                        k_out: Some(&mut k),
+                        v_out: Some(&mut v),
+                        ..LayerIo::default()
+                    };
+                    x = self.run_layer(
+                        &x,
+                        seq,
+                        &w,
+                        false,
+                        Stage::Layer,
+                        &mut captured,
+                        None,
+                        &mut io,
+                    )?;
+                    kv[i] = Some((k, v));
+                }
+                MixerWeights::Gdn(_) => {
+                    let mut state = self
+                        .gpu
+                        .stream
+                        .alloc_zeros::<f32>(cfg.linear_num_value_heads
+                            * cfg.linear_key_head_dim
+                            * cfg.linear_value_head_dim)?;
+                    let conv_dim = 2 * cfg.gdn_key_dim() + cfg.gdn_value_dim();
+                    let mut hist = self.gpu.stream.alloc_zeros::<bf16>(3 * conv_dim)?;
+                    let mut io = LayerIo {
+                        gdn_state_out: Some(&mut state),
+                        gdn_hist_out: Some(&mut hist),
+                        ..LayerIo::default()
+                    };
+                    x = self.run_layer(
+                        &x,
+                        seq,
+                        &w,
+                        false,
+                        Stage::Layer,
+                        &mut captured,
+                        None,
+                        &mut io,
+                    )?;
+                    gdn_state[i] = Some(state);
+                    gdn_hist[i] = Some(hist);
+                }
+            }
+        }
+        self.prof_report();
+        Ok(StateCache {
+            state_len: seq,
+            kv,
+            gdn_state,
+            gdn_hist,
+        })
+    }
+
+    /// Read out a decision from a question block forked from `cache`.
+    pub fn decision_logits_state_once(
+        &self,
+        cache: &StateCache,
+        question_tokens: &[u32],
+        head_ids: &[u32],
+    ) -> Result<Vec<f32>> {
+        let seq = question_tokens.len();
+        if seq == 0 {
+            bail!("a question block needs at least one token");
+        }
+        if self.cfg.attention_mode != AttentionMode::BlockCascade {
+            bail!("state-once execution needs a BlockCascade checkpoint");
+        }
+        let cfg = &self.cfg;
+        let mut x = self.embed(question_tokens)?;
+        for i in 0..cfg.num_hidden_layers {
+            let w = self.layer_weights(i)?;
+            let mut captured = None;
+            let mut io = LayerIo {
+                cascade: Some(cache),
+                cascade_layer: Some(i),
+                ..LayerIo::default()
+            };
+            if matches!(w.mixer, MixerWeights::Gdn(_)) {
+                io.gdn_seed = cache.gdn_state[i].as_ref();
+                io.gdn_hist = cache.gdn_hist[i].as_ref();
+            }
+            x = self.run_layer(
+                &x,
+                seq,
+                &w,
+                false,
+                Stage::Layer,
+                &mut captured,
+                None,
+                &mut io,
+            )?;
+        }
+        let norm = self.provider()?.final_norm()?;
+        let mut h = self.alloc_bf16(seq * cfg.hidden_size)?;
+        kernels::rmsnorm(
+            &self.gpu,
+            &self.kernels.rmsnorm,
+            &x,
+            &norm,
+            &mut h,
+            seq,
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+            true,
+        )?;
+        let all = self.to_f32(&h, seq * cfg.hidden_size)?;
+        let host = &all[(seq - 1) * cfg.hidden_size..];
+        self.readout_hidden(host, head_ids)
+    }
+
+
+    /// Batched state-once questions: one forward over every question block,
+    /// each forked from the same cached state. Full-attention layers run one
+    /// cascade launch per row; GDN layers seed one recurrent slot per row.
+    pub fn decision_logits_state_once_batch(
+        &self,
+        cache: &StateCache,
+        questions: &[&[u32]],
+        head_ids: &[u32],
+    ) -> Result<Vec<Vec<f32>>> {
+        let rows = self.state_once_batch_rows(cache, questions)?;
+        let head = self
+            .readout
+            .as_ref()
+            .context("this checkpoint has no separate readout head")?;
+        if head_ids.iter().any(|id| *id as usize >= head.rows) {
+            bail!("readout head id out of range (head has {} rows)", head.rows);
+        }
+        Ok(rows
+            .chunks_exact(head.rows)
+            .map(|row| head_ids.iter().map(|id| row[*id as usize]).collect())
+            .collect())
+    }
+
+    /// Full 255-row readout for a state-once batch. The adapter masks each
+    /// question's own option range; one batch may mix choice, noul and score.
+    pub fn readout_state_once_batch(
+        &self,
+        cache: &StateCache,
+        questions: &[&[u32]],
+    ) -> Result<Vec<Vec<f32>>> {
+        let rows = self.state_once_batch_rows(cache, questions)?;
+        let head = self
+            .readout
+            .as_ref()
+            .context("this checkpoint has no separate readout head")?;
+        Ok(rows.chunks_exact(head.rows).map(|row| row.to_vec()).collect())
+    }
+
+    /// Run a state-once question set, splitting it at the same caps the
+    /// checkpoint runtime uses (64 rows, 2^18 keys, 2^27 scores). Chunks share
+    /// one `StateCache`; results are restored to input order.
+    fn state_once_batch_rows(
+        &self,
+        cache: &StateCache,
+        questions: &[&[u32]],
+    ) -> Result<Vec<f32>> {
+        const MAX_ROWS: usize = 64;
+        const MAX_KEYS: usize = 1 << 18;
+        const MAX_SCORES: usize = 1 << 27;
+        if questions.is_empty() {
+            bail!("empty state-once question batch");
+        }
+        let head_rows = self
+            .readout
+            .as_ref()
+            .context("this checkpoint has no separate readout head")?
+            .rows;
+        let state = cache.state_len;
+        let mut order: Vec<usize> = (0..questions.len()).collect();
+        order.sort_by_key(|&i| questions[i].len());
+        let mut chunks: Vec<Vec<usize>> = Vec::new();
+        let mut current: Vec<usize> = Vec::new();
+        let mut max_q = 0usize;
+        for index in order {
+            let len = questions[index].len();
+            let next_max = max_q.max(len);
+            let rows = current.len() + 1;
+            let keys = rows * (state + next_max);
+            let scores = rows * next_max * (state + next_max);
+            if rows == 1 && (keys > MAX_KEYS || scores > MAX_SCORES) {
+                bail!(
+                    "one question needs {keys} keys / {scores} scores, over the \
+                     {MAX_KEYS}/{MAX_SCORES} caps"
+                );
+            }
+            if !current.is_empty()
+                && (rows > MAX_ROWS || keys > MAX_KEYS || scores > MAX_SCORES)
+            {
+                chunks.push(std::mem::take(&mut current));
+                max_q = 0;
+            }
+            current.push(index);
+            max_q = max_q.max(len);
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+        if chunks.len() <= 1 {
+            return self.state_once_batch_rows_inner(cache, questions);
+        }
+        let mut out = vec![0.0f32; questions.len() * head_rows];
+        for chunk in chunks {
+            let views: Vec<&[u32]> = chunk.iter().map(|&i| questions[i]).collect();
+            let rows = self.state_once_batch_rows_inner(cache, &views)?;
+            for (local, &index) in chunk.iter().enumerate() {
+                out[index * head_rows..(index + 1) * head_rows]
+                    .copy_from_slice(&rows[local * head_rows..(local + 1) * head_rows]);
+            }
+        }
+        Ok(out)
+    }
+
+    fn state_once_batch_rows_inner(
+        &self,
+        cache: &StateCache,
+        questions: &[&[u32]],
+    ) -> Result<Vec<f32>> {
+        if questions.is_empty() {
+            bail!("empty state-once question batch");
+        }
+        let flat = self.batch_tokens(questions)?;
+        let mut b = BatchInfo::new(&self.gpu, questions)?;
+        b.pos_start = cache.state_len;
+        let total = b.total;
+        self.prof.entries.lock().unwrap().clear();
+        let low_mem = total >= 12_288;
+        let was_low = self.pool.low_mem.swap(low_mem, Ordering::Relaxed);
+        let was_low_f32 = self.f32_pool.low_mem.swap(low_mem, Ordering::Relaxed);
+        if low_mem && !was_low {
+            self.pool.free.lock().unwrap().clear();
+        }
+        if low_mem && !was_low_f32 {
+            self.f32_pool.free.lock().unwrap().clear();
+        }
+        let mut x = timed!(self, "embed", self.embed(&flat)?);
+        for i in 0..self.cfg.num_hidden_layers {
+            let w = self.layer_weights(i)?;
+            let mut io = LayerIo {
+                cascade: Some(cache),
+                cascade_layer: Some(i),
+                ..LayerIo::default()
+            };
+            x = self.run_layer_batch(&x, &b, &w, &mut io)?;
+        }
+        let h = self.final_norm_rows(&x, total)?;
+        let rows = self.gather_last_rows(&h, &b, self.cfg.hidden_size)?;
+        let head = self
+            .readout
+            .as_ref()
+            .context("this checkpoint has no separate readout head")?;
+        let host = self.to_f32(&rows, b.batch() * self.cfg.hidden_size)?;
+        let x = self.gpu.stream.clone_htod(&host)?;
+        let mut out = self
+            .gpu
+            .stream
+            .alloc_zeros::<f32>(b.batch() * head.rows)?;
+        self.blas_gemm_f32(
+            &x,
+            b.batch(),
+            self.cfg.hidden_size,
+            &head.weight,
+            head.rows,
+            &mut out,
+        )?;
+        self.prof_report();
+        Ok(self.gpu.stream.clone_dtoh(&out)?)
+    }
+
+    fn readout_hidden(&self, hidden: &[f32], head_ids: &[u32]) -> Result<Vec<f32>> {
+        let Some(head) = &self.readout else {
+            bail!("this checkpoint has no separate readout head");
+        };
+        if head_ids.iter().any(|id| *id as usize >= head.rows) {
+            bail!("readout head id out of range (head has {} rows)", head.rows);
+        }
+        if hidden.len() != head.hidden {
+            bail!(
+                "readout expects hidden {}, got {}",
+                head.hidden,
+                hidden.len()
+            );
+        }
+        let x = self.gpu.stream.clone_htod(hidden)?;
+        let mut out = self.gpu.stream.alloc_zeros::<f32>(head.rows)?;
+        self.blas_gemm_f32(&x, 1, head.hidden, &head.weight, head.rows, &mut out)?;
+        let values: Vec<f32> = self.gpu.stream.clone_dtoh(&out)?;
+        Ok(head_ids.iter().map(|id| values[*id as usize]).collect())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3147,7 +4252,7 @@ impl Engine {
         {
             let mut g = self.marlin_locks.lock().unwrap();
             if g.is_none() {
-                *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
+                *g = Some(self.gpu.stream.alloc_zeros::<i32>(self.gpu.sms.max(128))?);
             }
         }
         let locks_guard = self.marlin_locks.lock().unwrap();
@@ -3170,7 +4275,20 @@ impl Engine {
             let idx = if pm <= 8 { 0 } else { tmb - 1 };
             let f = &self.kernels.marlin_fp8_cfgs[idx];
             kernels::marlin_gemm_fp8(
-                &self.gpu, f, xq, qweight, c, scales, zeros, a_scales, locks, off, pm, n, k,
+                &self.gpu,
+                f,
+                xq,
+                qweight,
+                c,
+                scales,
+                zeros,
+                a_scales,
+                locks,
+                off,
+                pm,
+                n,
+                k,
+                self.gpu.sms,
             )?;
             off += pm;
             rest -= pm;
@@ -3247,7 +4365,7 @@ impl Engine {
         {
             let mut g = self.marlin_locks.lock().unwrap();
             if g.is_none() {
-                *g = Some(self.gpu.stream.alloc_zeros::<i32>(128)?);
+                *g = Some(self.gpu.stream.alloc_zeros::<i32>(self.gpu.sms.max(128))?);
             }
         }
         let locks_guard = self.marlin_locks.lock().unwrap();
@@ -3270,7 +4388,21 @@ impl Engine {
             let idx = if pm <= 8 { 0 } else { tmb - 1 };
             let f = &self.kernels.marlin_int8_cfgs[idx];
             kernels::marlin_gemm_int8(
-                &self.gpu, f, xq, qweight, c, scales, zeros, a_scales, locks, off, pm, n, k, 0,
+                &self.gpu,
+                f,
+                xq,
+                qweight,
+                c,
+                scales,
+                zeros,
+                a_scales,
+                locks,
+                off,
+                pm,
+                n,
+                k,
+                0,
+                self.gpu.sms,
             )?;
             off += pm;
             rest -= pm;
@@ -3580,5 +4712,40 @@ impl Engine {
             bail!("expected {n} values, got {}", host.len());
         }
         Ok(host.iter().map(|v| v.to_f32()).collect())
+    }
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::block_cascade_mask;
+
+    fn bit(mask: &[u8], seq: usize, q: usize, k: usize) -> bool {
+        let i = q * seq + k;
+        mask[i / 8] & (1 << (i % 8)) != 0
+    }
+
+    #[test]
+    fn block_cascade_state_never_sees_question() {
+        let (seq, split) = (11usize, 5usize);
+        let m = block_cascade_mask(seq, split).unwrap();
+        assert_eq!(m.len(), (seq * seq).div_ceil(8));
+        for q in 0..seq {
+            for k in 0..seq {
+                let expected = if q < split { k < split } else { true };
+                assert_eq!(bit(&m, seq, q, k), expected, "q={q} k={k}");
+            }
+        }
+        // Negative control: the old noncausal-full mask would set these bits.
+        assert!(!bit(&m, seq, 0, split));
+        assert!(!bit(&m, seq, split - 1, seq - 1));
+        assert!(bit(&m, seq, split, 0));
+        assert!(bit(&m, seq, split, seq - 1));
+    }
+
+    #[test]
+    fn block_cascade_split_bounds() {
+        assert!(block_cascade_mask(5, 0).is_err());
+        assert!(block_cascade_mask(5, 5).is_err());
+        assert!(block_cascade_mask(5, 6).is_err());
     }
 }

@@ -312,12 +312,12 @@ class MetricsSampler(threading.Thread):
         super().__init__(daemon=True)
         self.base_url = base_url
         self.interval = interval
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
         self.queue_depth_max: float | None = None
         self.scrapes = 0
 
     def run(self) -> None:
-        while not self._stop.wait(self.interval):
+        while not self._stop_event.wait(self.interval):
             snapshot = batch_metrics_snapshot(scrape_metrics(self.base_url))
             if snapshot is None:
                 continue
@@ -331,7 +331,7 @@ class MetricsSampler(threading.Thread):
                 )
 
     def stop(self) -> None:
-        self._stop.set()
+        self._stop_event.set()
 
 
 def run_warmup(

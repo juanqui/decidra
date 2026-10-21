@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use cudarc::cublas::CudaBlas;
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream};
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, sys};
 use cudarc::nvrtc::Ptx;
 
 pub struct Gpu {
@@ -13,6 +13,9 @@ pub struct Gpu {
     /// Vendored Marlin W4A16 module (third_party/marlin).
     pub marlin_module: Arc<CudaModule>,
     pub blas: CudaBlas,
+    /// Streaming multiprocessor count of the open device. Marlin launches one
+    /// persistent block per SM; a fixed 128 leaves SMs idle on larger parts.
+    pub sms: usize,
 }
 
 impl Gpu {
@@ -30,12 +33,16 @@ impl Gpu {
             .load_module(Ptx::from_binary(marlin.to_vec()))
             .context("loading Marlin cubin")?;
         let blas = CudaBlas::new(stream.clone()).context("creating cuBLAS handle")?;
+        let sms = ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
+            .context("querying multiprocessor count")? as usize;
         Ok(Self {
             ctx,
             stream,
             module,
             marlin_module,
             blas,
+            sms,
         })
     }
 
@@ -62,5 +69,12 @@ impl Gpu {
     /// (free_bytes, total_bytes)
     pub fn mem_info(&self) -> Result<(usize, usize)> {
         self.ctx.mem_get_info().context("cudaMemGetInfo")
+    }
+
+    /// (major, minor) compute capability of the open device.
+    pub fn compute_capability(&self) -> Result<(i32, i32)> {
+        self.ctx
+            .compute_capability()
+            .context("querying compute capability")
     }
 }

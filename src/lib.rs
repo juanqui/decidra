@@ -11,6 +11,7 @@ pub mod backend;
 pub mod batch;
 pub mod cache;
 pub mod config;
+pub mod d3;
 pub mod engine;
 pub mod error;
 pub mod head;

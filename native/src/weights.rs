@@ -191,7 +191,7 @@ impl<'a> WeightProvider<'a> {
         gpu: &'a crate::cuda::Gpu,
         kernels: &'a crate::kernels::Kernels,
     ) -> Result<Self> {
-        let prefixes = ["model.language_model.", "model.", ""];
+        let prefixes = ["model.language_model.", "language_model.", "model.", ""];
         let mut prefix = None;
         for p in prefixes {
             if store.contains(&format!("{p}embed_tokens.weight")) {
@@ -314,7 +314,7 @@ impl<'a> WeightProvider<'a> {
                 if dbg {
                     eprintln!("marlin repack {module}: out={out} in={in_}");
                 }
-                let sms = 128usize;
+                let sms = self.gpu.sms;
                 let src = self.stream.clone_htod(&packed)?;
                 let mut gptq = self.stream.alloc_zeros::<i32>(out * packed_words)?;
                 if self.marlin_fp8 {

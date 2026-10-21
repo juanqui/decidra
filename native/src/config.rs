@@ -25,6 +25,17 @@ pub struct Config {
     /// Full-attention layers attend noncausally (AutoTrust/d3/d3-turbo/pplx).
     /// GDN layers remain causal regardless.
     pub noncausal_full: bool,
+    /// Exact full-attention mask family. `BlockCascade` is d3-turbo's
+    /// `prefix_bidir`: the state attends within itself and question tokens
+    /// see the state plus their own block, but no state token sees a question.
+    pub attention_mode: AttentionMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttentionMode {
+    Causal,
+    Full,
+    BlockCascade,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,30 +88,52 @@ impl Config {
         // Decision checkpoints may declare their prompt attention in
         // decision_config.json rather than config.json (d3/d3-turbo/pplx do;
         // AutoTrust uses jev_prompt_attention in config.json).
-        let decision: Option<Value> = std::fs::read_to_string(dir.join("decision_config.json"))
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok());
-        let attention_mode = v
-            .get("attention_mode")
-            .and_then(|x| x.as_str())
-            .or_else(|| {
-                decision
-                    .as_ref()
-                    .and_then(|d| d.get("attention_mode"))
-                    .and_then(|x| x.as_str())
-            })
+        let decision_path = dir.join("decision_config.json");
+        let decision: Option<Value> = match std::fs::read_to_string(&decision_path) {
+            Ok(raw) => Some(
+                serde_json::from_str(&raw)
+                    .with_context(|| format!("parsing {}", decision_path.display()))?,
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(error).with_context(|| format!("reading {}", decision_path.display()));
+            }
+        };
+        let config_mode = v.get("attention_mode").and_then(|x| x.as_str());
+        let decision_mode = decision
+            .as_ref()
+            .and_then(|d| d.get("attention_mode"))
+            .and_then(|x| x.as_str());
+        if let (Some(a), Some(b)) = (config_mode, decision_mode) {
+            if a != b {
+                anyhow::bail!(
+                    "config.json attention_mode {a:?} conflicts with decision_config.json {b:?}"
+                );
+            }
+        }
+        let attention_mode = config_mode
+            .or(decision_mode)
             .or_else(|| {
                 v.get("jev_prompt_attention")
                     .and_then(|x| x.as_str())
                     .map(|x| if x == "bidirectional" { "noncausal_full_attention" } else { x })
             });
+        if attention_mode.is_none() && dir.join("readout.safetensors").exists() {
+            anyhow::bail!(
+                "{} has a readout but no attention_mode in config.json or decision_config.json",
+                dir.display()
+            );
+        }
         // prefix_bidir (d3-turbo) is a bidirectional question block over a causal
         // state prefix; the noncausal full kernel is the closest available mask
         // until the block-cascade kernel lands.
-        let noncausal_full = matches!(
-            attention_mode,
-            Some("noncausal_full_attention") | Some("prefix_bidir")
-        );
+        let mode = match attention_mode {
+            None | Some("causal") => AttentionMode::Causal,
+            Some("noncausal_full_attention") => AttentionMode::Full,
+            Some("prefix_bidir") => AttentionMode::BlockCascade,
+            Some(other) => anyhow::bail!("unsupported attention_mode {other:?}"),
+        };
+        let noncausal_full = mode != AttentionMode::Causal;
 
         Ok(Self {
             hidden_size,
@@ -135,6 +168,7 @@ impl Config {
                 .and_then(|x| x.as_bool())
                 .unwrap_or(true),
             noncausal_full,
+            attention_mode: mode,
         })
     }
 
@@ -156,4 +190,44 @@ fn get_usize(v: &Value, key: &str) -> Result<usize> {
         .and_then(|x| x.as_u64())
         .map(|x| x as usize)
         .with_context(|| format!("config missing {key}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_config(dir: &Path, attention: &str) {
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"text_config":{"num_hidden_layers":2,"num_attention_heads":4,
+            "num_key_value_heads":2,"hidden_size":64,"intermediate_size":128,
+            "vocab_size":256,"layer_types":["linear_attention","full_attention"]}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("decision_config.json"),
+            format!(r#"{{"attention_mode":"{attention}"}}"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn parses_prefix_bidir_as_block_cascade() {
+        let dir = std::env::temp_dir().join(format!("decidra-config-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        write_config(&dir, "prefix_bidir");
+        let cfg = Config::from_dir(&dir).unwrap();
+        assert_eq!(cfg.attention_mode, AttentionMode::BlockCascade);
+        assert!(cfg.noncausal_full);
+        write_config(&dir, "noncausal_full_attention");
+        assert_eq!(
+            Config::from_dir(&dir).unwrap().attention_mode,
+            AttentionMode::Full
+        );
+        write_config(&dir, "causal");
+        let causal = Config::from_dir(&dir).unwrap();
+        assert_eq!(causal.attention_mode, AttentionMode::Causal);
+        assert!(!causal.noncausal_full);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

@@ -6,7 +6,9 @@
 //! (see [`crate::batch`]); requests are tokenized on the async reactor, queued,
 //! and executed in small FIFO batches. The reactor never blocks on a forward.
 
-use std::time::Instant;
+use std::{pin::Pin, time::Instant};
+
+use serde_json::{Map, Value, json};
 
 use anyhow::{Context, Result};
 use tokenizers::Tokenizer;
@@ -30,6 +32,22 @@ struct EngineExecutor {
 }
 
 impl BatchExecutor for EngineExecutor {
+    fn execute_state_once(
+        &mut self,
+        state: &[u32],
+        questions: &[Vec<u32>],
+        _codes: &[u32],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        let cache = self
+            .engine
+            .capture_state(state)
+            .map_err(|error| error.to_string())?;
+        let views: Vec<&[u32]> = questions.iter().map(|q| q.as_slice()).collect();
+        self.engine
+            .readout_state_once_batch(&cache, &views)
+            .map_err(|error| error.to_string())
+    }
+
     fn execute(&mut self, tokens: &[&[u32]], ids: &[&[u32]]) -> Vec<ExecResult> {
         if tokens.len() != ids.len() {
             return vec![
@@ -89,11 +107,43 @@ impl BatchExecutor for EngineExecutor {
     }
 }
 
+#[derive(Clone)]
+struct D3Config {
+    codes: Vec<String>,
+    temperature: f64,
+}
+
 pub struct NativeBackend {
     tokenizer: Tokenizer,
     queue: BatchHandle,
     /// Exact `(tokens, head ids)` logits cache. Capacity 0 disables it.
     cache: DecisionCache,
+    d3: Option<D3Config>,
+}
+
+fn load_d3_config(dir: &std::path::Path) -> Result<Option<D3Config>> {
+    let path = dir.join("decision_config.json");
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let value: Value = serde_json::from_str(&raw).with_context(|| format!("parsing {}", path.display()))?;
+    if value.get("attention_mode").and_then(Value::as_str) != Some("prefix_bidir") {
+        return Ok(None);
+    }
+    let codes = value
+        .get("codes")
+        .and_then(Value::as_array)
+        .context("decision_config.json codes")?
+        .iter()
+        .map(|code| code.as_str().unwrap_or_default().to_owned())
+        .collect::<Vec<_>>();
+    let temperature = value
+        .get("temperature")
+        .and_then(Value::as_f64)
+        .unwrap_or(1.0);
+    Ok(Some(D3Config { codes, temperature }))
 }
 
 impl NativeBackend {
@@ -174,6 +224,66 @@ impl NativeBackend {
         } else {
             BatchOptions::single(config.native_max_batch_tokens)
         };
+        let d3 = load_d3_config(&config.native_model)?;
+        if std::env::var("DECIDRA_D3").map(|v| v != "0").unwrap_or(false) && d3.is_none() {
+            anyhow::bail!(
+                "DECIDRA_D3 is set but {} has no prefix_bidir decision_config.json",
+                config.native_model.display()
+            );
+        }
+        if let Some(d3) = &d3 {
+            // Startup self-test through the exact state-once path. A broken
+            // mask, artifact, or FlashInfer build must fail here, not on a
+            // production request.
+            let question = crate::d3::noul_question("self test", None);
+            let text = crate::d3::render(&json!("ok"), &question, &d3.codes)?;
+            let (ids, split) = crate::d3::encode_split(&tokenizer, &text, &json!("ok"))?;
+            let cache = engine
+                .capture_state(&ids[..split])
+                .context("d3 startup state capture")?;
+            let rows = engine
+                .readout_state_once_batch(&cache, &[&ids[split..]])
+                .context("d3 startup question pass")?;
+            if rows.first().map_or(true, |row| row.iter().any(|v| !v.is_finite())) {
+                anyhow::bail!("d3 startup self-test returned non-finite logits");
+            }
+            let codes: Vec<u32> = (0..255).collect();
+            let reference = engine
+                .decision_logits_split(&ids, split, &codes)
+                .context("d3 startup per-row block reference")?;
+            let softmax = |values: &[f32]| -> Vec<f32> {
+                let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut out: Vec<f32> = values.iter().map(|v| (v - max).exp()).collect();
+                let total: f32 = out.iter().sum();
+                for v in &mut out {
+                    *v /= total;
+                }
+                out
+            };
+            let state_once = softmax(&rows[0]);
+            let block = softmax(&reference);
+            let delta = state_once
+                .iter()
+                .zip(&block)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            // W4A8 Marlin picks a different split-K shape for the two paths;
+            // the smoke gate catches a mask/cache reversal, not quantization
+            // noise (the offline EVAL gate covers weights).
+            if delta > 0.12 {
+                anyhow::bail!(
+                    "d3 startup self-test disagrees with the per-row block path by {delta}"
+                );
+            }
+            let yes = softmax(&rows[0][..2])[1];
+            // BF16 reference for this fixed prompt is 0.803; the W4A8 artifact
+            // lands at 0.735. A random-init or wrong-mask artifact leaves this
+            // band. The offline EVAL gate remains the quality authority.
+            if !(0.65..=0.85).contains(&yes) {
+                anyhow::bail!("d3 startup self-test noul probability {yes} is out of band");
+            }
+            tracing::info!(delta, yes, "d3 state-once self-test passed");
+        }
         let executor = EngineExecutor {
             engine,
             batch_enabled: config.native_batch,
@@ -182,6 +292,7 @@ impl NativeBackend {
             tokenizer,
             queue: BatchHandle::spawn(executor, options),
             cache: DecisionCache::new(config.decision_cache_size),
+            d3,
         })
     }
 
@@ -249,5 +360,119 @@ impl Backend for NativeBackend {
 
     fn name(&self) -> &str {
         "native"
+    }
+
+    fn d3_enabled(&self) -> bool {
+        self.d3.is_some()
+    }
+
+    fn d3_answers<'a>(
+        &'a self,
+        state: &'a Value,
+        questions: &'a Map<String, Value>,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, EngineError>> + Send + 'a>> {
+        Box::pin(async move {
+            let config = self
+                .d3
+                .as_ref()
+                .ok_or_else(|| EngineError::Unsupported("d3 is not configured".to_owned()))?;
+            if questions.is_empty() {
+                return Err(EngineError::Config("questions must not be empty".to_owned()));
+            }
+            if questions.len() > 64 {
+                return Err(EngineError::Config(
+                    "at most 64 questions per state-once request".to_owned(),
+                ));
+            }
+            if crate::d3::contains_media(state) {
+                return Err(EngineError::Unsupported(
+                    "image and video states are not supported by the native d3 path".to_owned(),
+                ));
+            }
+            if serde_json::to_string(state).map_or(true, |text| text.len() > (1 << 20)) {
+                return Err(EngineError::Config(
+                    "state is over the 1 MiB rendering cap".to_owned(),
+                ));
+            }
+            let mut state_ids: Option<Vec<u32>> = None;
+            let mut blocks = Vec::with_capacity(questions.len());
+            let mut counts = Vec::with_capacity(questions.len());
+            for (name, question) in questions {
+                let parsed = crate::d3::parse_question(question)
+                    .map_err(|error| EngineError::Config(format!("question {name}: {error}")))?;
+                let text = crate::d3::render(state, &parsed, &config.codes)
+                    .map_err(|error| EngineError::Config(format!("question {name}: {error}")))?;
+                if text.len() > (1 << 20) {
+                    return Err(EngineError::Config(format!(
+                        "question {name} renders over the 1 MiB cap"
+                    )));
+                }
+                let (ids, split) = crate::d3::encode_split(&self.tokenizer, &text, state)
+                    .map_err(|error| EngineError::Config(format!("question {name}: {error}")))?;
+                if split > 32_768 || ids.len() > 32_768 {
+                    return Err(EngineError::Config(format!(
+                        "question {name} has {split}+{} tokens, over the 32K serving cap",
+                        ids.len() - split
+                    )));
+                }
+                let head = ids[..split].to_vec();
+                match &state_ids {
+                    Some(existing) if *existing != head => {
+                        return Err(EngineError::BadResponse(
+                            "the tokenized state differs across questions".to_owned(),
+                        ));
+                    }
+                    None => state_ids = Some(head),
+                    _ => {}
+                }
+                blocks.push(ids[split..].to_vec());
+                counts.push(parsed.keys.len());
+            }
+            let state_ids = state_ids.expect("at least one question");
+            let usage_tokens = state_ids.len() as u64
+                + blocks.iter().map(|block| block.len() as u64).sum::<u64>();
+            let codes: Vec<u32> = (0..255).collect();
+            let receiver = self
+                .queue
+                .submit_state_once(state_ids.clone(), blocks.clone(), codes)
+                .map_err(|error| EngineError::Internal(error.to_string()))?;
+            let rows = receiver
+                .await
+                .map_err(|_| EngineError::Internal("native worker dropped the d3 reply".to_owned()))?
+                .map_err(EngineError::Backend)?;
+            if rows.len() != blocks.len() {
+                return Err(EngineError::BadResponse(format!(
+                    "native engine returned {} rows for {} questions",
+                    rows.len(),
+                    blocks.len()
+                )));
+            }
+            let mut out = Map::new();
+            for ((name, count), row) in questions.keys().zip(counts).zip(rows) {
+                if row.len() < count {
+                    return Err(EngineError::BadResponse(
+                        "readout returned fewer logits than options".to_owned(),
+                    ));
+                }
+                let scaled: Vec<f32> = row[..count]
+                    .iter()
+                    .map(|value| (value / config.temperature as f32).exp())
+                    .collect();
+                let total: f32 = scaled.iter().sum();
+                if !(total > 0.0) || !total.is_finite() {
+                    return Err(EngineError::BadResponse("non-finite d3 logits".to_owned()));
+                }
+                let probabilities: Vec<f32> = scaled.iter().map(|value| value / total).collect();
+                let question = crate::d3::parse_question(&questions[name])
+                    .map_err(|error| EngineError::Internal(error.to_string()))?;
+                let answer = crate::d3::to_answer(&question, &probabilities)
+                    .map_err(|error| EngineError::Internal(error.to_string()))?;
+                out.insert(name.clone(), answer);
+            }
+            Ok(json!({
+                "answers": out,
+                "usage": {"input_tokens": usage_tokens, "output_tokens": 0},
+            }))
+        })
     }
 }

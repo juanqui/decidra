@@ -712,6 +712,7 @@ pub fn marlin_gemm(
     m: usize,
     n: usize,
     k: usize,
+    sms: usize,
 ) -> Result<()> {
     let a_addr = ptr_of(x, gpu) + (row_off * k * 2) as u64;
     let (c_base, _r0) = out.device_ptr_mut(&gpu.stream);
@@ -725,7 +726,7 @@ pub fn marlin_gemm(
     let (lda, zero) = (k as i32, 0u64);
     let (f_bias, f_atomic, f_reduce) = (false, false, false);
     let cfg = LaunchConfig {
-        grid_dim: (128, 1, 1),
+        grid_dim: (sms as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: MR_SHARED as u32,
     };
@@ -991,6 +992,7 @@ pub fn marlin_gemm_int8(
     n: usize,
     k: usize,
     a_group_size: usize,
+    sms: usize,
 ) -> Result<()> {
     let (a_base, _ra) = x.device_ptr(&gpu.stream);
     let a_addr = a_base + (row_off * k) as u64;
@@ -1012,7 +1014,7 @@ pub fn marlin_gemm_int8(
     let (lda, zero) = (k as i32, 0u64);
     let (f_bias, f_atomic, f_reduce) = (false, false, false);
     let cfg = LaunchConfig {
-        grid_dim: (128, 1, 1),
+        grid_dim: (sms as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: MR_SHARED as u32,
     };
@@ -1056,6 +1058,7 @@ pub fn marlin_gemm_fp8(
     m: usize,
     n: usize,
     k: usize,
+    sms: usize,
 ) -> Result<()> {
     let (a_base, _ra) = x.device_ptr(&gpu.stream);
     let a_addr = a_base + (row_off * k) as u64;
@@ -1072,7 +1075,7 @@ pub fn marlin_gemm_fp8(
     let (lda, zero) = (k as i32, 0u64);
     let (f_bias, f_atomic, f_reduce) = (false, false, false);
     let cfg = LaunchConfig {
-        grid_dim: (128, 1, 1),
+        grid_dim: (sms as u32, 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: MR_SHARED as u32,
     };

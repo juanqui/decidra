@@ -24,6 +24,8 @@ pub enum EngineError {
     Unsupported(String),
     #[error("internal error: {0}")]
     Internal(String),
+    #[error("overloaded: {0}")]
+    Overloaded(String),
 }
 
 /// An API error with an OpenAI-compatible envelope plus FastAPI's historical `detail` field.
@@ -91,6 +93,11 @@ impl From<EngineError> for ApiError {
             }
             EngineError::Unsupported(message) => ApiError::not_implemented(message),
             EngineError::Internal(message) => ApiError::internal(message),
+            EngineError::Overloaded(message) => ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                kind: "overloaded_error",
+                message,
+            },
         }
     }
 }

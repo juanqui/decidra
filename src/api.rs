@@ -708,13 +708,47 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
             "questions must be a non-empty object",
         );
     }
-    if questions.len() > MAX_SYSTEMONE_QUESTIONS {
-        return s1_error(StatusCode::BAD_REQUEST, "at most 8 questions per request");
-    }
     let state_value = object
         .get("state")
         .cloned()
         .unwrap_or_else(|| Value::String(String::new()));
+    if state.engine.backend.d3_enabled() {
+        metrics::counter!("decidra_systemone_requests_total").increment(1);
+        return match state.engine.backend.d3_answers(&state_value, questions).await {
+            Ok(mut body) => {
+                if let Some(object) = body.as_object_mut() {
+                    object.insert(
+                        "object".to_owned(),
+                        Value::String("structured_decision".to_owned()),
+                    );
+                    object.insert(
+                        "model".to_owned(),
+                        Value::String(state.config.model_id.clone()),
+                    );
+                    object.insert(
+                        "created".to_owned(),
+                        Value::from(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0),
+                        ),
+                    );
+                }
+                axum::Json(body).into_response()
+            }
+            Err(EngineError::Config(message)) | Err(EngineError::Unsupported(message)) => {
+                s1_error(StatusCode::BAD_REQUEST, message)
+            }
+            Err(EngineError::Overloaded(message)) => {
+                s1_error(StatusCode::SERVICE_UNAVAILABLE, message)
+            }
+            Err(error) => s1_error(StatusCode::BAD_GATEWAY, format!("backend: {error}")),
+        };
+    }
+    if questions.len() > MAX_SYSTEMONE_QUESTIONS {
+        return s1_error(StatusCode::BAD_REQUEST, "at most 8 questions per request");
+    }
     let (text, image) = match s1_split_state(&state_value) {
         Ok(parts) => parts,
         Err(message) => return s1_error(StatusCode::BAD_REQUEST, message),

@@ -1152,7 +1152,10 @@ extern "C" __global__ void gdn_chunked_f32(
   const int tid = threadIdx.x;
   const int nchunks = (seq + C - 1) / C;
 
-  for (int i = tid; i < dk * vc; i += blockDim.x) S[i] = 0.f;
+  for (int i = tid; i < dk * vc; i += blockDim.x) {
+    int d = i / vc, j = i - d * vc;
+    S[i] = state[((size_t)h * dk + d) * dv + j0 + j];
+  }
 
   for (int c = 0; c < nchunks; ++c) {
     const int t0 = c * C;
@@ -1489,7 +1492,10 @@ __device__ __forceinline__ void gdn_chunked_tc_body(
     pt0 = now;                              \
   }
 
-  for (int i = tid; i < DK * VC; i += blockDim.x) S[i] = 0.f;
+  for (int i = tid; i < DK * VC; i += blockDim.x) {
+    int d = i / VC, j = i - d * VC;
+    S[i] = state[((size_t)h * DK + d) * DV + j0 + j];
+  }
 
   for (int c = 0; c < nchunks; ++c) {
     const int t0 = c * C;

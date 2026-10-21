@@ -16,13 +16,14 @@ GPU engine are one process. There is no Python at serving time.
 ## Supported models
 
 Decidra is built for specific decision checkpoints. It is not a general-purpose
-model runner. Two JEV-27B-VL quantized artifacts are supported:
+model runner. The JEV-27B-VL and d3-turbo families are supported:
 
 | artifact | weights | activations | decision head | status |
 |---|---|---|---|---|
 | [`aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8`](https://huggingface.co/aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8) | INT4, group **128**, symmetric | INT8 **per-token dynamic** (`CompressedTensorsWNA8Int`) | rank-32 **LoRA** on all linears + `lm_head` | **supported** |
 | `awq-w4a16-v2` build (local checkpoint) | INT4, group **64**, asymmetric | engine applies INT8 at runtime (group-64 / per-token) | **merged** decoder + BF16 head | **supported** |
 | [`autotrust/JEV-27B-VL`](https://huggingface.co/autotrust/JEV-27B-VL) | BF16 base | — | LoRA / merged variants | source model; does not fit one 24 GB GPU |
+| `d3-turbo-w4a8-g64-v4` (local, `vllm-sr/d3-turbo`) | INT4, group **64**, symmetric, GPTQ | INT8 **per-token**, per-64-group scales | separate F32 `[255,5120]` | **experimental**; state-once path |
 
 ### W4A8 checkpoint
 
@@ -53,6 +54,24 @@ model.safetensors    compressed-tensors W4A8 text weights
 adapter_vllm/        adapter_config.json + adapter_model.safetensors (rank 32)
 ```
 
+### d3-turbo state-once (experimental)
+
+The native engine also runs `vllm-sr/d3-turbo`, a Qwen3.5 hybrid with
+`attention_mode: prefix_bidir`: the state is read once, then every question
+forks from cached full-attention K/V, the final GDN recurrent state and the
+convolution tail. `DECIDRA_D3=1` enables the `/v1/systemone` d3 path
+(choice, noul and score, text only). Serve the local
+`d3-turbo-w4a8-g64-v4` artifact with the environment in
+[`docs/D3TURBO.md`](docs/D3TURBO.md); the design and review log are in
+[`docs/specs/2026-10-21-d3turbo-state-once.md`](docs/specs/2026-10-21-d3turbo-state-once.md).
+
+Measured on one RTX 4090 with a 2,048-token state and 64 questions: 465 ms
+state capture, 734 ms question pass, ~1.20 s in the engine and 1.65 s through
+the HTTP server. vLLM-SR 0.2.0 serving the same int4 artifact on the same GPU
+takes 3.89 s for the same request (2.36× slower), with the same top choice and
+a largest probability difference of 0.005. A 32-row BF16 smoke gate gives
+31/32 top-1. Per-row Qwen3.5 decision models still use the paths above.
+
 ### W4A16 checkpoint
 
 The local `awq-w4a16-v2` build. It uses the engine's original runtime INT8
@@ -73,12 +92,28 @@ engine does not load them by configuration alone.
 ## Hardware
 
 Tested on one **RTX 4090 (Ada, SM89), 24 GB**, with a CUDA 13.x driver.
+Also tested on one **NVIDIA L40S (Ada, SM89), 48 GB**: ~78–81% of the 4090's
+throughput on this bandwidth-bound workload, with 64K-context capacity. See
+[`docs/L40S.md`](docs/L40S.md) for the measured comparison and the SM-count-aware
+Marlin launch that L40S uses.
+
+An **H100 SXM (Hopper, SM90, 80 GB)** build also runs with
+`DECIDRA_CUDA_ARCH=sm_90`; on a CUDA 12.4 driver the Rust `cudarc` feature must be
+`cuda-12040` instead of the default `cuda-13000`. The current kernels are
+SM89-tuned on the quantized-linear path (Marlin `mma.sync`); SM90 uses FA3 for
+full attention, and the dequant→BF16 path runs through cuBLAS WGMMA/TMA.
+Measured H100 throughput is 4090-class (57 req/s saturated, 4.2K tok/s at
+19.5K prefill), with 122K-context capacity. vLLM 0.31 (Machete, FLASH_ATTN,
+FlashInfer GDN) is **1.5–1.7× faster on long prefill** and reaches 79 req/s at
+c32. See [`docs/H100.md`](docs/H100.md) and
+[`docs/H100-VLLM.md`](docs/H100-VLLM.md).
 
 The server, API, decision head, and model contract are GPU-agnostic. The native
-kernels are compiled for **SM89 only** today. **RTX Pro 6000 (Blackwell, SM120)
-is not supported yet.** Supporting it is a backend port: the Marlin/INT8 GEMMs,
-FlashInfer prefill, GDN kernels, and the cubin build need SM120 versions. The
-current Docker image will not run on SM120.
+kernels are compiled for **SM89 by default** and can be built for **SM90** with
+`DECIDRA_CUDA_ARCH=sm_90`. **RTX Pro 6000 (Blackwell, SM120) is not supported
+yet.** Supporting it is a backend port: the Marlin/INT8 GEMMs, FlashInfer
+prefill, GDN kernels, and the cubin build need SM120 versions. The current Docker
+image will not run on SM120.
 
 ## Performance
 

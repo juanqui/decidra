@@ -5,8 +5,8 @@
 
 use std::path::Path;
 
-use decidra_native::engine::Stage;
 use decidra_native::Engine;
+use decidra_native::engine::Stage;
 
 #[test]
 #[ignore = "requires the quantized AutoTrust checkpoint and HF layer dump on GPU1"]

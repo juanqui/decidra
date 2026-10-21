@@ -7,6 +7,8 @@
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
+use serde_json::{Map, Value};
+
 use crate::error::EngineError;
 
 /// Boxed future returned by [`Backend::logits`]. Keeping the trait object-safe
@@ -31,6 +33,20 @@ pub trait Backend: Send + Sync {
 
     /// Short backend name used in diagnostics (`/v1/models`, logs).
     fn name(&self) -> &str;
+
+    /// Whether this backend serves the d3-turbo state-once program.
+    fn d3_enabled(&self) -> bool {
+        false
+    }
+
+    /// One d3 state-once request: all questions forked from one state.
+    fn d3_answers<'a>(
+        &'a self,
+        _state: &'a Value,
+        _questions: &'a Map<String, Value>,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, EngineError>> + Send + 'a>> {
+        Box::pin(async { Err(EngineError::Unsupported("d3 backend not loaded".to_owned())) })
+    }
 }
 
 type MockFn = dyn Fn(&str, &[u32]) -> Result<Vec<f32>, EngineError> + Send + Sync;

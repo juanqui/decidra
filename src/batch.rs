@@ -27,6 +27,14 @@ use crate::error::EngineError;
 pub type ExecResult = Result<Vec<f32>, String>;
 
 /// A request waiting for a forward.
+/// A state-once decision request: one state block, many question blocks.
+pub struct StateOnceRequest {
+    pub state: Vec<u32>,
+    pub questions: Vec<Vec<u32>>,
+    pub codes: Vec<u32>,
+    pub reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
+}
+
 pub struct PendingRequest {
     pub tokens: Vec<u32>,
     pub ids: Vec<u32>,
@@ -66,10 +74,22 @@ impl BatchOptions {
 /// request, in input order.
 pub trait BatchExecutor: Send + 'static {
     fn execute(&mut self, tokens: &[&[u32]], ids: &[&[u32]]) -> Vec<ExecResult>;
+
+    /// Run one state-once request. The default keeps test executors and
+    /// legacy backends compiling; the native executor overrides it.
+    fn execute_state_once(
+        &mut self,
+        _state: &[u32],
+        _questions: &[Vec<u32>],
+        _codes: &[u32],
+    ) -> Result<Vec<Vec<f32>>, String> {
+        Err("this backend has no state-once program".to_owned())
+    }
 }
 
 struct QueueState {
     pending: VecDeque<PendingRequest>,
+    once: VecDeque<StateOnceRequest>,
     stopping: bool,
 }
 
@@ -98,6 +118,7 @@ impl BatchHandle {
         let shared = Arc::new(Shared {
             state: Mutex::new(QueueState {
                 pending: VecDeque::new(),
+                once: VecDeque::new(),
                 stopping: false,
             }),
             ready: Condvar::new(),
@@ -143,6 +164,45 @@ impl BatchHandle {
         Ok(receiver)
     }
 
+    /// Enqueue a state-once request. It runs alone on the engine thread:
+    /// one state capture plus one question pass.
+    pub fn submit_state_once(
+        &self,
+        state: Vec<u32>,
+        questions: Vec<Vec<u32>>,
+        codes: Vec<u32>,
+    ) -> Result<oneshot::Receiver<Result<Vec<Vec<f32>>, String>>, EngineError> {
+        let (reply, receiver) = oneshot::channel();
+        {
+            let mut guard = self.shared.lock();
+            if guard.stopping {
+                return Err(EngineError::Internal(
+                    "native batch worker is shutting down".to_owned(),
+                ));
+            }
+            while guard
+                .once
+                .front()
+                .is_some_and(|request| request.reply.is_closed())
+            {
+                guard.once.pop_front();
+            }
+            if guard.once.len() >= 32 {
+                return Err(EngineError::Overloaded(
+                    "too many queued state-once requests".to_owned(),
+                ));
+            }
+            guard.once.push_back(StateOnceRequest {
+                state,
+                questions,
+                codes,
+                reply,
+            });
+        }
+        self.shared.ready.notify_one();
+        Ok(receiver)
+    }
+
     /// Current number of queued (not yet executing) requests.
     pub fn depth(&self) -> usize {
         self.shared.lock().pending.len()
@@ -156,6 +216,7 @@ impl Drop for BatchHandle {
             state.stopping = true;
             // Close queued replies so callers cannot wait forever.
             state.pending.clear();
+            state.once.clear();
         }
         self.shared.ready.notify_all();
 
@@ -258,13 +319,38 @@ fn run_worker<E: BatchExecutor>(
     done: Sender<()>,
 ) {
     loop {
+        // State-once requests run alone, ahead of the FIFO logits queue.
+        {
+            let mut state = shared.lock();
+            if let Some(request) = state.once.pop_front() {
+                drop(state);
+                if request.reply.is_closed() {
+                    continue;
+                }
+                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    executor.execute_state_once(&request.state, &request.questions, &request.codes)
+                }))
+                .unwrap_or_else(|_| Err("native state-once executor panicked".to_owned()));
+                let _ = request.reply.send(result);
+                continue;
+            }
+        }
         // Block until there is work or shutdown is requested.
         let mut state = shared.lock();
-        while state.pending.is_empty() && !state.stopping {
+        while state.pending.is_empty() && state.once.is_empty() && !state.stopping {
             state = shared
                 .ready
                 .wait(state)
                 .unwrap_or_else(|error| error.into_inner());
+        }
+        if let Some(request) = state.once.pop_front() {
+            drop(state);
+            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                executor.execute_state_once(&request.state, &request.questions, &request.codes)
+            }))
+            .unwrap_or_else(|_| Err("native state-once executor panicked".to_owned()));
+            let _ = request.reply.send(result);
+            continue;
         }
         let Some(first) = state.pending.pop_front() else {
             drop(state);
@@ -367,6 +453,7 @@ fn run_worker<E: BatchExecutor>(
 #[cfg(test)]
 mod tests {
     use std::{
+        collections::VecDeque,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
@@ -449,6 +536,7 @@ mod tests {
     fn state_with(requests: Vec<PendingRequest>) -> QueueState {
         QueueState {
             pending: requests.into(),
+            once: VecDeque::new(),
             stopping: false,
         }
     }
