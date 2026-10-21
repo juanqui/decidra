@@ -668,8 +668,15 @@ impl Engine {
         heads: usize,
         kv: usize,
     ) -> Option<&crate::flashinfer::FlashInfer> {
+        // Noncausal models must never fall through to the causal-only native
+        // kernels; the FlashInfer minimum sequence guard is for the causal path.
+        let min_seq = if self.noncausal_full {
+            0
+        } else {
+            self.flashinfer_min_seq.load(Ordering::Relaxed)
+        };
         if !self.flashinfer_enabled.load(Ordering::Relaxed)
-            || seq < self.flashinfer_min_seq.load(Ordering::Relaxed)
+            || seq < min_seq
             || hd != 256
             || heads != 24
             || kv != 4
@@ -1524,7 +1531,7 @@ impl Engine {
             let mut ov = attn
                 .try_slice_mut(o * hv..(o + l) * hv)
                 .context("attention out view")?;
-            let fi = if b.batch() == 1 {
+            let fi = if b.batch() == 1 || self.noncausal_full {
                 self.flashinfer_for(l, hd, heads, kv)
             } else {
                 None
