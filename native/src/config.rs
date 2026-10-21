@@ -74,13 +74,33 @@ impl Config {
             .or_else(|| c.get("partial_rotary_factor").and_then(|x| x.as_f64()))
             .unwrap_or(1.0) as f32;
 
-        let noncausal_full = v
-            .get("jev_prompt_attention")
+        // Decision checkpoints may declare their prompt attention in
+        // decision_config.json rather than config.json (d3/d3-turbo/pplx do;
+        // AutoTrust uses jev_prompt_attention in config.json).
+        let decision: Option<Value> = std::fs::read_to_string(dir.join("decision_config.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+        let attention_mode = v
+            .get("attention_mode")
             .and_then(|x| x.as_str())
-            .map(|x| x == "bidirectional")
-            .unwrap_or(false)
-            || v.get("attention_mode").and_then(|x| x.as_str())
-                == Some("noncausal_full_attention");
+            .or_else(|| {
+                decision
+                    .as_ref()
+                    .and_then(|d| d.get("attention_mode"))
+                    .and_then(|x| x.as_str())
+            })
+            .or_else(|| {
+                v.get("jev_prompt_attention")
+                    .and_then(|x| x.as_str())
+                    .map(|x| if x == "bidirectional" { "noncausal_full_attention" } else { x })
+            });
+        // prefix_bidir (d3-turbo) is a bidirectional question block over a causal
+        // state prefix; the noncausal full kernel is the closest available mask
+        // until the block-cascade kernel lands.
+        let noncausal_full = matches!(
+            attention_mode,
+            Some("noncausal_full_attention") | Some("prefix_bidir")
+        );
 
         Ok(Self {
             hidden_size,
