@@ -187,6 +187,8 @@ requests; `q/s` means questions per second, not requests per second.
 | RTX 4090 (450 W) | W4A8 g64 | 64q, c1 | **936 ms** | **3.89 s** | **4.2× lower latency** |
 | H100 SXM 80 GB | BF16 | 64q, c1 | **824 ms** | **2.43 s** | **2.9× lower latency** |
 | H100 SXM 80 GB | BF16 | 64q, c8 | **5.10 s / 100 q/s** | **13.66 s / 23 q/s** | **2.7× lower latency, 4.3× q/s** |
+| RTX PRO 6000, 600 W | BF16 | 64q, c1 | **775 ms** | **3.23 s** | **4.2× lower latency** |
+| RTX PRO 6000, 600 W | BF16 | 64q, c8 | **3.42 s / 84 q/s** | **14.57 s / 20 q/s** | **4.3× q/s** |
 | H200 | BF16 | 64q, c1 | **800 ms** | **2.90 s** | **3.6× lower latency** |
 | H200 | BF16 | 64q, c8 | **5.47 s / 94 q/s** | **13.22 s / 22 q/s** | **2.4× lower latency, 4.3× q/s** |
 | H200 | BF16 | 16q, c8 | **1.32 s / 97 q/s** | **4.30 s / 17 q/s** | **3.3× lower latency, 5.7× q/s** |
@@ -202,16 +204,18 @@ it as W4A8 g64 with per-64-group INT8 activation scales.
 | GPU | 64q c1 | 64q c8 | 16q c8 |
 |---|---:|---:|---:|
 | RTX 4090, 450 W | **936 ms** | **4.18 s / 69 q/s** | **1.15 s / 69 q/s** |
-| RTX PRO 6000, 547 W | **992 ms** | **4.44 s / 65 q/s** | **1.31 s / 61 q/s** |
+| RTX PRO 6000, 600 W | **775 ms** | **3.42 s / 84 q/s** | **976 ms / 82 q/s** |
 | H100 SXM 80 GB | **824 ms** | **5.10 s / 100 q/s** | **1.28 s / 100 q/s** |
 | H200 | **800 ms** | **5.47 s / 94 q/s** | **1.32 s / 97 q/s** |
 
 RTX PRO 6000 uses the BF16 package by default: it passes the state-once parity
-gate at max Δp **0.0102**. The W4A8 package is slightly faster (964 ms) but its
-single-vs-batch parity on this stack is **0.081**, so it is not the recommended
-Blackwell path. A vLLM-SR baseline on that card was not measured, so no
-cross-engine Blackwell speedup is claimed. On the 4090: 1q **43 ms** warm,
-8K/64q **1.02 s**, 24K/64q **1.29 s**. The 16-entry pinned GPU state cache plus an 8 GiB host L2 serves **16 states at
+gate at max Δp **0.0102** and answers the same 64-question request **4.2×**
+faster than the vLLM-SR `vllm-srun` runtime on the same host. The W4A8 package
+is slightly faster than BF16 (964 ms on a 547 W host) but its single-vs-batch
+parity is **0.081**, so it is not the recommended Blackwell path. The 547 W
+host result is not a hardware comparison: that instance ran at 1695 MHz and
+376 W, while this 600 W host sustained 2445–2482 MHz and ~605 W. On the 4090:
+1q **43 ms** warm, 8K/64q **1.02 s**, 24K/64q **1.29 s**. The 16-entry pinned GPU state cache plus an 8 GiB host L2 serves **16 states at
 69 q/s** and **32 states at 63 q/s**; long states are protected by a 2 GiB
 scratch reserve. On H200, long-state 64q is **1.27 s at 8K** and **2.62 s at
 24K**, versus **4.39 s** and **9.45 s** for vLLM-SR.

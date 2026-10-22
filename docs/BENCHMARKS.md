@@ -39,42 +39,77 @@ claimed. The 4090 comparison chose the same top answer with max Δp 0.005.
 
 ## RTX PRO 6000 Blackwell WS (SM120, 96 GB)
 
+Two hosts were measured. The first was power-limited to **547 W** and sustained
+**1695 MHz / 376 W**; it is not valid for hardware comparison and produced the
+earlier 992 ms figure. The results below use a **600 W** WS host that sustained
+**2445–2482 MHz / ~605 W** under the same load.
+
 Host: Vast.ai RTX PRO 6000 Blackwell Workstation Edition, 188 SMs, 97.9 GB
-VRAM, power limit 547 W, driver 615.71, CUDA 13.1. The card ran at P1
-(1695 MHz SM / 13365 MHz GDDR7) and drew ~376 W under the 64-question
-benchmark; no software clock or power adjustment was available in the
-container.
+VRAM, driver 615.71 (or 580.126), CUDA 13.1, P1 state, GDDR7 13,365 MHz.
+
+### Decidra vs vLLM-SR on the same 600 W host
+
+Same BF16 checkpoint, same 2K state + 64-question request, vLLM-SR
+`vllm-srun` 0.2.0 with `--max-num-seqs 64 --max-num-batched-tokens 65536
+--enable-shared-context --dtype bfloat16`.
+
+| test | Decidra BF16 | vLLM-SR BF16 | advantage |
+|---|---:|---:|---|
+| 1q c1 | **51.1 ms / 20 q/s** | **551.8 ms / 2 q/s** | **10.8×** |
+| 8q c1 | **124.2 ms / 65 q/s** | **729.5 ms / 11 q/s** | **5.9×** |
+| 16q c1 | **211.5 ms / 76 q/s** | **955.8 ms / 17 q/s** | **4.5×** |
+| 64q c1 | **775.3 ms / 83 q/s** | **3.23 s / 20 q/s** | **4.2×** |
+| 64q c8 | **3.42 s / 84 q/s** | **14.57 s / 20 q/s** | **4.3× q/s** |
+| 64q c8 p50 | **3.42 s** | **14.57 s** | **4.3× lower latency** |
+
+Both servers ran on the same instance, sequentially, with the other stopped.
+vLLM-SR reports `approximate` numerics with shared context; Decidra reports the
+state-once parity numbers in the correctness section.
+
+### Decidra package comparison
 
 | package | 64q c1 | 64q c8 | 16q c8 | 8q c1 | state-once parity |
 |---|---:|---:|---:|---:|---:|
-| BF16 merged, 49 GB | **992 ms / 64 q/s** | **4.44 s / 65 q/s** | **1.31 s / 61 q/s** | 165 ms / 49 q/s | **0.0102** |
-| W4A8 g64, Marlin | 964 ms / 66 q/s | 4.32 s / 67 q/s | 1.22 s / 65 q/s | 141 ms / 57 q/s | 0.081 |
+| BF16 merged, 49 GB | **775 ms / 83 q/s** | **3.42 s / 84 q/s** | **976 ms / 82 q/s** | 124 ms / 65 q/s | **0.0102** |
+| W4A8 g64, 547 W host | 964 ms / 66 q/s | 4.32 s / 67 q/s | 1.22 s / 65 q/s | 141 ms / 57 q/s | 0.081 |
 
-BF16 is the recommended SM120 path: it passes the state-once parity gate at
-0.0102 and keeps 46.7 GiB free after preload. W4A8 is slightly faster but its
-single-vs-batch parity is 0.081 on this stack; it is not recommended where
-per-row equivalence matters. The 4090 remains the fastest W4A8 part because its
-clock window is better matched to the SM80-style Marlin kernel.
+BF16 is the recommended SM120 path. W4A8’s single-vs-batch parity is 0.081 on
+this stack, so it is not recommended where per-row equivalence matters. The
+RTX PRO 6000 at 600 W is **1.20× faster** than the 450 W RTX 4090 on the
+64-question W4A8 comparison (775 ms BF16 vs 933 ms W4A8), while keeping the
+96 GB BF16 cache headroom.
+
+### What the clock gap explains
+
+| GPU | sustained clock | power under 64q | 64q c1 |
+|---|---:|---:|---:|
+| RTX PRO 6000, 547 W host | 1695 MHz | 376 W | 992 ms |
+| RTX PRO 6000, 600 W host | 2445–2482 MHz | ~605 W | **775 ms** |
+| RTX 4090, 450 W | 2835 MHz | 449 W | 933 ms (W4A8) |
+
+The 547 W instance never approached its 600 W limit, and its SM clock was only
+65% of the 600 W host. Reporting that as “RTX PRO 6000 performance” was wrong.
 
 ### SM120 iterations
 
-| change | 64q c1 | result |
-|---|---:|---|
-| BF16 baseline | 998 ms | cuBLAS BF16 |
-| `BATCH_ROWS=512`, 128-row state chunks | 998 ms | rejected; c8 p50 7.66 s, no throughput gain |
-| W4A8 Marlin | 964 ms | faster, but 0.081 single-vs-batch parity; not recommended |
-| W8A8 per-row expansion | 923 ms | rejected: single-vs-batch max Δp **0.281** (W4A8: 0.017); per-row activation scales were too coarse |
-| FP8 E4M3 via cuBLASLt | 939 ms | rejected; slower than W4A8 |
-| W8A8 transposed layout | 1,882 ms | rejected; cuBLAS OP_N path slower |
-| chunked GDN for 50-token questions | 973 ms | rejected; register GDN is faster |
+| change | result |
+|---|---|
+| BF16 baseline on 547 W host | 998 ms; rejected as a hardware comparison after the clock audit |
+| BF16 on 600 W host | **775 ms / 83 q/s**, accepted |
+| W4A8 Marlin | 964 ms on 547 W; parity 0.081; optional only |
+| W8A8 per-row expansion | 923 ms on 547 W, but max Δp **0.281**; removed |
+| FP8 E4M3 via cuBLASLt | 939 ms on 547 W; rejected |
+| W8A8 transposed layout | 1.88 s; rejected |
+| chunked GDN for short questions | 973 ms; rejected |
+| large c8 regrouping | no throughput gain; rejected |
 
-The BF16 and W4A8 GEMMs both land near 190 TFLOP/s on the MLP linears at this
-card's P1 clock. The register GDN recurrence is the next-largest region
-(~137 ms for 48 layers) and is bandwidth-bound. FP8 and INT8 large-M variants
-were benchmarked through cuBLAS/cuBLASLt but did not beat the W4A8 or BF16
-paths at the measured shapes.
+Marlin's persistent W4 kernel is decode-oriented; the SM120 Blackwell path uses
+the merged BF16 package and cuBLAS for the large-M question pass. The remaining
+large regions are the MLP linears and the bandwidth-bound register GDN
+recurrence. Further gains require SM120 FP4/FP8 kernels or CUDA-graph/fused-MLP
+work, not another scheduler change.
 
-## RTX 4090 W4A8, 450 W cap (local GPU1)
+## RTX 4090 W4A8, 450 W cap (local GPU1)## RTX 4090 W4A8, 450 W cap (local GPU1)
 
 Both GPUs are hard-capped at 450 W. GPU1 draws ~449 W and runs at ~2.82 GHz.
 SM89 defaults: W4A8 group-64, gate/up/down/o/q INT8, k/v W4A16, register GDN,
