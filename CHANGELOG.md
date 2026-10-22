@@ -10,7 +10,8 @@ Public d3-turbo release.
   16 states at 69 q/s, 32 states at 63 q/s on a 450 W RTX 4090.
 - Added fused residual + RMSNorm, suffix-only question tokenization, 32-row
   scheduler budgeting, state-cache metrics, and cuBLAS worker-thread rebind.
-- Shipped W4A8 group-64 SM89 defaults and BF16 SM90 support.
+- Shipped W4A8 group-64 SM89 defaults, BF16 SM90 support, and RTX PRO 6000
+  Blackwell (SM120) support with architecture-checked cubins.
 - Refreshed the container image defaults, compose file, and public docs.
 
 ## 0.1.0

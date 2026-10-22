@@ -173,7 +173,41 @@ Largest probability difference 0.0272; score difference 0.0012. The batched
 W4A8 path is what the server serves; single-question parity (0.0056 max Δp
 vs batch-of-one) is a separate check.
 
-## 5. Performance on one RTX 4090 (450 W cap)
+## 4.1 Architecture profiles (SM89 / SM90 / SM120)
+
+Host-side choices live in `native/src/arch/`: `GpuArch` maps compute capability
+to a profile, and `Gpu::new` verifies the embedded cubin's
+`DECIDRA_COMPILED_ARCH` against the runtime device. The profiles currently
+control the FlashInfer threshold, state-row default, scheduler budget, and GDN
+chunk threshold. Shared kernels remain in `native/kernels/kernels.cu`; vendored
+Marlin is in `native/kernels/marlin.cu`.
+
+SM120 is a Blackwell workstation ISA, not a small SM100:
+
+- fifth-generation tensor cores with FP4/FP8, but no TMEM, tcgen05, WGMMA,
+  thread-block clusters, or distributed shared memory;
+- 99 KiB opt-in CTA shared memory and 188 SMs on RTX PRO 6000;
+- SM80-style register `mma.sync` plus `cp.async` is the compatible path;
+- FP8 and INT8 large-M GEMMs use cuBLAS/cuBLASLt rather than SM100 collectives;
+- Blackwell GeForce/WORKSTATION FP8 requires the TN operand layout.
+
+### SM120 large-M precision
+
+The SM120 recommendation is the merged BF16 path: 992 ms for 64 questions and
+a state-once parity of 0.0102. Marlin W4A8 is slightly faster (964 ms) but its
+single-vs-batch parity is 0.081 on this stack, so it is not the recommended
+Blackwell configuration. Attempts to improve large-M W4A8 with a per-row W8A8
+view reached 923 ms but raised the parity delta to 0.281: the checkpoint's
+per-64-group activation scales cannot be replaced with one scale per token
+without losing accuracy. FP8 E4M3 through cuBLASLt (939 ms) and a transposed
+W8A8 layout (1.88 s) were also rejected. None of those paths is compiled into
+the serving dispatch.
+
+Rejected SM120 experiments: large c8 regrouping (no throughput gain) and
+chunked GDN for short questions (973 ms vs 992 ms BF16). They are not compiled
+into the serving path.
+
+## 5. Performance on one RTX 4090 (450 W cap)## 5. Performance on one RTX 4090 (450 W cap)
 
 Both GPUs are capped at 450 W. The 4090 draws ~449 W at ~2.82 GHz. Defaults:
 W4A8 g64, gate/up/down/o/q INT8 group, k/v W4A16, register GDN, suffix-only

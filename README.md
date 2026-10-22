@@ -47,13 +47,14 @@ questions ──► one ragged pass ──► [B, 255] readout ──► typed a
 ### Requirements
 
 - Linux x86_64, NVIDIA driver with CUDA 13 support.
-- RTX 4090 / L40S (SM89) or H100 / H200 (SM90).
+- RTX 4090 / L40S (SM89), H100 / H200 (SM90), or RTX PRO 6000 Blackwell
+  (SM120).
 - The d3-turbo package mounted read-only. It must contain `config.json`,
   `decision_config.json` (`attention_mode: prefix_bidir`,
   `format_id: d3-code-readout-v1`), `tokenizer.json`, `model.safetensors`, and
   `readout.safetensors`.
-- 24 GB VRAM for the W4A8 g64 package on a 4090; 49 GB BF16 package on
-  H100/H200.
+- 24 GB VRAM for the W4A8 g64 package on a 4090; 49 GB BF16 on H100/H200;
+  96 GB on the RTX PRO 6000, which fits either BF16 or W4A8 plus state caches.
 
 ### Docker
 
@@ -72,10 +73,11 @@ curl -fsS http://127.0.0.1:8080/health
 # {"status":"ready","model":"vllm-sr/d3-turbo","head":"d3-code-readout"}
 ```
 
-Build a Hopper image from source:
+Build a Hopper or Blackwell image from source:
 
 ```bash
-docker build --build-arg CUDA_ARCH=sm_90 -t decidra:0.2.0-h100 .
+docker build --build-arg CUDA_ARCH=sm_90  -t decidra:0.2.0-h100 .
+docker build --build-arg CUDA_ARCH=sm_120 -t decidra:0.2.0-rtx-pro-6000 .
 ```
 
 Or use the provided compose file:
@@ -93,6 +95,9 @@ cargo build --release --locked --features native
 
 # H100 / H200
 DECIDRA_CUDA_ARCH=sm_90 cargo build --release --locked --features native
+
+# RTX PRO 6000 Blackwell (SM120)
+DECIDRA_CUDA_ARCH=sm_120 cargo build --release --locked --features native
 
 CUDA_VISIBLE_DEVICES=0 \
 DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-g64-v4 \
@@ -197,11 +202,16 @@ it as W4A8 g64 with per-64-group INT8 activation scales.
 | GPU | 64q c1 | 64q c8 | 16q c8 |
 |---|---:|---:|---:|
 | RTX 4090, 450 W | **936 ms** | **4.18 s / 69 q/s** | **1.15 s / 69 q/s** |
+| RTX PRO 6000, 547 W | **992 ms** | **4.44 s / 65 q/s** | **1.31 s / 61 q/s** |
 | H100 SXM 80 GB | **824 ms** | **5.10 s / 100 q/s** | **1.28 s / 100 q/s** |
 | H200 | **800 ms** | **5.47 s / 94 q/s** | **1.32 s / 97 q/s** |
 
-On the 4090: 1q **43 ms** warm, 8K/64q **1.02 s**, 24K/64q **1.29 s**. The
-16-entry pinned GPU state cache plus an 8 GiB host L2 serves **16 states at
+RTX PRO 6000 uses the BF16 package by default: it passes the state-once parity
+gate at max Δp **0.0102**. The W4A8 package is slightly faster (964 ms) but its
+single-vs-batch parity on this stack is **0.081**, so it is not the recommended
+Blackwell path. A vLLM-SR baseline on that card was not measured, so no
+cross-engine Blackwell speedup is claimed. On the 4090: 1q **43 ms** warm,
+8K/64q **1.02 s**, 24K/64q **1.29 s**. The 16-entry pinned GPU state cache plus an 8 GiB host L2 serves **16 states at
 69 q/s** and **32 states at 63 q/s**; long states are protected by a 2 GiB
 scratch reserve. On H200, long-state 64q is **1.27 s at 8K** and **2.62 s at
 24K**, versus **4.39 s** and **9.45 s** for vLLM-SR.
@@ -229,7 +239,7 @@ The image and compose file carry production defaults. The most important knobs:
 | `DECIDRA_METRICS_ENABLED` | `true` | Prometheus `/metrics` |
 
 See [docs/DEPLOY.md](docs/DEPLOY.md) for the full environment reference, H100
-settings, and operational notes.
+and RTX PRO 6000 settings, and operational notes.
 
 ## Tests
 

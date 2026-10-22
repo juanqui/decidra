@@ -1,10 +1,12 @@
 //! CUDA context, cubin module, cuBLAS handle.
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use cudarc::cublas::CudaBlas;
 use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, sys};
 use cudarc::nvrtc::Ptx;
+
+use crate::arch::{ArchProfile, GpuArch};
 
 pub struct Gpu {
     pub ctx: Arc<CudaContext>,
@@ -16,6 +18,9 @@ pub struct Gpu {
     /// Streaming multiprocessor count of the open device. Marlin launches one
     /// persistent block per SM; a fixed 128 leaves SMs idle on larger parts.
     pub sms: usize,
+    /// Detected runtime architecture and its host-side tuning profile.
+    pub arch: GpuArch,
+    pub profile: ArchProfile,
 }
 
 impl Gpu {
@@ -24,6 +29,31 @@ impl Gpu {
             .with_context(|| format!("creating CUDA context on device {ordinal}"))?;
         let stream = ctx.default_stream();
 
+        let (major, minor) = ctx
+            .compute_capability()
+            .context("querying compute capability")?;
+        let arch = GpuArch::from_compute(major, minor);
+        let compiled =
+            GpuArch::from_compile_arch(env!("DECIDRA_COMPILED_ARCH")).with_context(|| {
+                format!(
+                    "invalid build architecture {:?}",
+                    env!("DECIDRA_COMPILED_ARCH")
+                )
+            })?;
+        if compiled != arch {
+            let hint = match arch {
+                GpuArch::Sm89 | GpuArch::Sm80 => "sm_89".to_owned(),
+                GpuArch::Sm90 => "sm_90".to_owned(),
+                GpuArch::Sm120 => "sm_120".to_owned(),
+                GpuArch::Other { major, minor } => format!("sm_{major}{minor}"),
+            };
+            bail!(
+                "this binary embeds {} kernels but the GPU is {} (SM {major}.{minor}); \
+                 rebuild with DECIDRA_CUDA_ARCH={hint}",
+                compiled.label(),
+                arch.label(),
+            );
+        }
         let cubin: &[u8] = include_bytes!(env!("DECIDRA_KERNELS_CUBIN"));
         let marlin: &[u8] = include_bytes!(env!("DECIDRA_MARLIN_CUBIN"));
         let module = ctx
@@ -36,6 +66,7 @@ impl Gpu {
         let sms = ctx
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
             .context("querying multiprocessor count")? as usize;
+        let profile = arch.profile(sms);
         Ok(Self {
             ctx,
             stream,
@@ -43,6 +74,8 @@ impl Gpu {
             marlin_module,
             blas,
             sms,
+            arch,
+            profile,
         })
     }
 

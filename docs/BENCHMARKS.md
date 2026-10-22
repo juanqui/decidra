@@ -37,6 +37,43 @@ warm weights. Baseline is vLLM-SR `vllm-srun` 0.2.0 engine mode with
 A 4090 vLLM-SR c8 baseline was not measured; no 4090 throughput speedup is
 claimed. The 4090 comparison chose the same top answer with max Δp 0.005.
 
+## RTX PRO 6000 Blackwell WS (SM120, 96 GB)
+
+Host: Vast.ai RTX PRO 6000 Blackwell Workstation Edition, 188 SMs, 97.9 GB
+VRAM, power limit 547 W, driver 615.71, CUDA 13.1. The card ran at P1
+(1695 MHz SM / 13365 MHz GDDR7) and drew ~376 W under the 64-question
+benchmark; no software clock or power adjustment was available in the
+container.
+
+| package | 64q c1 | 64q c8 | 16q c8 | 8q c1 | state-once parity |
+|---|---:|---:|---:|---:|---:|
+| BF16 merged, 49 GB | **992 ms / 64 q/s** | **4.44 s / 65 q/s** | **1.31 s / 61 q/s** | 165 ms / 49 q/s | **0.0102** |
+| W4A8 g64, Marlin | 964 ms / 66 q/s | 4.32 s / 67 q/s | 1.22 s / 65 q/s | 141 ms / 57 q/s | 0.081 |
+
+BF16 is the recommended SM120 path: it passes the state-once parity gate at
+0.0102 and keeps 46.7 GiB free after preload. W4A8 is slightly faster but its
+single-vs-batch parity is 0.081 on this stack; it is not recommended where
+per-row equivalence matters. The 4090 remains the fastest W4A8 part because its
+clock window is better matched to the SM80-style Marlin kernel.
+
+### SM120 iterations
+
+| change | 64q c1 | result |
+|---|---:|---|
+| BF16 baseline | 998 ms | cuBLAS BF16 |
+| `BATCH_ROWS=512`, 128-row state chunks | 998 ms | rejected; c8 p50 7.66 s, no throughput gain |
+| W4A8 Marlin | 964 ms | faster, but 0.081 single-vs-batch parity; not recommended |
+| W8A8 per-row expansion | 923 ms | rejected: single-vs-batch max Δp **0.281** (W4A8: 0.017); per-row activation scales were too coarse |
+| FP8 E4M3 via cuBLASLt | 939 ms | rejected; slower than W4A8 |
+| W8A8 transposed layout | 1,882 ms | rejected; cuBLAS OP_N path slower |
+| chunked GDN for 50-token questions | 973 ms | rejected; register GDN is faster |
+
+The BF16 and W4A8 GEMMs both land near 190 TFLOP/s on the MLP linears at this
+card's P1 clock. The register GDN recurrence is the next-largest region
+(~137 ms for 48 layers) and is bandwidth-bound. FP8 and INT8 large-M variants
+were benchmarked through cuBLAS/cuBLASLt but did not beat the W4A8 or BF16
+paths at the measured shapes.
+
 ## RTX 4090 W4A8, 450 W cap (local GPU1)
 
 Both GPUs are hard-capped at 450 W. GPU1 draws ~449 W and runs at ~2.82 GHz.

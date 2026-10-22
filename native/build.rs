@@ -88,6 +88,7 @@ fn main() {
         build(job, &manifest, &out_dir, &cubin, &arch);
     }
 
+    println!("cargo:rustc-env=DECIDRA_COMPILED_ARCH={arch}");
     println!(
         "cargo:rustc-env=DECIDRA_KERNELS_CUBIN={}",
         out_dir.join(format!("kernels-{arch}.cubin")).display()

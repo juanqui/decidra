@@ -11,6 +11,7 @@
 //!
 //! Move the engine to one blocking worker and serialize forwards; it is
 //! `Send` but not for concurrent use.
+pub mod arch;
 pub mod config;
 pub mod cuda;
 pub mod engine;

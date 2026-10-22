@@ -32,6 +32,9 @@ strict sub-prefix of a state is not a valid cache key.
 - **GDN layers:** causal; short question blocks use the register-resident
   four-lane recurrence (default), longer blocks use the chunked tensor-core
   prefill.
+- **Architecture profiles:** `src/arch/` selects SM89, SM90, or SM120 host
+  tuning and verifies the embedded cubin against the runtime compute
+  capability.
 - **FlashInfer:** FA2 is the default on SM89 and SM90. FA3 is compiled in with
   `DECIDRA_FA3=1` and selected at runtime with `DECIDRA_FLASHINFER_FA3=1`; on the
   d3 2K–24K workload FA2 measured faster.
@@ -44,6 +47,7 @@ native/
   kernels/kernels.cu    RMSNorm, RoPE, attention, GDN, conv, readout
   kernels/marlin.cu     Marlin W4A16/W4A8 launcher and repack
   third_party/          Marlin, FlashInfer FA2/FA3, CCCL headers
+  src/arch/              SM89/SM90/SM120 profiles and cubin guard
   src/config.rs         d3-turbo checkpoint contract
   src/weights.rs        merged BF16 / packed W4A8 loader
   src/engine.rs         layers, state capture, state-once batch, readout
@@ -59,6 +63,9 @@ cargo build --release --locked --features native
 
 # SM90 (H100 / H200)
 DECIDRA_CUDA_ARCH=sm_90 cargo build --release --locked --features native
+
+# SM120 (RTX PRO 6000 Blackwell)
+DECIDRA_CUDA_ARCH=sm_120 cargo build --release --locked --features native
 
 # Optional FA3: CUTLASS headers plus the FA3 library
 DECIDRA_FA3=1 \

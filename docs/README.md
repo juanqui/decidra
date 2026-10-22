@@ -28,7 +28,8 @@ Start with the [project README](../README.md) for the quick start and API.
 ## Conventions
 
 - Performance numbers are end-to-end `POST /v1/systemone` measurements.
-- SM89 numbers use the **W4A8 g64 v4** package; SM90 numbers use **BF16**.
+- SM89 numbers use the **W4A8 g64 v4** package; SM90 numbers use **BF16**;
+  SM120 numbers use the **BF16** package; W4A8 is supported but has a larger state-once shape delta.
 - Accuracy claims require the 32-row HF gate and the state-once/negative-control
   tests; the startup self-test is a fail-closed safety check, not the quality
   authority.

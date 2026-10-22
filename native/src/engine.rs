@@ -720,11 +720,8 @@ impl Engine {
         let flashinfer_min_seq = std::env::var("DECIDRA_FLASHINFER_MIN_SEQ")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(1024usize);
-        let sm90 = gpu
-            .compute_capability()
-            .map(|(major, _)| major >= 9)
-            .unwrap_or(false);
+            .unwrap_or(gpu.profile.flashinfer_min_seq);
+        let sm90 = matches!(gpu.arch, crate::arch::GpuArch::Sm90);
         let fa3_available = sm90 && flashinfer.as_ref().is_some_and(|f| f.has_fa3());
         // FA3 is opt-in: on the d3 2K-24K workload the FA2 cascade was
         // faster on H200 (FA3 writes the same work through a different tile
@@ -4211,7 +4208,7 @@ impl Engine {
         let max_rows = std::env::var("DECIDRA_STATE_ONCE_MAX_ROWS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(64);
+            .unwrap_or(self.gpu.profile.default_state_rows);
         let max_keys = std::env::var("DECIDRA_STATE_ONCE_MAX_KEYS")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())

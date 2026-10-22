@@ -99,6 +99,8 @@ impl NativeBackend {
         tracing::info!(
             model = %config.native_model.display(),
             tokenizer = %tokenizer_path.display(),
+            arch = engine.gpu.arch.label(),
+            sms = engine.gpu.sms,
             cache = config.native_cache,
             gpu_embed = config.native_gpu_embed,
             marlin = config.native_marlin,
