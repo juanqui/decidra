@@ -1,13 +1,16 @@
 //! Decoder forward.
 use std::collections::HashMap;
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use cudarc::cublas::sys::cublasOperation_t;
 use cudarc::cublas::{Gemm, GemmConfig};
+use cudarc::cublaslt::safe::MatmulShared;
+use cudarc::cublaslt::{result as lt_result, sys as lt_sys};
 use cudarc::driver::sys::CUevent_flags;
-use cudarc::driver::{CudaEvent, CudaSlice};
+use cudarc::driver::{CudaEvent, CudaSlice, DevicePtr, DevicePtrMut};
 use half::bf16;
 
 use crate::config::{AttentionMode, Config};
@@ -15,7 +18,7 @@ use crate::cuda::Gpu;
 use crate::kernels::{self, Kernels};
 use crate::tensor::Store;
 use crate::weights::{
-    FullAttentionWeights, GdnWeights, LayerWeights, LinearWeight, Lora, MixerWeights,
+    Fp8Weight, FullAttentionWeights, GdnWeights, LayerWeights, LinearWeight, Lora, MixerWeights,
     WeightProvider,
 };
 
@@ -240,6 +243,18 @@ fn marlin_chunk() -> usize {
     *CHUNK
 }
 
+/// Minimum M for the SM120 FP8 MLP path. State capture (about 2K rows) stays
+/// on BF16; the 64-question pass (about 3.2K rows) uses FP8.
+fn fp8_min_rows() -> usize {
+    static MIN: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
+        std::env::var("DECIDRA_FP8_MIN_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(512)
+    });
+    *MIN
+}
+
 /// Diagnostic: replicate one row-wide scale to every K group.
 fn int8_group_uniform() -> bool {
     static UNIFORM: std::sync::LazyLock<bool> =
@@ -253,6 +268,43 @@ fn int8_group_uniform() -> bool {
 struct Int8Scratch {
     x: CudaSlice<i8>,
     scales: CudaSlice<f32>,
+}
+
+struct Fp8Scratch {
+    x: CudaSlice<u8>,
+    scales: CudaSlice<f32>,
+}
+
+struct CaptureGuard<'a>(&'a AtomicBool);
+impl Drop for CaptureGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
+struct LtLayout(lt_sys::cublasLtMatrixLayout_t);
+impl Drop for LtLayout {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = lt_result::destroy_matrix_layout(self.0);
+        }
+    }
+}
+struct LtDesc(lt_sys::cublasLtMatmulDesc_t);
+impl Drop for LtDesc {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = lt_result::destroy_matmul_desc(self.0);
+        }
+    }
+}
+struct LtPref(lt_sys::cublasLtMatmulPreference_t);
+impl Drop for LtPref {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = lt_result::destroy_matmul_pref(self.0);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -368,6 +420,8 @@ pub struct Engine {
     /// Marlin split-K barrier workspace (one int per SM), zeroed once.
     marlin_locks: Mutex<Option<CudaSlice<i32>>>,
     int8_scratch: Mutex<Option<Int8Scratch>>,
+    fp8_scratch: Mutex<Option<Fp8Scratch>>,
+    capturing: AtomicBool,
     /// Warp-per-query attention (fast for long contexts); the original block
     /// kernel remains selectable.
     warp_attention: AtomicBool,
@@ -786,6 +840,8 @@ impl Engine {
             int8_all_layers: Mutex::new(Vec::new()),
             marlin_locks: Mutex::new(None),
             int8_scratch: Mutex::new(None),
+            fp8_scratch: Mutex::new(None),
+            capturing: AtomicBool::new(false),
             warp_attention: AtomicBool::new(true),
             flashinfer,
             flashinfer_enabled: AtomicBool::new(flashinfer_enabled),
@@ -951,6 +1007,9 @@ impl Engine {
     pub fn rebind_blas(&mut self) -> Result<()> {
         self.gpu.blas = cudarc::cublas::CudaBlas::new(self.gpu.stream.clone())
             .context("rebinding cuBLAS handle on the CUDA worker thread")?;
+        self.gpu.blaslt = cudarc::cublaslt::safe::CudaBlasLT::new(self.gpu.stream.clone())
+            .context("rebinding cuBLASLt handle on the CUDA worker thread")?;
+        self.gpu.blaslt_workspace = self.gpu.stream.alloc_zeros::<u8>(32 * 1024 * 1024)?;
         Ok(())
     }
 
@@ -1105,6 +1164,10 @@ impl Engine {
         p.int8_group_scale = self.int8_group_scale.load(Ordering::Relaxed);
         p.int8_group_exclude = self.int8_group_exclude.lock().unwrap().clone();
         p.int8_all_layers = self.int8_all_layers.lock().unwrap().clone();
+        p.sm120_fp8_mlp = matches!(self.gpu.arch, crate::arch::GpuArch::Sm120)
+            && std::env::var("DECIDRA_NATIVE_FP8")
+                .map(|v| v == "1")
+                .unwrap_or(false);
         p.lora_store = self.lora_store.as_ref();
         p.lora_scale = self.lora_scale;
         Ok(p)
@@ -2190,9 +2253,10 @@ impl Engine {
             self,
             "gdn.recurrent",
             if gdn_reg {
+                let f = &self.kernels.gdn_recurrent_reg_split_batched;
                 kernels::gdn_recurrent_reg_split_batched(
                     &self.gpu,
-                    &self.kernels.gdn_recurrent_reg_split_batched,
+                    f,
                     &*qf,
                     &*kf,
                     &*vf,
@@ -2469,6 +2533,7 @@ impl Engine {
                 out: ids.len(),
                 in_: hidden,
                 w: wd,
+                fp8: None,
                 lora: None,
             };
             let logits = timed!(self, "head", self.gemm(&h, total, &lw)?);
@@ -3713,6 +3778,160 @@ impl Engine {
         Ok(())
     }
 
+    fn fp8_gemm(
+        &self,
+        x: &CudaSlice<bf16>,
+        rows: usize,
+        w: &Fp8Weight,
+        n: usize,
+        k: usize,
+    ) -> Result<Buf> {
+        let m_pad = rows.div_ceil(16) * 16;
+        let need = m_pad * k;
+        let mut scratch = self.fp8_scratch.lock().unwrap();
+        if scratch
+            .as_ref()
+            .is_none_or(|s| s.x.len() < need || s.scales.len() < m_pad)
+        {
+            *scratch = Some(Fp8Scratch {
+                x: self.gpu.stream.alloc_zeros::<u8>(need)?,
+                scales: self.gpu.stream.alloc_zeros::<f32>(m_pad)?,
+            });
+        }
+        let s = scratch.as_mut().unwrap();
+        kernels::quant_fp8_bf16(
+            &self.gpu,
+            &self.kernels.quant_fp8_bf16,
+            x,
+            &mut s.x,
+            &mut s.scales,
+            rows,
+            k,
+            1.0,
+        )?;
+        let mut c = self.gpu.stream.alloc_zeros::<f32>(m_pad * n)?;
+        let (wp, _wg) = w.w.device_ptr(&self.gpu.stream);
+        let (xp, _xg) = s.x.device_ptr(&self.gpu.stream);
+        let (cp, _cg) = c.device_ptr_mut(&self.gpu.stream);
+        let a_layout = LtLayout(
+            lt_result::create_matrix_layout(
+                lt_sys::cudaDataType::CUDA_R_8F_E4M3,
+                k as u64,
+                n as u64,
+                k as i64,
+            )
+            .map_err(|e| anyhow::anyhow!("cublasLt A layout: {e:?}"))?,
+        );
+        let b_layout = LtLayout(
+            lt_result::create_matrix_layout(
+                lt_sys::cudaDataType::CUDA_R_8F_E4M3,
+                k as u64,
+                m_pad as u64,
+                k as i64,
+            )
+            .map_err(|e| anyhow::anyhow!("cublasLt B layout: {e:?}"))?,
+        );
+        let c_layout = LtLayout(
+            lt_result::create_matrix_layout(
+                lt_sys::cudaDataType::CUDA_R_32F,
+                n as u64,
+                m_pad as u64,
+                n as i64,
+            )
+            .map_err(|e| anyhow::anyhow!("cublasLt C layout: {e:?}"))?,
+        );
+        let desc = LtDesc(
+            lt_result::create_matmul_desc(
+                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                lt_sys::cudaDataType::CUDA_R_32F,
+            )
+            .map_err(|e| anyhow::anyhow!("cublasLt desc: {e:?}"))?,
+        );
+        let ta = 1i32;
+        let tb = 0i32;
+        let pref = LtPref(
+            lt_result::create_matmul_pref().map_err(|e| anyhow::anyhow!("cublasLt pref: {e:?}"))?,
+        );
+        unsafe {
+            lt_result::set_matmul_desc_attribute(
+                desc.0,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                &ta as *const _ as *const c_void,
+                std::mem::size_of::<i32>(),
+            )
+            .map_err(|e| anyhow::anyhow!("cublasLt transa: {e:?}"))?;
+            lt_result::set_matmul_desc_attribute(
+                desc.0,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                &tb as *const _ as *const c_void,
+                std::mem::size_of::<i32>(),
+            )
+            .map_err(|e| anyhow::anyhow!("cublasLt transb: {e:?}"))?;
+        }
+        let ws = self.gpu.blaslt_workspace.len();
+        unsafe {
+            lt_result::set_matmul_pref_attribute(
+                pref.0,
+                lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws as *const _ as *const c_void,
+                std::mem::size_of::<usize>(),
+            )
+            .map_err(|e| anyhow::anyhow!("cublasLt workspace: {e:?}"))?;
+        }
+        let heuristic = unsafe {
+            lt_result::get_matmul_algo_heuristic(
+                *self.gpu.blaslt.handle(),
+                desc.0,
+                a_layout.0,
+                b_layout.0,
+                c_layout.0,
+                c_layout.0,
+                pref.0,
+            )
+            .map_err(|e| anyhow::anyhow!("cublasLt heuristic: {e:?}"))?
+        };
+        let (wsp, _wsg) = self.gpu.blaslt_workspace.device_ptr(&self.gpu.stream);
+        let alpha = 1f32;
+        let beta = 0f32;
+        unsafe {
+            lt_result::matmul(
+                *self.gpu.blaslt.handle(),
+                desc.0,
+                &alpha as *const f32 as *const c_void,
+                &beta as *const f32 as *const c_void,
+                wp as *const c_void,
+                a_layout.0,
+                xp as *const c_void,
+                b_layout.0,
+                cp as *const c_void,
+                c_layout.0,
+                cp as *mut c_void,
+                c_layout.0,
+                &heuristic.algo,
+                wsp as *mut c_void,
+                ws,
+                self.gpu.stream.cu_stream() as *mut _,
+            )
+            .map_err(|e| anyhow::anyhow!("cublasLt fp8 gemm: {e:?}"))?;
+        }
+        drop(_cg);
+        drop(_xg);
+        drop(_wg);
+        drop(_wsg);
+        let mut out = self.alloc_bf16(rows * n)?;
+        kernels::scale_fp8_gemm(
+            &self.gpu,
+            &self.kernels.scale_fp8_gemm,
+            &c,
+            &w.scale,
+            &s.scales,
+            &mut out,
+            rows,
+            n,
+        )?;
+        Ok(out)
+    }
+
     fn gemm_core(&self, x: &CudaSlice<bf16>, rows: usize, w: &LinearWeight) -> Result<Buf> {
         let (n, k) = (w.out(), w.in_());
         if x.len() != rows * k {
@@ -3736,7 +3955,12 @@ impl Engine {
         }
         let t0 = std::time::Instant::now();
         match w {
-            LinearWeight::Bf16 { w: wd, .. } => {
+            LinearWeight::Bf16 { w: wd, fp8, .. } => {
+                if let Some(fp8) = fp8 {
+                    if !self.capturing.load(Ordering::Relaxed) && rows >= fp8_min_rows() {
+                        return self.fp8_gemm(x, rows, fp8, n, k);
+                    }
+                }
                 let mut c = self.alloc_bf16(rows * n)?;
                 mark("  alloc", t0);
                 let cfg = GemmConfig {
@@ -4023,6 +4247,8 @@ impl Engine {
             bail!("a state cache is only valid for BlockCascade checkpoints");
         }
         self.prof.entries.lock().unwrap().clear();
+        self.capturing.store(true, Ordering::Relaxed);
+        let _capture_guard = CaptureGuard(&self.capturing);
         let low_mem = seq >= 12_288;
         self.pool.low_mem.store(low_mem, Ordering::Relaxed);
         self.f32_pool.low_mem.store(low_mem, Ordering::Relaxed);
@@ -4734,6 +4960,7 @@ impl Engine {
             out: ids.len(),
             in_: hidden,
             w,
+            fp8: None,
             lora: None,
         };
         let mut logits = timed!(self, "head", self.gemm(h, seq, &lw)?);
@@ -4776,6 +5003,7 @@ impl Engine {
                 out: n,
                 in_: hidden,
                 w,
+                fp8: None,
                 lora: None,
             };
             let mut c = timed!(self, "head", self.gemm(&x, rows, &lw)?);

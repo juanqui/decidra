@@ -14,7 +14,7 @@ It is not a general model runner. The HTTP server and the CUDA engine are one
 Rust process; there is no Python, PyTorch, vLLM, or external model server on the
 runtime path. A state is encoded once, then every question forks from that
 cache. On identical hardware and the same checkpoint, Decidra answers the
-64-question benchmark **2.4–4.2× faster** than vLLM-SR, with up to **4.3×
+64-question benchmark **2.4–5.2× faster** than vLLM-SR, with up to **5.2×
 higher 64-question throughput** at c8. The full side-by-side is below.
 
 ---
@@ -189,6 +189,8 @@ requests; `q/s` means questions per second, not requests per second.
 | H100 SXM 80 GB | BF16 | 64q, c8 | **5.10 s / 100 q/s** | **13.66 s / 23 q/s** | **2.7× lower latency, 4.3× q/s** |
 | RTX PRO 6000, 600 W | BF16 | 64q, c1 | **775 ms** | **3.23 s** | **4.2× lower latency** |
 | RTX PRO 6000, 600 W | BF16 | 64q, c8 | **3.42 s / 84 q/s** | **14.57 s / 20 q/s** | **4.3× q/s** |
+| RTX PRO 6000, 600 W | **FP8** | 64q, c1 | **623 ms** | **3.23 s** | **5.2× lower latency** |
+| RTX PRO 6000, 600 W | **FP8** | 64q, c8 | **2.80 s / 103 q/s** | **14.57 s / 20 q/s** | **5.2× q/s** |
 | H200 | BF16 | 64q, c1 | **800 ms** | **2.90 s** | **3.6× lower latency** |
 | H200 | BF16 | 64q, c8 | **5.47 s / 94 q/s** | **13.22 s / 22 q/s** | **2.4× lower latency, 4.3× q/s** |
 | H200 | BF16 | 16q, c8 | **1.32 s / 97 q/s** | **4.30 s / 17 q/s** | **3.3× lower latency, 5.7× q/s** |
@@ -204,18 +206,25 @@ it as W4A8 g64 with per-64-group INT8 activation scales.
 | GPU | 64q c1 | 64q c8 | 16q c8 |
 |---|---:|---:|---:|
 | RTX 4090, 450 W | **936 ms** | **4.18 s / 69 q/s** | **1.15 s / 69 q/s** |
-| RTX PRO 6000, 600 W | **775 ms** | **3.42 s / 84 q/s** | **976 ms / 82 q/s** |
+| RTX PRO 6000, 600 W BF16 | **775 ms** | **3.42 s / 84 q/s** | **976 ms / 82 q/s** |
+| RTX PRO 6000, 600 W FP8 | **623 ms** | **2.80 s / 103 q/s** | **754 ms / 106 q/s** |
+| RTX PRO 6000 Max-Q, 300 W BF16 | **1.045 s** | **4.70 s / 61 q/s** | — |
+| RTX PRO 6000 Max-Q, 300 W FP8 | **859 ms** | **3.84 s / 75 q/s** | **1.06 s / 75 q/s** |
 | H100 SXM 80 GB | **824 ms** | **5.10 s / 100 q/s** | **1.28 s / 100 q/s** |
 | H200 | **800 ms** | **5.47 s / 94 q/s** | **1.32 s / 97 q/s** |
 
-RTX PRO 6000 uses the BF16 package by default: it passes the state-once parity
-gate at max Δp **0.0102** and answers the same 64-question request **4.2×**
-faster than the vLLM-SR `vllm-srun` runtime on the same host. The W4A8 package
-is slightly faster than BF16 (964 ms on a 547 W host) but its single-vs-batch
-parity is **0.081**, so it is not the recommended Blackwell path. The 547 W
-host result is not a hardware comparison: that instance ran at 1695 MHz and
-376 W, while this 600 W host sustained 2445–2482 MHz and ~605 W. On the 4090:
-1q **43 ms** warm, 8K/64q **1.02 s**, 24K/64q **1.29 s**. The 16-entry pinned GPU state cache plus an 8 GiB host L2 serves **16 states at
+RTX PRO 6000 defaults to BF16 because it has the tightest state-once parity
+(**0.0102**). The opt-in SM120 FP8 path is **1.24× faster** again
+(**623 ms / 103 q/s**) and answers the same request **5.2×** faster than the
+vLLM-SR `vllm-srun` runtime on the same host. FP8 is approximate: the measured
+single-vs-batch probability delta is **0.036**, and the top choice matched on
+**64/64** probe rows. State capture stays on BF16, so FP8 only affects the question
+GEMMs. On Max-Q (300 W) the same FP8 path is **859 ms / 74 q/s** versus
+**61 q/s** BF16; the 4090 W4A8 reference is **933 ms / 69 q/s** at 450 W.
+The 547 W WS result is not a hardware comparison: that instance ran at
+1695 MHz and 376 W, while the 600 W host sustained 2445–2482 MHz and ~605 W.
+On the 4090: 1q **43 ms** warm, 8K/64q **1.02 s**, 24K/64q **1.29 s**. The
+16-entry pinned GPU state cache plus an 8 GiB host L2 serves **16 states at
 69 q/s** and **32 states at 63 q/s**; long states are protected by a 2 GiB
 scratch reserve. On H200, long-state 64q is **1.27 s at 8K** and **2.62 s at
 24K**, versus **4.39 s** and **9.45 s** for vLLM-SR.
@@ -240,6 +249,9 @@ The image and compose file carry production defaults. The most important knobs:
 | `DECIDRA_HOST_STATE_CACHE_BYTES` | `8589934592` | host L2 for overflow states |
 | `DECIDRA_BATCH_ROWS` | `32` | question-row budget per pass |
 | `DECIDRA_BATCH_WINDOW_US` | `2000` | request coalescing window |
+| `DECIDRA_NATIVE_FP8` | off | SM120 approximate FP8 GEMMs |
+| `DECIDRA_FP8_MODE` | `mlp` | `mlp`, `gate_up`, or `all_linear` |
+| `DECIDRA_FP8_MIN_ROWS` | `512` | FP8 question-row threshold; capture stays BF16 |
 | `DECIDRA_METRICS_ENABLED` | `true` | Prometheus `/metrics` |
 
 See [docs/DEPLOY.md](docs/DEPLOY.md) for the full environment reference, H100

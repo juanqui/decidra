@@ -172,6 +172,53 @@ extern "C" __global__ void quant_int8_per_token_bf16(
   }
 }
 
+__device__ __forceinline__ unsigned char to_fp8_e4m3(float x) {
+  __nv_fp8_storage_t s =
+      __nv_cvt_float_to_fp8(x, __NV_SATFINITE, __NV_E4M3);
+  return static_cast<unsigned char>(s);
+}
+
+// Per-token symmetric FP8 E4M3 quantization of bf16 activations/weights.
+extern "C" __global__ void quant_fp8_per_token_bf16(
+    const bf16* __restrict__ x, unsigned char* __restrict__ out,
+    float* __restrict__ scales, int rows, int k, float clip) {
+  extern __shared__ float red[];
+  int row = blockIdx.x;
+  if (row >= rows) return;
+  const bf16* xr = x + (size_t)row * k;
+  float m = 0.f;
+  for (int i = threadIdx.x; i < k; i += blockDim.x)
+    m = fmaxf(m, fabsf(bf2f(xr[i])));
+  red[threadIdx.x] = m;
+  __syncthreads();
+  for (int off = blockDim.x / 2; off > 0; off >>= 1) {
+    if (threadIdx.x < off)
+      red[threadIdx.x] = fmaxf(red[threadIdx.x], red[threadIdx.x + off]);
+    __syncthreads();
+  }
+  float scale = fmaxf(red[0] * clip, 1e-10f) / 448.f;
+  if (threadIdx.x == 0) scales[row] = scale;
+  __syncthreads();
+  unsigned char* orow = out + (size_t)row * k;
+  for (int i = threadIdx.x; i < k; i += blockDim.x)
+    orow[i] = to_fp8_e4m3(bf2f(xr[i]) / scale);
+}
+
+// Epilogue for cuBLAS FP8 GEMM: C is column-major [N, M] f32.
+extern "C" __global__ void scale_fp8_gemm_bf16(
+    const float* __restrict__ c, const float* __restrict__ w_scale,
+    const float* __restrict__ a_scale, bf16* __restrict__ out, int rows,
+    int cols) {
+  long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long total = (long)rows * cols;
+  if (idx >= total) return;
+  int row = (int)(idx / cols);
+  int col = (int)(idx - (long)row * cols);
+  // cuBLASLt C is column-major [N, M], which is row-major [M, N] in
+  // memory. Scale by output row (col) and token row (row).
+  out[idx] = f2bf(c[(long)row * cols + col] * w_scale[col] * a_scale[row]);
+}
+
 // Per-token symmetric INT8 quantization of an f32 activation matrix.
 extern "C" __global__ void quant_int8_per_token_f32(
     const float* __restrict__ x, int8_t* __restrict__ out,

@@ -191,24 +191,38 @@ SM120 is a Blackwell workstation ISA, not a small SM100:
 - FP8 and INT8 large-M GEMMs use cuBLAS/cuBLASLt rather than SM100 collectives;
 - Blackwell GeForce/WORKSTATION FP8 requires the TN operand layout.
 
-### SM120 large-M precision
+### SM120 FP8 question path
 
-The SM120 recommendation is the merged BF16 path: on a 600 W host it answers
-64 questions in **775 ms / 83 q/s** with a state-once parity of 0.0102, while
-vLLM-SR `vllm-srun` on the same host takes 3.23 s / 20 q/s. Marlin W4A8 on a
-power-limited 547 W host was 964 ms, but its single-vs-batch parity is 0.081,
-so it is not the recommended Blackwell configuration. Attempts to improve large-M W4A8 with a per-row W8A8
-view reached 923 ms but raised the parity delta to 0.281: the checkpoint's
-per-64-group activation scales cannot be replaced with one scale per token
-without losing accuracy. FP8 E4M3 through cuBLASLt (939 ms) and a transposed
-W8A8 layout (1.88 s) were also rejected. None of those paths is compiled into
-the serving dispatch.
+The default is BF16 for state capture and for all rows below
+`DECIDRA_FP8_MIN_ROWS` (512). With `DECIDRA_NATIVE_FP8=1` and
+`DECIDRA_FP8_MODE=all_linear`, large question passes use E4M3 FP8 GEMMs for
+the MLP and projection linears:
 
-Rejected SM120 experiments: large c8 regrouping (no throughput gain) and
-chunked GDN for short questions (973 ms vs 775 ms BF16). They are not compiled
-into the serving path.
+- weights are converted once at load to per-output-row E4M3 + f32 scales;
+- activations are quantized per token;
+- M is padded to 16 and cuBLASLt runs TN FP8 GEMMs;
+- a fused epilogue applies the weight-row and activation-token scales and
+  writes BF16;
+- `capture_state` sets a guard so state capture never uses FP8.
 
-## 5. Performance on one RTX 4090 (450 W cap)
+On the 600 W WS host this lowers 64q c1 from **775 ms to 623 ms**
+(103 q/s), and on Max-Q from **1,045 ms to 859 ms** (74 q/s). FP8 is
+approximate: the measured single-vs-batch probability delta is **0.0362**
+(versus 0.0102 for BF16) and the top choice matched on all **64** probe rows. The
+all-linear mode is both faster and lower-error than gate/up-only (0.0248) and
+all-MLP (0.0497) variants.
+
+Rejected SM120 experiments: fused gate/up + SiLU (616.8 ms but parity
+0.0547), FP8 fast accumulation (no gain), an L8 register GDN variant
+(correctness failure), W8A8 (parity 0.281), W8A8 transposed (1.88 s), chunked
+GDN for short questions (973 ms), and GDN vc32/vc64 changes (no gain).
+
+The remaining time is dominated by the f32 GDN recurrence (~86 ms at 600 W),
+cascade attention (~27 ms), RMSNorm/residual/epilogue kernels, and the state
+cache/readout path. The FP8 linears are at roughly 80% of the SM120 FP8 tensor
+peak at the sustained clock.
+
+## 5. Performance on one RTX 4090 (450 W cap)## 5. Performance on one RTX 4090 (450 W cap)
 
 Both GPUs are capped at 450 W. The 4090 draws ~449 W at ~2.82 GHz. Defaults:
 W4A8 g64, gate/up/down/o/q INT8 group, k/v W4A16, register GDN, suffix-only

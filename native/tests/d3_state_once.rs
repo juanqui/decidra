@@ -132,7 +132,14 @@ fn d3_state_once_batch() {
             .unwrap_or(false);
     // SM120's cuBLAS BF16 shape selection is slightly less batch-invariant
     // than Hopper; the measured RTX PRO 6000 BF16 delta is 0.0102.
-    let one_limit = if matches!(engine.gpu.arch, decidra_native::arch::GpuArch::Sm120) {
+    // The opt-in SM120 FP8 path is explicitly approximate; its measured
+    // single-vs-batch delta is 0.036 and it keeps the top choice on this probe.
+    let fp8 = std::env::var("DECIDRA_NATIVE_FP8")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let one_limit = if fp8 {
+        0.05
+    } else if matches!(engine.gpu.arch, decidra_native::arch::GpuArch::Sm120) {
         0.02
     } else if int8 {
         0.05

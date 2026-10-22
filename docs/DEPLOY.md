@@ -16,10 +16,11 @@ package is mounted read-only; weights are never baked into the image.
   exact-state caches. A re-quantized W4A8 H200 artifact must pass the 32-row
   accuracy gate before use; the SM80-style Marlin path was slower than BF16 on
   H200.
-- On RTX PRO 6000 Blackwell (96 GB) use the BF16 package. It passes the
-  state-once parity gate (max Δp 0.0102) and is the recommended Blackwell path.
-  W4A8 fits and is slightly faster, but its single-vs-batch parity is 0.081 on
-  this stack; do not use it where per-row equivalence is required.
+- On RTX PRO 6000 Blackwell (96 GB) use the BF16 package by default. It
+  passes the state-once parity gate (max Δp 0.0102). The opt-in FP8 question
+  path reaches **623 ms / 103 q/s** on a 600 W WS card and **859 ms / 74 q/s**
+  on a 300 W Max-Q card, with approximate parity (0.0362). State capture stays
+  BF16. W4A8 is not recommended on this stack (0.081 parity).
 - `libcublas.so.13` / `libcublasLt.so.13` at runtime.
 - The d3-turbo package: `config.json`, `decision_config.json` with
   `attention_mode: prefix_bidir`, `tokenizer.json`, `model.safetensors`,
@@ -64,12 +65,25 @@ DECIDRA_BATCH_ROWS=32 \
 DECIDRA_BIND_ADDR=0.0.0.0:8899 \
 ./target/release/decidra
 
-# RTX PRO 6000 Blackwell (SM120, BF16)
+# RTX PRO 6000 Blackwell (SM120, BF16 default)
 CUDA_VISIBLE_DEVICES=0 \
 DECIDRA_CHECKPOINT=/srv/models/d3-turbo \
 DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo \
 DECIDRA_NATIVE_MARLIN=0 \
 DECIDRA_NATIVE_GPU_EMBED=true \
+DECIDRA_BATCH_ROWS=32 \
+DECIDRA_BIND_ADDR=0.0.0.0:8899 \
+./target/release/decidra
+
+# RTX PRO 6000 Blackwell (SM120, opt-in approximate FP8 question path)
+CUDA_VISIBLE_DEVICES=0 \
+DECIDRA_CHECKPOINT=/srv/models/d3-turbo \
+DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo \
+DECIDRA_NATIVE_MARLIN=0 \
+DECIDRA_NATIVE_GPU_EMBED=true \
+DECIDRA_NATIVE_FP8=1 \
+DECIDRA_FP8_MODE=all_linear \
+DECIDRA_FP8_MIN_ROWS=512 \
 DECIDRA_BATCH_ROWS=32 \
 DECIDRA_BIND_ADDR=0.0.0.0:8899 \
 ./target/release/decidra
@@ -135,6 +149,9 @@ copies the real cuBLAS/cuBLASLt files.
 | `DECIDRA_HOST_STATE_CACHE_BYTES` | `8589934592` | host L2 for overflow states |
 | `DECIDRA_STATE_ONCE_MAX_ROWS` | `64` | coalesced question rows per pass |
 | `DECIDRA_FLASHINFER_FA3` | off | opt-in Hopper FA3 (FA2 is faster for d3) |
+| `DECIDRA_NATIVE_FP8` | off | SM120 approximate FP8 question GEMMs |
+| `DECIDRA_FP8_MODE` | `mlp` | `mlp`, `gate_up`, or `all_linear` |
+| `DECIDRA_FP8_MIN_ROWS` | `512` | FP8 question-row threshold |
 | `DECIDRA_METRICS_ENABLED` | `true` | Prometheus `/metrics` |
 
 ## Health

@@ -3,7 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use cudarc::cublas::CudaBlas;
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaStream, sys};
+use cudarc::cublaslt::safe::CudaBlasLT;
+use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, sys};
 use cudarc::nvrtc::Ptx;
 
 use crate::arch::{ArchProfile, GpuArch};
@@ -15,6 +16,9 @@ pub struct Gpu {
     /// Vendored Marlin W4A16 module (third_party/marlin).
     pub marlin_module: Arc<CudaModule>,
     pub blas: CudaBlas,
+    /// cuBLASLt handle and workspace for SM120 FP8 matmul.
+    pub blaslt: CudaBlasLT,
+    pub blaslt_workspace: CudaSlice<u8>,
     /// Streaming multiprocessor count of the open device. Marlin launches one
     /// persistent block per SM; a fixed 128 leaves SMs idle on larger parts.
     pub sms: usize,
@@ -63,6 +67,8 @@ impl Gpu {
             .load_module(Ptx::from_binary(marlin.to_vec()))
             .context("loading Marlin cubin")?;
         let blas = CudaBlas::new(stream.clone()).context("creating cuBLAS handle")?;
+        let blaslt = CudaBlasLT::new(stream.clone()).context("creating cuBLASLt handle")?;
+        let blaslt_workspace = stream.alloc_zeros::<u8>(32 * 1024 * 1024)?;
         let sms = ctx
             .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)
             .context("querying multiprocessor count")? as usize;
@@ -73,6 +79,8 @@ impl Gpu {
             module,
             marlin_module,
             blas,
+            blaslt,
+            blaslt_workspace,
             sms,
             arch,
             profile,

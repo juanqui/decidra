@@ -23,12 +23,22 @@ pub struct Lora {
     pub rank: usize,
 }
 
+/// FP8 E4M3 view of a BF16 linear for SM120 large-M MLP GEMMs.
+pub struct Fp8Weight {
+    /// [out, in] row-major E4M3 bytes.
+    pub w: CudaSlice<u8>,
+    /// [out] dequantization scale.
+    pub scale: CudaSlice<f32>,
+}
+
 pub enum LinearWeight {
     /// Merged (unquantized) BF16 weight, row-major [out, in].
     Bf16 {
         out: usize,
         in_: usize,
         w: CudaSlice<bf16>,
+        /// Optional SM120 FP8 image for large-M MLP GEMMs.
+        fp8: Option<Fp8Weight>,
         lora: Option<Arc<Lora>>,
     },
     /// Marlin W4A16 layout (repacked), asymmetric or symmetric group 64/128.
@@ -99,6 +109,13 @@ impl LinearWeight {
     }
 
     /// Weight quantization group size (64 or 128); 0 for BF16.
+    pub fn fp8(&self) -> Option<&Fp8Weight> {
+        match self {
+            LinearWeight::Bf16 { fp8, .. } => fp8.as_ref(),
+            _ => None,
+        }
+    }
+
     pub fn group_size(&self) -> usize {
         match self {
             LinearWeight::Marlin { group_size, .. }
@@ -177,6 +194,8 @@ pub struct WeightProvider<'a> {
     /// Layer indices that use all-linear INT8 (sorted), overriding the
     /// per-module exclusion list inside those layers.
     pub int8_all_layers: Vec<usize>,
+    /// Build FP8 E4M3 images for MLP linears on SM120.
+    pub sm120_fp8_mlp: bool,
     /// Optional LoRA adapter store (PEFT `base_model.model.<module>` keys).
     pub lora_store: Option<&'a Store>,
     /// LoRA scale, `lora_alpha / r`.
@@ -211,6 +230,7 @@ impl<'a> WeightProvider<'a> {
             int8_group_scale: false,
             int8_group_exclude: Vec::new(),
             int8_all_layers: Vec::new(),
+            sm120_fp8_mlp: false,
             lora_store: None,
             lora_scale: 1.0,
             stream: gpu.stream.clone(),
@@ -414,10 +434,43 @@ impl<'a> WeightProvider<'a> {
         }
         let out = info.shape[0];
         let in_ = info.shape[1];
+        let w = self.upload(&wname)?;
+        let fp8_mode = std::env::var("DECIDRA_FP8_MODE").unwrap_or_else(|_| "mlp".to_owned());
+        let fp8_selected = if fp8_mode == "all_linear" {
+            true
+        } else if fp8_mode == "gate_up" {
+            module.contains("mlp.gate_proj") || module.contains("mlp.up_proj")
+        } else {
+            module.contains("mlp.gate_proj")
+                || module.contains("mlp.up_proj")
+                || module.contains("mlp.down_proj")
+        };
+        let fp8 = if self.sm120_fp8_mlp && lora.is_none() && fp8_selected {
+            let mut q = self.stream.alloc_zeros::<u8>(out * in_)?;
+            let mut scales = self.stream.alloc_zeros::<f32>(out)?;
+            crate::kernels::quant_fp8_bf16(
+                self.gpu,
+                &self.kernels.quant_fp8_bf16,
+                &w,
+                &mut q,
+                &mut scales,
+                out,
+                in_,
+                1.0,
+            )?;
+            self.stream.synchronize()?;
+            Some(Fp8Weight {
+                w: q,
+                scale: scales,
+            })
+        } else {
+            None
+        };
         Ok(LinearWeight::Bf16 {
             out,
             in_,
-            w: self.upload(&wname)?,
+            w,
+            fp8,
             lora,
         })
     }
@@ -463,7 +516,6 @@ impl<'a> WeightProvider<'a> {
         let post_norm = self.upload(&self.name(&format!("{l}post_attention_layernorm.weight")))?;
         let gate_proj = self.linear(&self.name(&format!("{l}mlp.gate_proj")))?;
         let up_proj = self.linear(&self.name(&format!("{l}mlp.up_proj")))?;
-
         let down_proj = self.linear(&self.name(&format!("{l}mlp.down_proj")))?;
         let mixer = match kind {
             crate::config::LayerType::FullAttention => {

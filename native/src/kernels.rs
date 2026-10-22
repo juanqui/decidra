@@ -47,6 +47,8 @@ pub struct Kernels {
     pub quant_int8_bf16: CudaFunction,
     pub quant_int8_group_bf16: CudaFunction,
     pub quant_int8_group_silu_bf16: CudaFunction,
+    pub quant_fp8_bf16: CudaFunction,
+    pub scale_fp8_gemm: CudaFunction,
     pub dequant_w4a16: CudaFunction,
     pub gemm_w4a16: CudaFunction,
     pub gemm_w4a16_m128: CudaFunction,
@@ -173,6 +175,8 @@ impl Kernels {
             quant_int8_bf16: gpu.func("quant_int8_per_token_bf16")?,
             quant_int8_group_bf16: gpu.func("quant_int8_group_bf16")?,
             quant_int8_group_silu_bf16: gpu.func("quant_int8_group_silu_bf16")?,
+            quant_fp8_bf16: gpu.func("quant_fp8_per_token_bf16")?,
+            scale_fp8_gemm: gpu.func("scale_fp8_gemm_bf16")?,
             dequant_w4a16: gpu.func("dequant_w4a16_bf16")?,
             marlin_cfgs: {
                 const NAMES: [&str; 5] = [
@@ -952,6 +956,57 @@ pub fn quant_int8_group_bf16(
     l.arg(&global_scale);
     l.arg(&clip);
     l.arg(&u_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+pub fn quant_fp8_bf16(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    out: &mut CudaSlice<u8>,
+    scales: &mut CudaSlice<f32>,
+    rows: usize,
+    k: usize,
+    clip: f32,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 256 * 4,
+    };
+    let (r_i, k_i) = (rows as i32, k as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(out);
+    l.arg(scales);
+    l.arg(&r_i);
+    l.arg(&k_i);
+    l.arg(&clip);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn scale_fp8_gemm(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    c: &CudaSlice<f32>,
+    w_scale: &CudaSlice<f32>,
+    a_scale: &CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+    rows: usize,
+    cols: usize,
+) -> Result<()> {
+    let cfg = cfg_1d(rows * cols, 256);
+    let (r_i, c_i) = (rows as i32, cols as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(c);
+    l.arg(w_scale);
+    l.arg(a_scale);
+    l.arg(out);
+    l.arg(&r_i);
+    l.arg(&c_i);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }
