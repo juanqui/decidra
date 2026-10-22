@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Added native SM120 NVFP4 checkpoint loading and FP4×FP4 cuBLASLt GEMMs.
+- Added dynamic NVFP4 activation quantization with a coalesced one-CTA-per-row
+  kernel and block-scaled VEC16_UE4M3 scale repacking.
+- Added `quant/quantize_nvfp4.py` for GPTQ NVFP4 with d3 `prefix_bidir`
+  calibration and per-scope module selection.
+- NVFP4 W4A4 is explicitly experimental: full MLP+attention is 500.8 ms /
+  128 q/s on a 600 W RTX PRO 6000 but fails the 32-row HF accuracy gate
+  (28/32, max Δp 0.279). FP8 remains the validated approximate path
+  (32/32, max Δp 0.0115).
+
 ## 0.2.0 — 2026-10-22
 
 Public d3-turbo release.

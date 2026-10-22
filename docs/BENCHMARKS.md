@@ -219,3 +219,21 @@ path. The remaining gap is dominated by the GDN scan's arithmetic intensity and
 the per-row cascade attention launches. The next work is a batched ragged
 cascade and a fused/tensor-core GDN scan, plus an SM90 W4A8 WGMMA kernel if the
 15 GB artifact must be used on H100/H200.
+
+
+## NVFP4 experimental (RTX PRO 6000, 600 W)
+
+FP4 W4A4 is faster in its full form but does **not** meet the 32-row HF
+accuracy gate on d3-turbo. It is not a default or recommended serving path.
+
+| Configuration | 64q c1 | HF top-1 | Max Δp |
+|---|---:|---:|---:|
+| Full MLP + attention W4A4, GDN BF16 | **500.8 ms / 128 q/s** | 28/32 | 0.279 |
+| MLP W4A4, attention BF16 | — | 29/32 | 0.284 |
+| gate/up W4A4, down/attention BF16 | 611 ms / 105 q/s | 29/32 | 0.113 |
+| FP8 all-linear (recommended) | 623 ms / 103 q/s | **32/32** | **0.0115** |
+
+The full W4A4 checkpoint used 1,024 d3 `prefix_bidir` calibration rows and
+GPTQ; see `docs/ENGINE.md` and `quant/quantize_nvfp4.py`. The FP4 kernel and
+checkpoint loader are retained for experiments; quality-sensitive deployments
+should use BF16 or the validated FP8 path.

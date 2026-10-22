@@ -212,10 +212,42 @@ approximate: the measured single-vs-batch probability delta is **0.0362**
 all-linear mode is both faster and lower-error than gate/up-only (0.0248) and
 all-MLP (0.0497) variants.
 
+### SM120 NVFP4 path (experimental)
+
+The loader also accepts compressed-tensors `nvfp4-pack-quantized`
+checkpoints: E2M1 weights packed two per byte, E4M3 group-16 scales,
+`weight_global_scale`, and `input_global_scale`. The native path repacks the
+checkpoint scales into cuBLASLt's block-scaled VEC16_UE4M3 layout, quantizes
+activations dynamically per row and 16-element group, and runs an FP4×FP4
+cuBLASLt TN GEMM with BF16 C/D. The routing is per module, so GDN
+`linear_attn` and any other ignored projections stay BF16 in the same
+checkpoint.
+
+This path is **not recommended for quality-sensitive decisions** and is not
+enabled by default. On the 32-row HF reference probe:
+
+| FP4 scope | 64q c1, 600 W | HF top-1 | Max Δp | unsafe flips |
+|---|---:|---:|---:|---:|
+| gate/up only, down/attention BF16 | 611 ms / 105 q/s | 29/32 | 0.113 | 2 |
+| all MLP, attention BF16 | — | 29/32 | 0.284 | 2 |
+| all MLP + full attention, GDN BF16 | **500.8 ms / 128 q/s** | 28/32 | 0.279 | 3 |
+
+For comparison, the opt-in FP8 path is 32/32 with max Δp **0.0115** and
+623 ms / 103 q/s. FP8 therefore dominates the quality/perf tradeoff on this
+model. NVFP4 remains an explicit artifact-level opt-in for experiments; the
+repo does not ship an NVFP4 checkpoint. The recipe used 1,024 d3
+`prefix_bidir` calibration rows, GPTQ with static act-order, and excluded
+`lm_head`, `visual`, `linear_attn`, and `readout`; see
+`quant/quantize_nvfp4.py`. Its default `--scope gate_up` also leaves the
+full-attention and down projections BF16; `--scope mlp` and `--scope all`
+reproduce the table variants. The loader detects NVFP4 per module, so no
+environment flag is required beyond supplying the artifact.
+
 Rejected SM120 experiments: fused gate/up + SiLU (616.8 ms but parity
 0.0547), FP8 fast accumulation (no gain), an L8 register GDN variant
 (correctness failure), W8A8 (parity 0.281), W8A8 transposed (1.88 s), chunked
-GDN for short questions (973 ms), and GDN vc32/vc64 changes (no gain).
+GDN for short questions (973 ms), GDN vc32/vc64 changes (no gain), and NVFP4
+W4A4 for quality-sensitive serving (accuracy gate failed).
 
 The remaining time is dominated by the f32 GDN recurrence (~86 ms at 600 W),
 cascade attention (~27 ms), RMSNorm/residual/epilogue kernels, and the state

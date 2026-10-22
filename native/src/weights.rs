@@ -31,6 +31,19 @@ pub struct Fp8Weight {
     pub scale: CudaSlice<f32>,
 }
 
+/// Compressed-tensors NVFP4 weight: E2M1 pairs + per-16 UE4M3 scales in the
+/// cuBLASLt 128x4 tiled layout.
+pub struct NvFp4Weight {
+    /// [out, in/2] packed E2M1 pairs.
+    pub packed: CudaSlice<u8>,
+    /// cuBLASLt VEC16 UE4M3 scale layout for A.
+    pub scales: CudaSlice<u8>,
+    pub out: usize,
+    pub in_: usize,
+    pub weight_global: f32,
+    pub input_global: f32,
+}
+
 pub enum LinearWeight {
     /// Merged (unquantized) BF16 weight, row-major [out, in].
     Bf16 {
@@ -74,6 +87,8 @@ pub enum LinearWeight {
         zp: CudaSlice<i32>,
         lora: Option<Arc<Lora>>,
     },
+    /// NVFP4 W4A4 checkpoint, consumed directly by the SM120 FP4 GEMM.
+    NvFp4(NvFp4Weight),
 }
 
 impl LinearWeight {
@@ -105,6 +120,7 @@ impl LinearWeight {
             LinearWeight::Bf16 { lora, .. }
             | LinearWeight::Marlin { lora, .. }
             | LinearWeight::PackedW4A16 { lora, .. } => lora.as_ref(),
+            LinearWeight::NvFp4(_) => None,
         }
     }
 
@@ -120,7 +136,7 @@ impl LinearWeight {
         match self {
             LinearWeight::Marlin { group_size, .. }
             | LinearWeight::PackedW4A16 { group_size, .. } => *group_size,
-            LinearWeight::Bf16 { .. } => 0,
+            LinearWeight::Bf16 { .. } | LinearWeight::NvFp4(_) => 0,
         }
     }
 
@@ -129,6 +145,7 @@ impl LinearWeight {
             LinearWeight::Bf16 { out, .. }
             | LinearWeight::PackedW4A16 { out, .. }
             | LinearWeight::Marlin { out, .. } => *out,
+            LinearWeight::NvFp4(w) => w.out,
         }
     }
     pub fn in_(&self) -> usize {
@@ -136,6 +153,7 @@ impl LinearWeight {
             LinearWeight::Bf16 { in_, .. }
             | LinearWeight::PackedW4A16 { in_, .. }
             | LinearWeight::Marlin { in_, .. } => *in_,
+            LinearWeight::NvFp4(w) => w.in_,
         }
     }
 }
@@ -265,6 +283,12 @@ impl<'a> WeightProvider<'a> {
     pub fn linear(&self, module: &str) -> Result<LinearWeight> {
         let lora = self.lora_for(module)?;
         let packed_name = format!("{module}.weight_packed");
+        if self
+            .store
+            .contains(&format!("{module}.weight_global_scale"))
+        {
+            return self.nvfp4_linear(module);
+        }
         if self.store.contains(&packed_name) {
             let shape = self.store.i64(&format!("{module}.weight_shape"))?;
             if shape.len() != 2 {
@@ -475,6 +499,53 @@ impl<'a> WeightProvider<'a> {
         })
     }
 
+    fn nvfp4_linear(&self, module: &str) -> Result<LinearWeight> {
+        let packed_info = self
+            .store
+            .info(&format!("{module}.weight_packed"))
+            .with_context(|| format!("{module}.weight_packed missing"))?;
+        if packed_info.shape.len() != 2 {
+            bail!("{module}.weight_packed must be 2-D");
+        }
+        let out = packed_info.shape[0];
+        let in_ = packed_info.shape[1] * 2;
+        if in_ % 64 != 0 {
+            bail!("{module}: K={in_} is not a multiple of 64");
+        }
+        let scale_info = self
+            .store
+            .info(&format!("{module}.weight_scale"))
+            .with_context(|| format!("{module}.weight_scale missing"))?;
+        if scale_info.shape != vec![out, in_ / 16] {
+            bail!(
+                "{module}: weight_scale shape {:?}, expected [{out}, {}]",
+                scale_info.shape,
+                in_ / 16
+            );
+        }
+        let packed = self.store.u8(&format!("{module}.weight_packed"))?;
+        let scales_raw = self.store.u8(&format!("{module}.weight_scale"))?;
+        let scales = repack_nvfp4_scales(&scales_raw, out, in_);
+        let weight_global = *self
+            .store
+            .f32(&format!("{module}.weight_global_scale"))?
+            .first()
+            .context("weight_global_scale empty")?;
+        let input_global = *self
+            .store
+            .f32(&format!("{module}.input_global_scale"))?
+            .first()
+            .context("input_global_scale empty")?;
+        Ok(LinearWeight::NvFp4(NvFp4Weight {
+            packed: self.stream.clone_htod(&packed)?,
+            scales: self.stream.clone_htod(&scales)?,
+            out,
+            in_,
+            weight_global,
+            input_global,
+        }))
+    }
+
     /// Load a PEFT LoRA pair for `module` and upload it (B pre-scaled).
     fn lora_for(&self, module: &str) -> Result<Option<Arc<Lora>>> {
         let Some(store) = self.lora_store else {
@@ -557,6 +628,22 @@ impl<'a> WeightProvider<'a> {
     pub fn embedding(&self) -> String {
         self.name("embed_tokens.weight")
     }
+}
+
+/// Compressed-tensors `[outer, inner/16]` row-major scales -> cuBLASLt
+/// VEC16 UE4M3 128x4 tiled layout.
+fn repack_nvfp4_scales(src: &[u8], outer: usize, inner: usize) -> Vec<u8> {
+    let inner_blocks = inner / 64;
+    let outer_blocks = outer.div_ceil(128);
+    let mut dst = vec![0u8; inner_blocks * outer_blocks * 512];
+    for o in 0..outer {
+        for j in 0..inner / 16 {
+            let base = ((j / 4) + (o / 128) * inner_blocks) * 512;
+            let off = base + (o % 32) * 16 + ((o % 128) / 32) * 4 + (j % 4);
+            dst[off] = src[o * (inner / 16) + j];
+        }
+    }
+    dst
 }
 
 /// vLLM `get_scale_perms()` for group-wise scales.
@@ -741,6 +828,23 @@ fn awq_transform_host(packed: &[i32], zp: &[i32], k: usize, n: usize, groups: us
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nvfp4_scale_repack_uses_cublaslt_tiles() {
+        // outer=3, inner=128: two 64-wide inner tiles, one 128-wide outer tile.
+        let outer = 3usize;
+        let inner = 128usize;
+        let src: Vec<u8> = (0..outer * inner / 16).map(|i| i as u8).collect();
+        let got = repack_nvfp4_scales(&src, outer, inner);
+        assert_eq!(got.len(), (inner / 64) * 1 * 512);
+        for o in 0..outer {
+            for j in 0..inner / 16 {
+                let base = ((j / 4) + (o / 128) * (inner / 64)) * 512;
+                let off = base + (o % 32) * 16 + ((o % 128) / 32) * 4 + (j % 4);
+                assert_eq!(got[off], src[o * (inner / 16) + j], "o={o} j={j}");
+            }
+        }
+    }
 
     #[test]
     fn a8_scale_permutation_matches_vllm() {

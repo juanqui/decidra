@@ -48,6 +48,7 @@ pub struct Kernels {
     pub quant_int8_group_bf16: CudaFunction,
     pub quant_int8_group_silu_bf16: CudaFunction,
     pub quant_fp8_bf16: CudaFunction,
+    pub quant_nvfp4_bf16: CudaFunction,
     pub scale_fp8_gemm: CudaFunction,
     pub dequant_w4a16: CudaFunction,
     pub gemm_w4a16: CudaFunction,
@@ -176,6 +177,7 @@ impl Kernels {
             quant_int8_group_bf16: gpu.func("quant_int8_group_bf16")?,
             quant_int8_group_silu_bf16: gpu.func("quant_int8_group_silu_bf16")?,
             quant_fp8_bf16: gpu.func("quant_fp8_per_token_bf16")?,
+            quant_nvfp4_bf16: gpu.func("quant_nvfp4_act_bf16")?,
             scale_fp8_gemm: gpu.func("scale_fp8_gemm_bf16")?,
             dequant_w4a16: gpu.func("dequant_w4a16_bf16")?,
             marlin_cfgs: {
@@ -988,6 +990,33 @@ pub fn quant_fp8_bf16(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn quant_nvfp4_activation(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    packed: &mut CudaSlice<u8>,
+    scales: &mut CudaSlice<u8>,
+    rows: usize,
+    k: usize,
+    input_global: f32,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: (k * std::mem::size_of::<bf16>()) as u32,
+    };
+    let (r_i, k_i) = (rows as i32, k as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(packed);
+    l.arg(scales);
+    l.arg(&r_i);
+    l.arg(&k_i);
+    l.arg(&input_global);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
 pub fn scale_fp8_gemm(
     gpu: &Gpu,
     f: &CudaFunction,

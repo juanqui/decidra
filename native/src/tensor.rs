@@ -19,6 +19,7 @@ pub enum DType {
     I32,
     I64,
     U8,
+    F8E4M3,
 }
 
 impl DType {
@@ -30,6 +31,7 @@ impl DType {
             "I32" => DType::I32,
             "I64" => DType::I64,
             "U8" | "BOOL" => DType::U8,
+            "F8_E4M3" | "F8_E4M3FN" => DType::F8E4M3,
             other => bail!("unsupported safetensors dtype {other}"),
         })
     }
@@ -214,6 +216,15 @@ impl Store {
             DType::BF16 => Ok(bf16_slice(bytes).iter().map(|v| v.to_f32()).collect()),
             other => bail!("{name}: expected F32/BF16, got {other:?}"),
         }
+    }
+
+    /// Raw bytes (U8/I8/F8 and other 8-bit tensors).
+    pub fn u8(&self, name: &str) -> Result<Vec<u8>> {
+        let info = self
+            .info(name)
+            .with_context(|| format!("tensor {name} not found"))?;
+        let bytes = &self.shards[info.shard].mmap[info.start..info.end];
+        Ok(bytes.to_vec())
     }
 
     pub fn i32(&self, name: &str) -> Result<Vec<i32>> {

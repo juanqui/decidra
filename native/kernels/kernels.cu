@@ -219,6 +219,63 @@ extern "C" __global__ void scale_fp8_gemm_bf16(
   out[idx] = f2bf(c[(long)row * cols + col] * w_scale[col] * a_scale[row]);
 }
 
+__device__ __forceinline__ unsigned char fp4_encode(float x) {
+  float a = fabsf(x);
+  unsigned char e;
+  if (a < 0.25f) e = 0;
+  else if (a < 0.75f) e = 1;
+  else if (a < 1.25f) e = 2;
+  else if (a < 1.75f) e = 3;
+  else if (a < 2.5f) e = 4;
+  else if (a < 3.5f) e = 5;
+  else if (a < 5.0f) e = 6;
+  else e = 7;
+  return (x < 0.f) ? (unsigned char)(e | 8) : e;
+}
+
+// NVFP4 activation quantization for cuBLASLt:
+// - x [rows, k] bf16, multiplied by input_global
+// - packed [rows, k/2] E2M1 pairs (low nibble = even K)
+// - scales in cuBLASLt VEC16 UE4M3 128x4 tiled layout
+extern "C" __global__ void quant_nvfp4_act_bf16(
+    const bf16* __restrict__ x, unsigned char* __restrict__ packed,
+    unsigned char* __restrict__ scales, int rows, int k, float input_global) {
+  // One CTA per token row. The row is staged in shared memory with coalesced
+  // global loads, then each thread owns whole 16-element scale groups.
+  extern __shared__ bf16 xs[];
+  int row = blockIdx.x;
+  if (row >= rows) return;
+  int tid = threadIdx.x;
+  const bf16* src = x + (long)row * k;
+  for (int i = tid; i < k; i += blockDim.x) xs[i] = src[i];
+  __syncthreads();
+  int groups = k / 16;
+  for (int j = tid; j < groups; j += blockDim.x) {
+    float v[16];
+    float m = 0.f;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) {
+      v[i] = bf2f(xs[j * 16 + i]) * input_global;
+      m = fmaxf(m, fabsf(v[i]));
+    }
+    float sf = fmaxf(m / 6.0f, 1e-10f);
+    unsigned char sb = static_cast<unsigned char>(
+        __nv_cvt_float_to_fp8(sf, __NV_SATFINITE, __NV_E4M3));
+    __half_raw hr = __nv_cvt_fp8_to_halfraw(sb, __NV_E4M3);
+    float sd = __half2float(*reinterpret_cast<__half*>(&hr));
+    unsigned char* out = packed + (long)row * (k / 2) + j * 8;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      unsigned char lo = fp4_encode(v[2 * i] / sd);
+      unsigned char hi = fp4_encode(v[2 * i + 1] / sd);
+      out[i] = lo | (hi << 4);
+    }
+    int base = ((j / 4) + (row / 128) * (k / 64)) * 512;
+    int off = base + (row % 32) * 16 + ((row % 128) / 32) * 4 + (j % 4);
+    scales[off] = sb;
+  }
+}
+
 // Per-token symmetric INT8 quantization of an f32 activation matrix.
 extern "C" __global__ void quant_int8_per_token_f32(
     const float* __restrict__ x, int8_t* __restrict__ out,

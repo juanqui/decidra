@@ -19,7 +19,7 @@ use crate::kernels::{self, Kernels};
 use crate::tensor::Store;
 use crate::weights::{
     Fp8Weight, FullAttentionWeights, GdnWeights, LayerWeights, LinearWeight, Lora, MixerWeights,
-    WeightProvider,
+    NvFp4Weight, WeightProvider,
 };
 
 struct PoolState {
@@ -275,6 +275,11 @@ struct Fp8Scratch {
     scales: CudaSlice<f32>,
 }
 
+struct NvFp4Scratch {
+    packed: CudaSlice<u8>,
+    scales: CudaSlice<u8>,
+}
+
 struct CaptureGuard<'a>(&'a AtomicBool);
 impl Drop for CaptureGuard<'_> {
     fn drop(&mut self) {
@@ -421,6 +426,7 @@ pub struct Engine {
     marlin_locks: Mutex<Option<CudaSlice<i32>>>,
     int8_scratch: Mutex<Option<Int8Scratch>>,
     fp8_scratch: Mutex<Option<Fp8Scratch>>,
+    nvfp4_scratch: Mutex<Option<NvFp4Scratch>>,
     capturing: AtomicBool,
     /// Warp-per-query attention (fast for long contexts); the original block
     /// kernel remains selectable.
@@ -841,6 +847,7 @@ impl Engine {
             marlin_locks: Mutex::new(None),
             int8_scratch: Mutex::new(None),
             fp8_scratch: Mutex::new(None),
+            nvfp4_scratch: Mutex::new(None),
             capturing: AtomicBool::new(false),
             warp_attention: AtomicBool::new(true),
             flashinfer,
@@ -3778,6 +3785,188 @@ impl Engine {
         Ok(())
     }
 
+    fn nvfp4_gemm(
+        &self,
+        x: &CudaSlice<bf16>,
+        rows: usize,
+        w: &NvFp4Weight,
+        n: usize,
+        k: usize,
+    ) -> Result<Buf> {
+        let packed_need = rows * (k / 2);
+        let scale_need = (k / 64) * rows.div_ceil(128) * 512;
+        let mut scratch = self.nvfp4_scratch.lock().unwrap();
+        if scratch
+            .as_ref()
+            .is_none_or(|s| s.packed.len() < packed_need || s.scales.len() < scale_need)
+        {
+            *scratch = Some(NvFp4Scratch {
+                packed: self.gpu.stream.alloc_zeros::<u8>(packed_need)?,
+                scales: self.gpu.stream.alloc_zeros::<u8>(scale_need)?,
+            });
+        }
+        let s = scratch.as_mut().unwrap();
+        kernels::quant_nvfp4_activation(
+            &self.gpu,
+            &self.kernels.quant_nvfp4_bf16,
+            x,
+            &mut s.packed,
+            &mut s.scales,
+            rows,
+            k,
+            w.input_global,
+        )?;
+        let mut d = self.gpu.stream.alloc_zeros::<bf16>(rows * n)?;
+        let a_layout = LtLayout(
+            lt_result::create_matrix_layout(
+                lt_sys::cudaDataType::CUDA_R_4F_E2M1,
+                k as u64,
+                n as u64,
+                k as i64,
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 A layout: {e:?}"))?,
+        );
+        let b_layout = LtLayout(
+            lt_result::create_matrix_layout(
+                lt_sys::cudaDataType::CUDA_R_4F_E2M1,
+                k as u64,
+                rows as u64,
+                k as i64,
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 B layout: {e:?}"))?,
+        );
+        let c_layout = LtLayout(
+            lt_result::create_matrix_layout(
+                lt_sys::cudaDataType::CUDA_R_16BF,
+                n as u64,
+                rows as u64,
+                n as i64,
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 C layout: {e:?}"))?,
+        );
+        let desc = LtDesc(
+            lt_result::create_matmul_desc(
+                lt_sys::cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                lt_sys::cudaDataType::CUDA_R_32F,
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 desc: {e:?}"))?,
+        );
+        let ta = 1i32;
+        let tb = 0i32;
+        let scale_mode =
+            lt_sys::cublasLtMatmulMatrixScale_t::CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+        unsafe {
+            lt_result::set_matmul_desc_attribute(
+                desc.0,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSA,
+                &ta as *const _ as *const c_void,
+                std::mem::size_of::<i32>(),
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 transa: {e:?}"))?;
+            lt_result::set_matmul_desc_attribute(
+                desc.0,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_TRANSB,
+                &tb as *const _ as *const c_void,
+                std::mem::size_of::<i32>(),
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 transb: {e:?}"))?;
+            lt_result::set_matmul_desc_attribute(
+                desc.0,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                &scale_mode as *const _ as *const c_void,
+                std::mem::size_of::<lt_sys::cublasLtMatmulMatrixScale_t>(),
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 A scale mode: {e:?}"))?;
+            lt_result::set_matmul_desc_attribute(
+                desc.0,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                &scale_mode as *const _ as *const c_void,
+                std::mem::size_of::<lt_sys::cublasLtMatmulMatrixScale_t>(),
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 B scale mode: {e:?}"))?;
+        }
+        let (ap, _ag) = w.packed.device_ptr(&self.gpu.stream);
+        let (as_, _asg) = w.scales.device_ptr(&self.gpu.stream);
+        let (bp, _bg) = s.packed.device_ptr(&self.gpu.stream);
+        let (bs, _bsg) = s.scales.device_ptr(&self.gpu.stream);
+        let (dp, _dg) = d.device_ptr_mut(&self.gpu.stream);
+        unsafe {
+            lt_result::set_matmul_desc_attribute(
+                desc.0,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                &as_ as *const _ as *const c_void,
+                std::mem::size_of::<u64>(),
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 A scale: {e:?}"))?;
+            lt_result::set_matmul_desc_attribute(
+                desc.0,
+                lt_sys::cublasLtMatmulDescAttributes_t::CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                &bs as *const _ as *const c_void,
+                std::mem::size_of::<u64>(),
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 B scale: {e:?}"))?;
+        }
+        let pref = LtPref(
+            lt_result::create_matmul_pref().map_err(|e| anyhow::anyhow!("fp4 pref: {e:?}"))?,
+        );
+        let ws = self.gpu.blaslt_workspace.len();
+        unsafe {
+            lt_result::set_matmul_pref_attribute(
+                pref.0,
+                lt_sys::cublasLtMatmulPreferenceAttributes_t::CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                &ws as *const _ as *const c_void,
+                std::mem::size_of::<usize>(),
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 workspace: {e:?}"))?;
+        }
+        let heuristic = unsafe {
+            lt_result::get_matmul_algo_heuristic(
+                *self.gpu.blaslt.handle(),
+                desc.0,
+                a_layout.0,
+                b_layout.0,
+                c_layout.0,
+                c_layout.0,
+                pref.0,
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 heuristic: {e:?}"))?
+        };
+        let (wsp, _wsg) = self.gpu.blaslt_workspace.device_ptr(&self.gpu.stream);
+        let alpha = 1.0 / (w.weight_global * w.input_global);
+        let beta = 0f32;
+        unsafe {
+            lt_result::matmul(
+                *self.gpu.blaslt.handle(),
+                desc.0,
+                &alpha as *const f32 as *const c_void,
+                &beta as *const f32 as *const c_void,
+                ap as *const c_void,
+                a_layout.0,
+                bp as *const c_void,
+                b_layout.0,
+                dp as *const c_void,
+                c_layout.0,
+                dp as *mut c_void,
+                c_layout.0,
+                &heuristic.algo,
+                wsp as *mut c_void,
+                ws,
+                self.gpu.stream.cu_stream() as *mut _,
+            )
+            .map_err(|e| anyhow::anyhow!("fp4 gemm: {e:?}"))?;
+        }
+        drop(_dg);
+        drop(_ag);
+        drop(_asg);
+        drop(_bg);
+        drop(_bsg);
+        drop(_wsg);
+        Ok(Buf {
+            slice: Some(d),
+            pool: self.pool.clone(),
+        })
+    }
+
     fn fp8_gemm(
         &self,
         x: &CudaSlice<bf16>,
@@ -4102,6 +4291,9 @@ impl Engine {
                 }
                 self.cpu_prof.end("w4.launch", __p);
                 Ok(c)
+            }
+            LinearWeight::NvFp4(w) => {
+                return self.nvfp4_gemm(x, rows, w, n, k);
             }
             LinearWeight::PackedW4A16 {
                 group_size,
@@ -4908,6 +5100,7 @@ impl Engine {
             LinearWeight::Marlin { .. } => {
                 bail!("{module} is repacked to Marlin; rerun without --marlin")
             }
+            LinearWeight::NvFp4(_) => bail!("{module} is an NVFP4 checkpoint"),
             LinearWeight::PackedW4A16 {
                 out,
                 in_,
