@@ -269,6 +269,36 @@ extern "C" __global__ void self_test_kernel(const bf16* __restrict__ in,
 //   zero_centered=1: effective weight = 1 + w   (Qwen3_5RMSNorm)
 //   zero_centered=0: effective weight = w       (Qwen3_5RMSNormGated without gate)
 // ---------------------------------------------------------------------------
+// Fused residual add + RMSNorm. The residual is rounded to bf16 exactly as
+// add_bf16 does, then normalized, matching the unfused sequence bit-for-bit.
+extern "C" __global__ void add_rmsnorm_bf16(const bf16* __restrict__ x,
+                                            const bf16* __restrict__ mix,
+                                            const bf16* __restrict__ w,
+                                            bf16* __restrict__ residual,
+                                            bf16* __restrict__ out, int cols,
+                                            float eps, int zero_centered) {
+  extern __shared__ float red[];
+  int row = blockIdx.x;
+  const bf16* xr = x + (size_t)row * cols;
+  const bf16* mr = mix + (size_t)row * cols;
+  bf16* rr = residual + (size_t)row * cols;
+  bf16* orow = out + (size_t)row * cols;
+  float ss = 0.f;
+  for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+    bf16 r = f2bf(bf2f(xr[j]) + bf2f(mr[j]));
+    rr[j] = r;
+    float v = bf2f(r);
+    ss += v * v;
+  }
+  float mean = block_reduce_sum(ss, red) / (float)cols;
+  float scale = 1.0f / sqrtf(mean + eps);
+  __syncthreads();
+  for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+    float wv = bf2f(w[j]) + (zero_centered ? 1.0f : 0.0f);
+    orow[j] = f2bf(bf2f(rr[j]) * scale * wv);
+  }
+}
+
 extern "C" __global__ void rmsnorm_bf16(const bf16* __restrict__ x,
                                         const bf16* __restrict__ w,
                                         bf16* __restrict__ out, int cols,
@@ -607,6 +637,17 @@ extern "C" __global__ void gdn_prepare(const bf16* __restrict__ qkv,
 // out: bf16 [seq, heads, dv] (torch casts core_attn_out to bf16 here)
 // One block per value head, 128 threads; thread j owns value dimension j.
 // ---------------------------------------------------------------------------
+// Broadcast one f32 recurrent seed into every row of a batched state buffer.
+extern "C" __global__ void gdn_seed_broadcast(const float* __restrict__ seed,
+                                              float* __restrict__ state,
+                                              int elems) {
+  const int b = blockIdx.y;
+  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < elems;
+       i += gridDim.x * blockDim.x) {
+    state[(size_t)b * elems + i] = seed[i];
+  }
+}
+
 extern "C" __global__ void gdn_recurrent(const float* __restrict__ qf,
                                          const float* __restrict__ kf,
                                          const float* __restrict__ vf,
@@ -1374,7 +1415,7 @@ __device__ __forceinline__ void tf32_tile_cr(const float* a, int lda,
 // row stride of X (VC for the U columns, DK for the W columns) and ISV selects
 // the beta*V or beta*exp(G)*K right-hand side. The 32 rows are a serial chain,
 // so the inner j loop carries four independent accumulators.
-template <int XS, bool ISV>
+template <int XS, int C, int VC, bool ISV>
 __device__ __forceinline__ void gdn_solve4(float* __restrict__ X,
                                            const float* __restrict__ Ab,
                                            const float* __restrict__ Vb,
@@ -1382,8 +1423,6 @@ __device__ __forceinline__ void gdn_solve4(float* __restrict__ X,
                                            const float* __restrict__ Bb,
                                            const float* __restrict__ ExpG,
                                            int off) {
-  constexpr int C = GDN_CHUNK_C;
-  constexpr int VC = 64;
   constexpr int DK = 128;
 #pragma unroll 4
   for (int i = 0; i < C; ++i) {
@@ -1446,20 +1485,21 @@ __device__ __forceinline__ void gdn_solve4(float* __restrict__ X,
 // `gdn_chunked_tc_prof` runs the identical code with clock64() phase counters.
 // Phase indices: 0 load, 1 KK^T, 2 A mask, 3 solve, 4 Vnew, 5 Q load, 6 QS,
 // 7 QK+mask, 8 output, 9 state update. One counter per phase per block.
-template <bool PROF>
+template <bool PROF, int C, int VC>
 __device__ __forceinline__ void gdn_chunked_tc_body(
     const float* __restrict__ q, const float* __restrict__ k,
     const float* __restrict__ v, const float* __restrict__ g,
     const float* __restrict__ beta, float* __restrict__ state,
     bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc,
     unsigned long long* __restrict__ prof) {
-  constexpr int C = GDN_CHUNK_C;
-  // The chunked path is only launched for DK=DV=128, VC=64. Making these
+  // C is a template parameter: 32 for SM89/long state, 64 for short SM90
+  // question blocks. The chunked path is only launched for DK=DV=128, VC=64.
+  // Making these
   // compile-time constants lets every loop below fully unroll.
   constexpr int DK = 128;
   constexpr int DV = 128;
-  constexpr int VC = 64;
   constexpr int THREADS = 256;
+  constexpr int VTILES = VC / 16;
   constexpr int P = 10;
   unsigned long long acc[P];
   if (PROF) {
@@ -1513,9 +1553,7 @@ __device__ __forceinline__ void gdn_chunked_tc_body(
             k + ((size_t)(t0 + i) * heads + h) * DK + d);
       *reinterpret_cast<float4*>(Kb + e) = val;
     }
-#pragma unroll
-    for (int it = 0; it < (C * VC) / (4 * THREADS); ++it) {
-      int e = (it * THREADS + tid) * 4;
+    for (int e = tid * 4; e < C * VC; e += 4 * THREADS) {
       int i = e / VC, j = e - i * VC;
       float4 val = make_float4(0.f, 0.f, 0.f, 0.f);
       if (i < L)
@@ -1545,9 +1583,10 @@ __device__ __forceinline__ void gdn_chunked_tc_body(
     __syncthreads();
     PH_MARK(0);
 
-    // A = K K^T (2x2 16x16 tiles), then strict-lower mask + beta + decay.
-    if (warp < 4) {
-      int mi = warp >> 1, nj = warp & 1;
+    // A = K K^T (C/16 square tiles), then strict-lower mask + beta + decay.
+    constexpr int TILES = C / 16;
+    for (int tile = warp; tile < TILES * TILES; tile += 8) {
+      int mi = tile / TILES, nj = tile - mi * TILES;
       tf32_tile_rc(Kb + mi * 16 * DK, DK, Kb + nj * 16 * DK, DK,
                    Ab + mi * 16 * C + nj * 16, C, DK);
     }
@@ -1567,23 +1606,21 @@ __device__ __forceinline__ void gdn_chunked_tc_body(
     // first half of warp 1 the 64 U columns. Columns are independent, so the
     // substitution needs no per-row __syncthreads.
     if (tid < DK / 4) {
-      gdn_solve4<DK, false>(WQ, Ab, Vb, Kb, Bb, ExpG, tid * 4);
+      gdn_solve4<DK, C, VC, false>(WQ, Ab, Vb, Kb, Bb, ExpG, tid * 4);
     } else if (tid < (DK + VC) / 4) {
-      gdn_solve4<VC, true>(Ub, Ab, Vb, Kb, Bb, ExpG, (tid - DK / 4) * 4);
+      gdn_solve4<VC, C, VC, true>(Ub, Ab, Vb, Kb, Bb, ExpG, (tid - DK / 4) * 4);
     }
     __syncthreads();
     PH_MARK(3);
 
     // Vnew = U - W S (WMMA into Vb, then elementwise subtract into Ub).
-    if (warp < 8) {
-      int mi = warp >> 2, nj = warp & 3;
+    for (int tile = warp; tile < TILES * VTILES; tile += 8) {
+      int mi = tile / VTILES, nj = tile - mi * VTILES;
       tf32_tile_rr(WQ + mi * 16 * DK, DK, S + nj * 16, VC,
                    Vb + mi * 16 * VC + nj * 16, VC, DK);
     }
     __syncthreads();
-#pragma unroll
-    for (int it = 0; it < (C * VC) / (4 * THREADS); ++it) {
-      int e = (it * THREADS + tid) * 4;
+    for (int e = tid * 4; e < C * VC; e += 4 * THREADS) {
       float4 a = *reinterpret_cast<const float4*>(Ub + e);
       float4 b = *reinterpret_cast<const float4*>(Vb + e);
       a.x -= b.x; a.y -= b.y; a.z -= b.z; a.w -= b.w;
@@ -1607,8 +1644,8 @@ __device__ __forceinline__ void gdn_chunked_tc_body(
     PH_MARK(5);
 
     // QS into Vb.
-    if (warp < 8) {
-      int mi = warp >> 2, nj = warp & 3;
+    for (int tile = warp; tile < TILES * VTILES; tile += 8) {
+      int mi = tile / VTILES, nj = tile - mi * VTILES;
       tf32_tile_rr(WQ + mi * 16 * DK, DK, S + nj * 16, VC,
                    Vb + mi * 16 * VC + nj * 16, VC, DK);
     }
@@ -1616,8 +1653,8 @@ __device__ __forceinline__ void gdn_chunked_tc_body(
     PH_MARK(6);
 
     // QK^T (2x2) into Ab, then inclusive-lower decay mask.
-    if (warp < 4) {
-      int mi = warp >> 1, nj = warp & 1;
+    for (int tile = warp; tile < TILES * TILES; tile += 8) {
+      int mi = tile / TILES, nj = tile - mi * TILES;
       tf32_tile_rc(WQ + mi * 16 * DK, DK, Kb + nj * 16 * DK, DK,
                    Ab + mi * 16 * C + nj * 16, C, DK);
     }
@@ -1630,15 +1667,13 @@ __device__ __forceinline__ void gdn_chunked_tc_body(
     PH_MARK(7);
 
     // Am @ Vnew into WQ (Q is dead now), then combine with QS.
-    if (warp < 8) {
-      int mi = warp >> 2, nj = warp & 3;
+    for (int tile = warp; tile < TILES * VTILES; tile += 8) {
+      int mi = tile / VTILES, nj = tile - mi * VTILES;
       tf32_tile_rr(Ab + mi * 16 * C, C, Ub + nj * 16, VC,
                    WQ + mi * 16 * VC + nj * 16, VC, C);
     }
     __syncthreads();
-#pragma unroll
-    for (int it = 0; it < (C * VC) / (4 * THREADS); ++it) {
-      int e = (it * THREADS + tid) * 4;
+    for (int e = tid * 4; e < C * VC; e += 4 * THREADS) {
       int i = e / VC, j = e - i * VC;
       if (i >= L) continue;
       float4 qs = *reinterpret_cast<const float4*>(Vb + e);
@@ -1719,8 +1754,8 @@ extern "C" __global__ void gdn_chunked_tc(
     const float* __restrict__ v, const float* __restrict__ g,
     const float* __restrict__ beta, float* __restrict__ state,
     bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc) {
-  gdn_chunked_tc_body<false>(q, k, v, g, beta, state, out, seq, heads, dk, dv,
-                             vc, nullptr);
+  gdn_chunked_tc_body<false, GDN_CHUNK_C, 64>(q, k, v, g, beta, state, out, seq,
+                                               heads, dk, dv, vc, nullptr);
 }
 
 extern "C" __global__ void gdn_chunked_tc_prof(
@@ -1729,8 +1764,8 @@ extern "C" __global__ void gdn_chunked_tc_prof(
     const float* __restrict__ beta, float* __restrict__ state,
     bf16* __restrict__ out, int seq, int heads, int dk, int dv, int vc,
     unsigned long long* __restrict__ prof) {
-  gdn_chunked_tc_body<true>(q, k, v, g, beta, state, out, seq, heads, dk, dv,
-                            vc, prof);
+  gdn_chunked_tc_body<true, GDN_CHUNK_C, 64>(q, k, v, g, beta, state, out, seq,
+                                              heads, dk, dv, vc, prof);
 }
 
 // One launch for a batch of sequences. Grid is (dv/VC, heads, batch); each
@@ -1748,12 +1783,15 @@ extern "C" __global__ void gdn_chunked_tc_batched(
   const int l = lens[z];
   const size_t krow = (size_t)heads * dk;
   const size_t vrow = (size_t)heads * dv;
-  gdn_chunked_tc_body<false>(q + o * krow, k + o * krow, v + o * vrow,
-                             g + (size_t)o * heads, beta + (size_t)o * heads,
-                             state + (size_t)z * krow * dv, out + o * vrow, l,
-                             heads, dk, dv, vc, nullptr);
+  gdn_chunked_tc_body<false, 32, 64>(q + o * krow, k + o * krow,
+                                      v + o * vrow, g + (size_t)o * heads,
+                                      beta + (size_t)o * heads,
+                                      state + (size_t)z * krow * dv,
+                                      out + o * vrow, l, heads, dk, dv, vc,
+                                      nullptr);
 }
 
+// SM90 short-question variant: one 64-token chunk for a <=64-token block.
 // ---------------------------------------------------------------------------
 // Batched variants: every sequence is a contiguous row range
 // [offsets[s], offsets[s] + lens[s]) in the flattened [total, ...] buffers.
@@ -1917,6 +1955,67 @@ extern "C" __global__ void gdn_recurrent_split_batched(
   for (int i = i0; i < i1; ++i) col[(size_t)i * dv + j] = S[i * pad + j];
 }
 
+// Register-resident GDN recurrence: four lanes per value column, 32 f32 state
+// values per thread, no shared state. Grid (heads*dv/vc, batch), block vc*4.
+extern "C" __global__ void gdn_recurrent_reg_split_batched(
+    const float* __restrict__ qf, const float* __restrict__ kf,
+    const float* __restrict__ vf, const float* __restrict__ g,
+    const float* __restrict__ beta, float* __restrict__ state,
+    bf16* __restrict__ out, const int* __restrict__ offsets,
+    const int* __restrict__ lens, int heads, int dk, int dv, int vc,
+    int chunks) {
+  constexpr int L = 4;
+  constexpr int PER = 32;
+  int sidx = blockIdx.y;
+  int h = blockIdx.x / chunks;
+  int chunk = blockIdx.x % chunks;
+  int tid = threadIdx.x;
+  int j = tid / L;
+  int lane = tid % L;
+  if (j >= vc || lane >= L) return;
+  int base = offsets[sidx];
+  int seq = lens[sidx];
+  int v0 = chunk * vc;
+  int gj = v0 + j;
+  int i0 = lane * PER;
+  float* col = state + ((size_t)sidx * heads + h) * dk * dv + v0;
+  float s[PER];
+#pragma unroll
+  for (int i = 0; i < PER; ++i) s[i] = col[(size_t)(i0 + i) * dv + j];
+
+  for (int t = 0; t < seq; ++t) {
+    int row = base + t;
+    float dec = expf(g[row * heads + h]);
+    float bt = beta[row * heads + h];
+    const float* kt = kf + ((size_t)row * heads + h) * dk + i0;
+    const float* qt = qf + ((size_t)row * heads + h) * dk + i0;
+    float kv = 0.f;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+      float sv = s[i] * dec;
+      s[i] = sv;
+      kv += sv * kt[i];
+    }
+    kv += __shfl_xor_sync(0xffffffffu, kv, 1);
+    kv += __shfl_xor_sync(0xffffffffu, kv, 2);
+    float del = (vf[((size_t)row * heads + h) * dv + gj] - kv) * bt;
+    float o = 0.f;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+      float sv = s[i] + kt[i] * del;
+      s[i] = sv;
+      o += sv * qt[i];
+    }
+    o += __shfl_xor_sync(0xffffffffu, o, 1);
+    o += __shfl_xor_sync(0xffffffffu, o, 2);
+    if (lane == 0)
+      out[((size_t)row * heads + h) * dv + gj] = f2bf(o);
+  }
+
+#pragma unroll
+  for (int i = 0; i < PER; ++i) col[(size_t)(i0 + i) * dv + j] = s[i];
+}
+
 // Single-column shared-state GDN recurrence, one CTA per (head slice, seq).
 // grid: (heads*chunks, batch); block: vc; smem: dk*vc*4.
 extern "C" __global__ void gdn_recurrent_shared_batched(
@@ -1980,7 +2079,7 @@ extern "C" __global__ void gather_rows_bf16(const bf16* __restrict__ src,
 
 // ===========================================================================
 // Tiled causal GQA attention (FlashAttention-2 style) for sm_89, BF16.
-// Added by the standalone /tmp/jev-attn work; see attn.cu for the host wrapper.
+// Standalone attention kernel; see attn.cu for the host wrapper.
 // Grid: (ceil(seq/64), n_heads), block: 256, dynamic smem: 101376 B at hd=256.
 // ===========================================================================
 

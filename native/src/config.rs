@@ -22,7 +22,7 @@ pub struct Config {
     pub rope_theta: f32,
     pub partial_rotary_factor: f32,
     pub attn_output_gate: bool,
-    /// Full-attention layers attend noncausally (AutoTrust/d3/d3-turbo/pplx).
+    /// Full-attention layers attend with the d3-turbo non-causal mask.
     /// GDN layers remain causal regardless.
     pub noncausal_full: bool,
     /// Exact full-attention mask family. `BlockCascade` is d3-turbo's
@@ -33,8 +33,9 @@ pub struct Config {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionMode {
-    Causal,
-    Full,
+    /// d3-turbo `prefix_bidir`: the state attends within itself, a question
+    /// block attends to the state plus its own block, and no state token sees
+    /// a question.
     BlockCascade,
 }
 
@@ -85,9 +86,8 @@ impl Config {
             .or_else(|| c.get("partial_rotary_factor").and_then(|x| x.as_f64()))
             .unwrap_or(1.0) as f32;
 
-        // Decision checkpoints may declare their prompt attention in
-        // decision_config.json rather than config.json (d3/d3-turbo/pplx do;
-        // AutoTrust uses jev_prompt_attention in config.json).
+        // The d3-turbo contract declares its prompt attention in
+        // decision_config.json.
         let decision_path = dir.join("decision_config.json");
         let decision: Option<Value> = match std::fs::read_to_string(&decision_path) {
             Ok(raw) => Some(
@@ -111,29 +111,18 @@ impl Config {
                 );
             }
         }
-        let attention_mode = config_mode
-            .or(decision_mode)
-            .or_else(|| {
-                v.get("jev_prompt_attention")
-                    .and_then(|x| x.as_str())
-                    .map(|x| if x == "bidirectional" { "noncausal_full_attention" } else { x })
-            });
-        if attention_mode.is_none() && dir.join("readout.safetensors").exists() {
-            anyhow::bail!(
-                "{} has a readout but no attention_mode in config.json or decision_config.json",
-                dir.display()
-            );
-        }
-        // prefix_bidir (d3-turbo) is a bidirectional question block over a causal
-        // state prefix; the noncausal full kernel is the closest available mask
-        // until the block-cascade kernel lands.
+        let attention_mode = config_mode.or(decision_mode);
         let mode = match attention_mode {
-            None | Some("causal") => AttentionMode::Causal,
-            Some("noncausal_full_attention") => AttentionMode::Full,
             Some("prefix_bidir") => AttentionMode::BlockCascade,
-            Some(other) => anyhow::bail!("unsupported attention_mode {other:?}"),
+            Some(other) => anyhow::bail!(
+                "unsupported attention_mode {other:?}; Decidra serves only d3-turbo prefix_bidir"
+            ),
+            None => anyhow::bail!(
+                "{} has no attention_mode; d3-turbo requires prefix_bidir",
+                dir.display()
+            ),
         };
-        let noncausal_full = mode != AttentionMode::Causal;
+        let noncausal_full = true;
 
         Ok(Self {
             hidden_size,
@@ -219,15 +208,6 @@ mod tests {
         let cfg = Config::from_dir(&dir).unwrap();
         assert_eq!(cfg.attention_mode, AttentionMode::BlockCascade);
         assert!(cfg.noncausal_full);
-        write_config(&dir, "noncausal_full_attention");
-        assert_eq!(
-            Config::from_dir(&dir).unwrap().attention_mode,
-            AttentionMode::Full
-        );
-        write_config(&dir, "causal");
-        let causal = Config::from_dir(&dir).unwrap();
-        assert_eq!(causal.attention_mode, AttentionMode::Causal);
-        assert!(!causal.noncausal_full);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

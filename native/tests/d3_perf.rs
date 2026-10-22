@@ -10,7 +10,7 @@ use decidra_native::Engine;
 #[ignore = "requires a d3-turbo checkpoint on a GPU"]
 fn d3_state_once_perf() {
     let model = std::env::var("DECIDRA_D3_MODEL")
-        .unwrap_or_else(|_| "/srv/models/d3-turbo-w4a8-g128".to_string());
+        .unwrap_or_else(|_| "/srv/models/d3-turbo-w4a8-g64-v4".to_string());
     let probe =
         std::env::var("DECIDRA_D3_PROBE").unwrap_or_else(|_| "/tmp/d3_once_batch.json".to_string());
     let repeat: usize = std::env::var("DECIDRA_D3_REPEAT")
@@ -47,7 +47,10 @@ fn d3_state_once_perf() {
 
     let started = Instant::now();
     let engine = Engine::new(Path::new(&model)).expect("engine");
-    if std::env::var("DECIDRA_MARLIN").map(|v| v != "0").unwrap_or(false) {
+    if std::env::var("DECIDRA_MARLIN")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
         engine.set_marlin(true);
         engine.set_marlin_int8(
             std::env::var("DECIDRA_INT8")
@@ -59,9 +62,8 @@ fn d3_state_once_perf() {
                 .map(|v| v != "0")
                 .unwrap_or(false),
         );
-        let exclude = std::env::var("DECIDRA_INT8_EXCLUDE").unwrap_or_else(|_| {
-            "self_attn.o_proj,self_attn.v_proj,self_attn.k_proj".to_owned()
-        });
+        let exclude = std::env::var("DECIDRA_INT8_EXCLUDE")
+            .unwrap_or_else(|_| "self_attn.o_proj,self_attn.v_proj,self_attn.k_proj".to_owned());
         engine.set_int8_exclude(
             exclude
                 .split(',')
@@ -69,7 +71,15 @@ fn d3_state_once_perf() {
                 .map(str::to_owned)
                 .collect(),
         );
-        engine.set_int8_group_exclude(vec!["mlp.gate_proj".to_owned()]);
+        let group_exclude =
+            std::env::var("DECIDRA_INT8_GROUP_EXCLUDE").unwrap_or_else(|_| String::new());
+        engine.set_int8_group_exclude(
+            group_exclude
+                .split(',')
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
         engine.set_int8_all_layers("last:8");
         if let Ok(clip) = std::env::var("DECIDRA_INT8_CLIP") {
             if let Ok(clip) = clip.parse::<f32>() {
@@ -77,7 +87,10 @@ fn d3_state_once_perf() {
             }
         }
     }
-    if std::env::var("DECIDRA_GDN_CHUNKED").map(|v| v != "0").unwrap_or(false) {
+    if std::env::var("DECIDRA_GDN_CHUNKED")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
         engine.set_gdn_chunked(true);
         engine.set_gdn_chunked_tc(true);
         if let Ok(min) = std::env::var("DECIDRA_GDN_CHUNK_MIN") {
@@ -87,7 +100,10 @@ fn d3_state_once_perf() {
         }
     }
     println!("engine open: {:?}", started.elapsed());
-    if std::env::var("DECIDRA_PRELOAD").map(|v| v != "0").unwrap_or(false) {
+    if std::env::var("DECIDRA_PRELOAD")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
         engine.set_gpu_embed(
             std::env::var("DECIDRA_GPU_EMBED")
                 .map(|v| v != "0")

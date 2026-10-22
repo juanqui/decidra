@@ -1,752 +1,406 @@
-//! FIFO batching queue for the native backend.
+//! Dedicated CUDA worker for d3-turbo state-once requests.
 //!
-//! One dedicated thread owns `decidra_native::Engine` and executes requests in
-//! batches. The worker blocks for the first request, then drains additional
-//! requests until the batch window expires, `MAX_BATCH` is reached, or the next
-//! request would exceed `MAX_BATCH_TOKENS`. A request larger than the token cap
-//! runs alone. Order is strict FIFO; a batch is never split.
+//! One engine owns one CUDA context/stream and cannot run concurrent forwards.
+//! The HTTP reactor tokenizes and builds question blocks; this thread:
 //!
-//! `BatchExecutor` is abstract so the queue can be unit-tested without a GPU.
+//! 1. coalesces requests that arrive within a short window;
+//! 2. groups them by exact state token ids;
+//! 3. keeps a pinned exact-state GPU cache plus a host-memory L2 for overflow;
+//! 4. runs one state capture per distinct cold state and one combined question
+//!    pass per state group.
+//!
+//! Repeated or concurrent copies of the same state therefore pay the state
+//! read once and share the question GEMMs; distinct states remain serialized
+//! by the single CUDA stream.
 
-use std::{
-    collections::VecDeque,
-    panic::AssertUnwindSafe,
-    sync::{
-        Arc, Condvar, Mutex, MutexGuard,
-        mpsc::{self, Receiver, Sender},
-    },
-    thread::JoinHandle,
-    time::{Duration, Instant},
-};
+use std::sync::mpsc::{self, SyncSender, TrySendError};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use decidra_native::Engine;
+use decidra_native::HostStateCache;
+use decidra_native::engine::StateCache;
 use tokio::sync::oneshot;
 
 use crate::error::EngineError;
 
-/// Result type returned by an executor for one request.
-pub type ExecResult = Result<Vec<f32>, String>;
-
-/// A request waiting for a forward.
-/// A state-once decision request: one state block, many question blocks.
-pub struct StateOnceRequest {
-    pub state: Vec<u32>,
-    pub questions: Vec<Vec<u32>>,
-    pub codes: Vec<u32>,
-    pub reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
-}
-
-pub struct PendingRequest {
-    pub tokens: Vec<u32>,
-    pub ids: Vec<u32>,
-    pub reply: oneshot::Sender<ExecResult>,
-    enqueued_at: Instant,
-    /// Pushed back from a sealed batch (`Full`/`NoFit`). The next batch starts
-    /// immediately instead of waiting for the window again: the request has
-    /// already paid its batching latency.
-    deferred: bool,
-}
-
-/// Batching policy. `window` is the maximum time the worker waits after the
-/// first request of a batch for more work.
-#[derive(Debug, Clone, Copy)]
-pub struct BatchOptions {
-    pub max_batch: usize,
-    pub max_batch_tokens: usize,
-    pub window: Duration,
-}
-
-impl BatchOptions {
-    pub fn new(max_batch: usize, max_batch_tokens: usize, window: Duration) -> Self {
-        Self {
-            max_batch: max_batch.max(1),
-            max_batch_tokens: max_batch_tokens.max(1),
-            window,
-        }
-    }
-
-    /// Batching disabled: one request per forward and no window wait.
-    pub fn single(max_batch_tokens: usize) -> Self {
-        Self::new(1, max_batch_tokens, Duration::ZERO)
-    }
-}
-
-/// Executes one batch. Implementations must return exactly one result per
-/// request, in input order.
-pub trait BatchExecutor: Send + 'static {
-    fn execute(&mut self, tokens: &[&[u32]], ids: &[&[u32]]) -> Vec<ExecResult>;
-
-    /// Run one state-once request. The default keeps test executors and
-    /// legacy backends compiling; the native executor overrides it.
-    fn execute_state_once(
-        &mut self,
-        _state: &[u32],
-        _questions: &[Vec<u32>],
-        _codes: &[u32],
-    ) -> Result<Vec<Vec<f32>>, String> {
-        Err("this backend has no state-once program".to_owned())
-    }
-}
-
-struct QueueState {
-    pending: VecDeque<PendingRequest>,
-    once: VecDeque<StateOnceRequest>,
-    stopping: bool,
-}
-
-struct Shared {
-    state: Mutex<QueueState>,
-    ready: Condvar,
-}
-
-impl Shared {
-    fn lock(&self) -> MutexGuard<'_, QueueState> {
-        self.state.lock().unwrap_or_else(|error| error.into_inner())
-    }
-}
-
-/// Handle to the engine thread. `submit` is non-blocking; the caller awaits
-/// the returned oneshot receiver.
 pub struct BatchHandle {
-    shared: Arc<Shared>,
-    done: Mutex<Option<Receiver<()>>>,
-    join: Option<JoinHandle<()>>,
+    tx: SyncSender<Job>,
+}
+
+struct Job {
+    state: Vec<u32>,
+    questions: Vec<Vec<u32>>,
+    submitted: Instant,
+    reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
+}
+
+struct CachedState {
+    state: Vec<u32>,
+    cache: StateCache,
+    bytes: usize,
+}
+
+struct HostCachedState {
+    state: Vec<u32>,
+    cache: HostStateCache,
+    bytes: usize,
+}
+
+/// State cache is dominated by 16 full-attention K/V layers (64 KiB/token)
+/// plus the fixed GDN recurrent state.
+fn state_cache_bytes_for(state_len: usize) -> usize {
+    state_len * 65_536 + 160 * 1024 * 1024
 }
 
 impl BatchHandle {
-    /// Start the engine thread. `executor` is moved in and owns the engine.
-    pub fn spawn<E: BatchExecutor>(executor: E, options: BatchOptions) -> Self {
-        let shared = Arc::new(Shared {
-            state: Mutex::new(QueueState {
-                pending: VecDeque::new(),
-                once: VecDeque::new(),
-                stopping: false,
-            }),
-            ready: Condvar::new(),
-        });
-        let (done_tx, done_rx) = mpsc::channel();
-        let worker_shared = Arc::clone(&shared);
-        let join = std::thread::Builder::new()
-            .name("decidra-native-batch".to_owned())
-            .spawn(move || run_worker(executor, options, worker_shared, done_tx))
-            .expect("spawning the native batch worker");
-        Self {
-            shared,
-            done: Mutex::new(Some(done_rx)),
-            join: Some(join),
-        }
+    /// Spawn the single CUDA worker.
+    pub fn spawn(
+        mut engine: Engine,
+        max_queue: usize,
+        batch_requests: usize,
+        batch_rows: usize,
+        batch_window_us: u64,
+        state_cache_entries: usize,
+        state_cache_bytes: usize,
+        host_state_cache_bytes: usize,
+    ) -> Self {
+        let (tx, rx) = mpsc::sync_channel::<Job>(max_queue);
+        thread::Builder::new()
+            .name("decidra-cuda".to_owned())
+            .spawn(move || {
+                if let Err(error) = engine.rebind_blas() {
+                    tracing::error!(%error, "failed to rebind cuBLAS on CUDA worker");
+                }
+                let mut cache: Vec<CachedState> = Vec::with_capacity(state_cache_entries);
+                let mut host_cache: Vec<HostCachedState> = Vec::with_capacity(state_cache_entries);
+                loop {
+                    let first = match rx.recv() {
+                        Ok(job) => job,
+                        Err(_) => break,
+                    };
+                    let first_rows = first.questions.len().max(1);
+                    let max_jobs = (batch_rows / first_rows).max(1).min(batch_requests);
+                    let mut jobs = vec![first];
+                    let deadline = Instant::now() + Duration::from_micros(batch_window_us);
+                    while jobs.len() < max_jobs {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        match rx.recv_timeout(deadline - now) {
+                            Ok(job) => jobs.push(job),
+                            Err(mpsc::RecvTimeoutError::Timeout) => break,
+                            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                                // Flush the jobs already collected, then stop.
+                                run_jobs(
+                                    &engine,
+                                    jobs,
+                                    &mut cache,
+                                    &mut host_cache,
+                                    state_cache_entries,
+                                    state_cache_bytes,
+                                    host_state_cache_bytes,
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    run_jobs(
+                        &engine,
+                        jobs,
+                        &mut cache,
+                        &mut host_cache,
+                        state_cache_entries,
+                        state_cache_bytes,
+                        host_state_cache_bytes,
+                    );
+                }
+            })
+            .expect("spawning the decidra CUDA worker");
+        Self { tx }
     }
 
-    /// Enqueue a request. Fails after shutdown has been requested.
-    pub fn submit(
-        &self,
-        tokens: Vec<u32>,
-        ids: Vec<u32>,
-    ) -> Result<oneshot::Receiver<ExecResult>, EngineError> {
-        let (reply, receiver) = oneshot::channel();
-        let request = PendingRequest {
-            tokens,
-            ids,
-            reply,
-            enqueued_at: Instant::now(),
-            deferred: false,
-        };
-        {
-            let mut state = self.shared.lock();
-            if state.stopping {
-                return Err(EngineError::Internal(
-                    "native batch worker is shutting down".to_owned(),
-                ));
-            }
-            state.pending.push_back(request);
-            metrics::gauge!("decidra_native_batch_queue_depth").set(state.pending.len() as f64);
-        }
-        self.shared.ready.notify_one();
-        Ok(receiver)
-    }
-
-    /// Enqueue a state-once request. It runs alone on the engine thread:
-    /// one state capture plus one question pass.
+    /// Run one state-once request. The receiver resolves when the worker has
+    /// finished the request's question batch.
     pub fn submit_state_once(
         &self,
         state: Vec<u32>,
         questions: Vec<Vec<u32>>,
-        codes: Vec<u32>,
     ) -> Result<oneshot::Receiver<Result<Vec<Vec<f32>>, String>>, EngineError> {
         let (reply, receiver) = oneshot::channel();
-        {
-            let mut guard = self.shared.lock();
-            if guard.stopping {
-                return Err(EngineError::Internal(
-                    "native batch worker is shutting down".to_owned(),
-                ));
-            }
-            while guard
-                .once
-                .front()
-                .is_some_and(|request| request.reply.is_closed())
-            {
-                guard.once.pop_front();
-            }
-            if guard.once.len() >= 32 {
-                return Err(EngineError::Overloaded(
-                    "too many queued state-once requests".to_owned(),
-                ));
-            }
-            guard.once.push_back(StateOnceRequest {
-                state,
-                questions,
-                codes,
-                reply,
-            });
-        }
-        self.shared.ready.notify_one();
-        Ok(receiver)
-    }
-
-    /// Current number of queued (not yet executing) requests.
-    pub fn depth(&self) -> usize {
-        self.shared.lock().pending.len()
-    }
-}
-
-impl Drop for BatchHandle {
-    fn drop(&mut self) {
-        {
-            let mut state = self.shared.lock();
-            state.stopping = true;
-            // Close queued replies so callers cannot wait forever.
-            state.pending.clear();
-            state.once.clear();
-        }
-        self.shared.ready.notify_all();
-
-        let stopped = match self.done.lock() {
-            Ok(mut guard) => guard
-                .take()
-                .is_some_and(|done| done.recv_timeout(Duration::from_secs(30)).is_ok()),
-            Err(_) => false,
+        let job = Job {
+            state,
+            questions,
+            submitted: Instant::now(),
+            reply,
         };
-        match self.join.take() {
-            Some(join) if stopped => {
-                let _ = join.join();
-            }
-            Some(_) => {
-                tracing::warn!(
-                    "native batch worker did not stop within 30s; detaching the engine thread"
-                );
-            }
-            None => {}
+        match self.tx.try_send(job) {
+            Ok(()) => Ok(receiver),
+            Err(TrySendError::Full(_)) => Err(EngineError::Overloaded(
+                "d3-turbo queue is full; retry shortly".to_owned(),
+            )),
+            Err(TrySendError::Disconnected(_)) => Err(EngineError::Internal(
+                "d3-turbo CUDA worker stopped".to_owned(),
+            )),
         }
     }
 }
 
-/// Outcome of trying to add one request to the current batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddOutcome {
-    /// The request joined the batch.
-    Added,
-    /// A hard cap was reached; seal the batch.
-    Full,
-    /// The request would exceed the token cap; it was pushed back and the
-    /// batch must be sealed (waiting cannot help: the head can never fit).
-    NoFit,
-}
-
-/// Add one request if it fits. `Full` and `NoFit` both mean the batch is
-/// sealed; `NoFit` guarantees the batch is non-empty (a lone oversize request
-/// is accepted).
-fn add_to_batch(
-    state: &mut QueueState,
-    batch: &mut Vec<PendingRequest>,
-    batch_tokens: &mut usize,
-    request: PendingRequest,
-    options: &BatchOptions,
-) -> AddOutcome {
-    if request.reply.is_closed() {
-        // Dropped client: discard it and keep the batch open.
-        return AddOutcome::Added;
-    }
-    if batch.len() >= options.max_batch {
-        let mut request = request;
-        request.deferred = true;
-        state.pending.push_front(request);
-        return AddOutcome::Full;
-    }
-    let tokens = request.tokens.len();
-    if !batch.is_empty() && *batch_tokens + tokens > options.max_batch_tokens {
-        // FIFO: keep it at the head of the queue for the next batch.
-        let mut request = request;
-        request.deferred = true;
-        state.pending.push_front(request);
-        return AddOutcome::NoFit;
-    }
-    *batch_tokens += tokens;
-    batch.push(request);
-    if batch.len() >= options.max_batch || *batch_tokens >= options.max_batch_tokens {
-        AddOutcome::Full
-    } else {
-        AddOutcome::Added
-    }
-}
-
-/// Take everything that fits from `state` starting with `first`. A request that
-/// does not fit is pushed back at the head, preserving FIFO. Closed receivers
-/// are skipped. The worker uses [`add_to_batch`] directly with its window; this
-/// helper exists for deterministic batch-policy tests.
-#[cfg(test)]
-fn take_batch(
-    state: &mut QueueState,
-    first: PendingRequest,
-    options: &BatchOptions,
-) -> Vec<PendingRequest> {
-    let mut batch = Vec::with_capacity(options.max_batch);
-    let mut batch_tokens = 0usize;
-    let mut candidate = Some(first);
-    while let Some(request) = candidate.take() {
-        if add_to_batch(state, &mut batch, &mut batch_tokens, request, options) != AddOutcome::Added
-        {
-            break;
-        }
-        candidate = state.pending.pop_front();
-    }
-    batch
-}
-
-fn run_worker<E: BatchExecutor>(
-    mut executor: E,
-    options: BatchOptions,
-    shared: Arc<Shared>,
-    done: Sender<()>,
+fn run_jobs(
+    engine: &Engine,
+    jobs: Vec<Job>,
+    cache: &mut Vec<CachedState>,
+    host_cache: &mut Vec<HostCachedState>,
+    state_cache_entries: usize,
+    state_cache_bytes: usize,
+    host_state_cache_bytes: usize,
 ) {
-    loop {
-        // State-once requests run alone, ahead of the FIFO logits queue.
-        {
-            let mut state = shared.lock();
-            if let Some(request) = state.once.pop_front() {
-                drop(state);
-                if request.reply.is_closed() {
-                    continue;
-                }
-                let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                    executor.execute_state_once(&request.state, &request.questions, &request.codes)
-                }))
-                .unwrap_or_else(|_| Err("native state-once executor panicked".to_owned()));
-                let _ = request.reply.send(result);
-                continue;
-            }
-        }
-        // Block until there is work or shutdown is requested.
-        let mut state = shared.lock();
-        while state.pending.is_empty() && state.once.is_empty() && !state.stopping {
-            state = shared
-                .ready
-                .wait(state)
-                .unwrap_or_else(|error| error.into_inner());
-        }
-        if let Some(request) = state.once.pop_front() {
-            drop(state);
-            let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                executor.execute_state_once(&request.state, &request.questions, &request.codes)
-            }))
-            .unwrap_or_else(|_| Err("native state-once executor panicked".to_owned()));
-            let _ = request.reply.send(result);
-            continue;
-        }
-        let Some(first) = state.pending.pop_front() else {
-            drop(state);
-            break;
-        };
-        metrics::gauge!("decidra_native_batch_queue_depth").set(state.pending.len() as f64);
-
-        // A request that arrives alone only needs a short grace period to pick
-        // up a burst; a full window is for a queue that already has waiters.
-        // This keeps a lone request's latency low without losing coalescing.
-        const LONE_WINDOW: Duration = Duration::from_micros(500);
-        let window = if state.pending.is_empty() {
-            options.window.min(LONE_WINDOW)
-        } else {
-            options.window
-        };
-        let deadline = Instant::now()
-            + if first.deferred {
-                Duration::ZERO
-            } else {
-                window
-            };
-        let mut batch = Vec::with_capacity(options.max_batch);
-        let mut batch_tokens = 0usize;
-        let mut candidate = Some(first);
-        let mut open = true;
-        while open {
-            // Drain whatever is already queued. A hard cap, a no-fit head, or
-            // stopping all seal the batch immediately: waiting cannot make the
-            // head fit, it only adds latency.
-            while let Some(request) = candidate.take().or_else(|| state.pending.pop_front()) {
-                match add_to_batch(&mut state, &mut batch, &mut batch_tokens, request, &options) {
-                    AddOutcome::Added => {}
-                    AddOutcome::Full | AddOutcome::NoFit => {
-                        open = false;
-                        break;
-                    }
-                }
-            }
-            if !open || state.stopping {
-                break;
-            }
-            // Wait for arrivals until the window expires.
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            let (guard, timed_out) = shared
-                .ready
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|error| error.into_inner());
-            state = guard;
-            if state.pending.is_empty() {
-                if timed_out.timed_out() || state.stopping {
-                    break;
-                }
-                continue;
-            }
-            candidate = state.pending.pop_front();
-        }
-
-        metrics::gauge!("decidra_native_batch_queue_depth").set(state.pending.len() as f64);
-        drop(state);
-
-        if batch.is_empty() {
-            continue;
-        }
-
-        let waits: Vec<f64> = batch
-            .iter()
-            .map(|request| request.enqueued_at.elapsed().as_secs_f64())
-            .collect();
-        metrics::histogram!("decidra_native_batch_size").record(batch.len() as f64);
-        for wait in &waits {
-            metrics::histogram!("decidra_native_batch_wait_seconds").record(*wait);
-        }
-
-        let tokens: Vec<&[u32]> = batch
-            .iter()
-            .map(|request| request.tokens.as_slice())
-            .collect();
-        let ids: Vec<&[u32]> = batch.iter().map(|request| request.ids.as_slice()).collect();
-        let mut results =
-            match std::panic::catch_unwind(AssertUnwindSafe(|| executor.execute(&tokens, &ids))) {
-                Ok(results) => results,
-                Err(_) => {
-                    tracing::error!(batch = batch.len(), "native batch executor panicked");
-                    vec![Err("native batch executor panicked".to_owned()); batch.len()]
-                }
-            };
-        results.resize(batch.len(), Err("missing batch result".to_owned()));
-        results.truncate(batch.len());
-        for (request, result) in batch.into_iter().zip(results) {
-            let _ = request.reply.send(result);
+    // Preserve first-seen state order so co-batched replies stay deterministic.
+    let mut groups: Vec<(Vec<u32>, Vec<Job>)> = Vec::new();
+    for job in jobs {
+        match groups.iter_mut().find(|(state, _)| *state == job.state) {
+            Some((_, members)) => members.push(job),
+            None => groups.push((job.state.clone(), vec![job])),
         }
     }
-    let _ = done.send(());
+    // Cost-aware scheduling, opt-in for A/B: shortest estimated GPU work
+    // first. A group older than 500 ms jumps the queue to avoid starvation.
+    if std::env::var("DECIDRA_SCHED_PRIORITY")
+        .map(|value| value != "0")
+        .unwrap_or(false)
+    {
+        groups.sort_by_key(|(state, jobs)| {
+            let age_ms = jobs
+                .iter()
+                .map(|job| job.submitted.elapsed().as_millis() as usize)
+                .max()
+                .unwrap_or(0);
+            if age_ms >= 500 {
+                return 0;
+            }
+            let questions = jobs
+                .iter()
+                .flat_map(|job| job.questions.iter())
+                .map(|question| question.len())
+                .sum::<usize>();
+            let state_cost = if cache.iter().any(|entry| entry.state == *state) {
+                0
+            } else {
+                state.len()
+            };
+            state_cost + questions
+        });
+    }
+    for (state, jobs) in groups {
+        run_group(
+            engine,
+            &state,
+            jobs,
+            cache,
+            host_cache,
+            state_cache_entries,
+            state_cache_bytes,
+            host_state_cache_bytes,
+        );
+    }
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{
-        collections::VecDeque,
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
-        },
-        thread,
-        time::{Duration, Instant},
+fn run_group(
+    engine: &Engine,
+    state: &[u32],
+    jobs: Vec<Job>,
+    cache: &mut Vec<CachedState>,
+    host_cache: &mut Vec<HostCachedState>,
+    state_cache_entries: usize,
+    state_cache_bytes: usize,
+    host_state_cache_bytes: usize,
+) {
+    let cached = cache.iter().position(|entry| entry.state == state);
+    let host_cached = if cached.is_none() {
+        host_cache.iter().position(|entry| entry.state == state)
+    } else {
+        None
     };
-
-    use super::{
-        AddOutcome, BatchExecutor, BatchHandle, BatchOptions, ExecResult, PendingRequest,
-        QueueState,
-    };
-    use tokio::sync::oneshot;
-
-    #[derive(Clone, Default)]
-    struct Recorder {
-        batches: Arc<Mutex<Vec<Vec<Vec<u32>>>>>,
-    }
-
-    impl Recorder {
-        fn batches(&self) -> Vec<Vec<Vec<u32>>> {
-            self.batches.lock().unwrap().clone()
-        }
-    }
-
-    struct Fake {
-        recorder: Recorder,
-        fail_on: Option<u32>,
-        delay: Duration,
-        executed: Arc<AtomicUsize>,
-    }
-
-    impl BatchExecutor for Fake {
-        fn execute(&mut self, tokens: &[&[u32]], _ids: &[&[u32]]) -> Vec<ExecResult> {
-            self.executed.fetch_add(tokens.len(), Ordering::SeqCst);
-            self.recorder
-                .batches
-                .lock()
-                .unwrap()
-                .push(tokens.iter().map(|tokens| tokens.to_vec()).collect());
-            if !self.delay.is_zero() {
-                thread::sleep(self.delay);
+    let hit = cached.is_some() || host_cached.is_some();
+    let pin_cache = std::env::var("DECIDRA_STATE_CACHE_PIN")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let entry_bytes = state_cache_bytes_for(state.len());
+    if cached.is_none() && host_cached.is_none() {
+        let cached_bytes: usize = cache.iter().map(|entry| entry.bytes).sum();
+        if !pin_cache {
+            while !cache.is_empty()
+                && (cache.len() >= state_cache_entries
+                    || cached_bytes.saturating_add(entry_bytes) > state_cache_bytes)
+            {
+                cache.remove(0);
             }
-            tokens
-                .iter()
-                .map(|tokens| {
-                    if self.fail_on == tokens.first().copied() {
-                        Err("fake failure".to_owned())
-                    } else {
-                        Ok(tokens.iter().map(|value| *value as f32).collect())
+        }
+        if let Ok((free, _)) = engine.gpu.mem_info() {
+            let reserve = 2 * 1024 * 1024 * 1024;
+            if free < entry_bytes.saturating_add(reserve) {
+                cache.clear();
+                let _ = engine.trim_pools();
+                if let Ok((free, _)) = engine.gpu.mem_info() {
+                    if free < entry_bytes.saturating_add(reserve) {
+                        let message = format!(
+                            "insufficient GPU memory for a {}-token state (need ~{} MiB, {} MiB free)",
+                            state.len(),
+                            entry_bytes / (1024 * 1024),
+                            free / (1024 * 1024)
+                        );
+                        for job in jobs {
+                            let _ = job.reply.send(Err(message.clone()));
+                        }
+                        return;
                     }
-                })
-                .collect()
+                }
+            }
         }
     }
+    let capture_started = Instant::now();
+    let from_host = host_cached;
 
-    fn fake(recorder: &Recorder, fail_on: Option<u32>) -> Fake {
-        Fake {
-            recorder: recorder.clone(),
-            fail_on,
-            delay: Duration::ZERO,
-            executed: Arc::new(AtomicUsize::new(0)),
-        }
-    }
-
-    fn request(tokens: Vec<u32>) -> (PendingRequest, oneshot::Receiver<ExecResult>) {
-        let (reply, receiver) = oneshot::channel();
-        (
-            PendingRequest {
-                tokens,
-                ids: vec![1],
-                reply,
-                enqueued_at: Instant::now(),
-                deferred: false,
+    let entry = if let Some(index) = cached {
+        cache.remove(index)
+    } else if let Some(index) = host_cached {
+        let host_entry = &host_cache[index];
+        match StateCache::restore(&host_entry.cache, &engine.gpu) {
+            Ok(restored) => CachedState {
+                state: state.to_vec(),
+                cache: restored,
+                bytes: entry_bytes,
             },
-            receiver,
-        )
-    }
-
-    fn state_with(requests: Vec<PendingRequest>) -> QueueState {
-        QueueState {
-            pending: requests.into(),
-            once: VecDeque::new(),
-            stopping: false,
+            Err(error) => {
+                let message = format!("state restore failed: {error}");
+                for job in jobs {
+                    let _ = job.reply.send(Err(message.clone()));
+                }
+                return;
+            }
         }
-    }
-
-    #[tokio::test]
-    async fn window_fills_a_batch_from_queued_requests() {
-        let recorder = Recorder::default();
-        let handle = BatchHandle::spawn(
-            fake(&recorder, None),
-            BatchOptions::new(8, 16384, Duration::from_millis(20)),
-        );
-        let mut receivers = Vec::new();
-        for value in 0..4u32 {
-            receivers.push(handle.submit(vec![value], vec![1]).unwrap());
-        }
-        for (value, receiver) in (0..4u32).zip(receivers) {
-            let logits = receiver.await.unwrap().unwrap();
-            assert_eq!(logits, vec![value as f32]);
-        }
-        let batches = recorder.batches();
-        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 4);
-        assert!(batches.iter().all(|batch| batch.len() <= 8));
-        assert_eq!(batches[0].len(), 4, "batches: {batches:?}");
-    }
-
-    #[tokio::test]
-    async fn max_batch_splits_into_fifo_batches() {
-        let recorder = Recorder::default();
-        let handle = BatchHandle::spawn(
-            fake(&recorder, None),
-            BatchOptions::new(2, 16384, Duration::from_millis(20)),
-        );
-        let mut receivers = Vec::new();
-        for value in 0..5u32 {
-            receivers.push(handle.submit(vec![value], vec![1]).unwrap());
-        }
-        for (value, receiver) in (0..5u32).zip(receivers) {
-            assert_eq!(receiver.await.unwrap().unwrap(), vec![value as f32]);
-        }
-        let batches = recorder.batches();
-        assert!(batches.iter().all(|batch| batch.len() <= 2));
-        assert_eq!(batches.iter().map(Vec::len).sum::<usize>(), 5);
-        let order: Vec<u32> = batches
-            .iter()
-            .flat_map(|batch| batch.iter().map(|tokens| tokens[0]))
-            .collect();
-        assert_eq!(order, vec![0, 1, 2, 3, 4], "FIFO order");
-    }
-
-    #[test]
-    fn max_batch_tokens_keeps_fifo_and_never_splits() {
-        let (a, _ra) = request(vec![1; 400]);
-        let (b, _rb) = request(vec![2; 400]);
-        let (c, _rc) = request(vec![3; 100]);
-        let mut state = state_with(vec![b, c]);
-        let options = BatchOptions::new(8, 512, Duration::from_millis(1));
-        let batch = super::take_batch(&mut state, a, &options);
-        assert_eq!(batch.len(), 1, "400 + 400 exceeds 512");
-        assert_eq!(state.pending.len(), 2, "the next request is kept");
-        assert_eq!(batch[0].tokens.len(), 400);
-
-        let first = state.pending.pop_front().unwrap();
-        let batch = super::take_batch(&mut state, first, &options);
-        assert_eq!(batch.len(), 2, "400 + 100 fits");
-        assert_eq!(batch[0].tokens[0], 2);
-        assert_eq!(batch[1].tokens[0], 3);
-        assert!(state.pending.is_empty());
-    }
-
-    #[test]
-    fn single_request_larger_than_token_cap_runs_alone() {
-        let (big, _r) = request(vec![9; 2000]);
-        let (next, _r2) = request(vec![1; 10]);
-        let mut state = state_with(vec![next]);
-        let options = BatchOptions::new(8, 512, Duration::from_millis(1));
-        let batch = super::take_batch(&mut state, big, &options);
-        assert_eq!(batch.len(), 1);
-        assert_eq!(batch[0].tokens.len(), 2000);
-        assert_eq!(state.pending.len(), 1, "next request stays queued");
-    }
-
-    #[test]
-    fn dropped_receivers_are_skipped() {
-        let (dropped, receiver) = request(vec![1; 10]);
-        drop(receiver);
-        let (kept, _kept_rx) = request(vec![2; 10]);
-        let mut state = state_with(vec![dropped, kept]);
-        let (first, _first_rx) = request(vec![3; 10]);
-        let options = BatchOptions::new(8, 16384, Duration::from_millis(1));
-        let batch = super::take_batch(&mut state, first, &options);
-        assert_eq!(batch.len(), 2);
-        assert_eq!(batch[0].tokens[0], 3);
-        assert_eq!(batch[1].tokens[0], 2);
-        assert!(state.pending.is_empty());
-    }
-
-    #[tokio::test]
-    async fn error_propagation_is_per_request() {
-        let recorder = Recorder::default();
-        let handle = BatchHandle::spawn(
-            fake(&recorder, Some(7)),
-            BatchOptions::new(8, 16384, Duration::from_millis(20)),
-        );
-        let good = handle.submit(vec![1], vec![1]).unwrap();
-        let bad = handle.submit(vec![7], vec![1]).unwrap();
-        assert_eq!(good.await.unwrap().unwrap(), vec![1.0]);
-        assert_eq!(bad.await.unwrap().unwrap_err(), "fake failure");
-    }
-
-    #[tokio::test]
-    async fn dropped_receiver_does_not_execute() {
-        let recorder = Recorder::default();
-        let executed = Arc::new(AtomicUsize::new(0));
-        let handle = BatchHandle::spawn(
-            Fake {
-                recorder: recorder.clone(),
-                fail_on: None,
-                delay: Duration::ZERO,
-                executed: executed.clone(),
+    } else {
+        match engine.capture_state(state) {
+            Ok(captured) => CachedState {
+                state: state.to_vec(),
+                cache: captured,
+                bytes: entry_bytes,
             },
-            BatchOptions::new(8, 16384, Duration::from_millis(5)),
-        );
-        let dropped = handle.submit(vec![4], vec![1]).unwrap();
-        drop(dropped);
-        let live = handle.submit(vec![5], vec![1]).unwrap();
-        assert_eq!(live.await.unwrap().unwrap(), vec![5.0]);
-        assert_eq!(executed.load(Ordering::SeqCst), 1);
-        let batches = recorder.batches();
-        assert!(batches.iter().all(|batch| batch[0][0] != 4), "{batches:?}");
+            Err(error) => {
+                let message = format!("state capture failed: {error}");
+                for job in jobs {
+                    let _ = job.reply.send(Err(message.clone()));
+                }
+                return;
+            }
+        }
+    };
+    let capture_ms = capture_started.elapsed().as_secs_f64() * 1e3;
+    let wait_max_ms = jobs
+        .iter()
+        .map(|job| job.submitted.elapsed().as_secs_f64() * 1e3)
+        .fold(0.0_f64, f64::max);
+    let job_count = jobs.len();
+
+    let mut questions: Vec<&[u32]> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::with_capacity(jobs.len());
+    for job in &jobs {
+        let start = questions.len();
+        questions.extend(job.questions.iter().map(|question| question.as_slice()));
+        ranges.push((start, questions.len()));
+    }
+    let pass_started = Instant::now();
+    let rows = engine.readout_state_once_batch(&entry.cache, &questions);
+    let pass_ms = pass_started.elapsed().as_secs_f64() * 1e3;
+    metrics::counter!(if hit {
+        "semel_state_cache_hits_total"
+    } else {
+        "semel_state_cache_misses_total"
+    })
+    .increment(1);
+    metrics::histogram!("semel_group_jobs").record(job_count as f64);
+    metrics::histogram!("semel_group_rows").record(questions.len() as f64);
+    metrics::histogram!("semel_capture_seconds").record(capture_ms / 1e3);
+    metrics::histogram!("semel_queue_wait_seconds").record(wait_max_ms / 1e3);
+    metrics::histogram!("semel_pass_seconds").record(pass_ms / 1e3);
+    tracing::debug!(
+        jobs = job_count,
+        rows = questions.len(),
+        state = state.len(),
+        cache_hit = hit,
+        wait_max_ms,
+        capture_ms,
+        pass_ms,
+        "state-once group"
+    );
+    match rows {
+        Ok(rows) if rows.len() == questions.len() => {
+            for (job, (start, end)) in jobs.into_iter().zip(ranges) {
+                let _ = job.reply.send(Ok(rows[start..end].to_vec()));
+            }
+        }
+        Ok(rows) => {
+            let message = format!(
+                "state-once returned {} rows for {} questions",
+                rows.len(),
+                questions.len()
+            );
+            for job in jobs {
+                let _ = job.reply.send(Err(message.clone()));
+            }
+        }
+        Err(error) => {
+            let message = format!("state-once question pass failed: {error}");
+            for job in jobs {
+                let _ = job.reply.send(Err(message.clone()));
+            }
+        }
     }
 
-    #[tokio::test]
-    async fn window_expires_without_waiting_forever() {
-        let recorder = Recorder::default();
-        let handle = BatchHandle::spawn(
-            fake(&recorder, None),
-            BatchOptions::new(8, 16384, Duration::from_millis(5)),
-        );
-        let first = handle.submit(vec![1], vec![1]).unwrap();
-        assert_eq!(first.await.unwrap().unwrap(), vec![1.0]);
-        let second = handle.submit(vec![2], vec![1]).unwrap();
-        assert_eq!(second.await.unwrap().unwrap(), vec![2.0]);
-        let batches = recorder.batches();
-        assert_eq!(batches.len(), 2, "separate arrivals form separate batches");
+    if state_cache_entries > 0 {
+        let cached_bytes: usize = cache.iter().map(|entry| entry.bytes).sum();
+        let has_room = cache.len() < state_cache_entries
+            && cached_bytes.saturating_add(entry.bytes) <= state_cache_bytes;
+        if has_room {
+            cache.push(entry);
+            if let Some(index) = from_host {
+                host_cache.remove(index);
+            }
+        } else if from_host.is_none() && host_state_cache_bytes > 0 {
+            host_insert(
+                engine,
+                host_cache,
+                entry,
+                entry_bytes,
+                host_state_cache_bytes,
+            );
+        }
     }
+}
 
-    #[test]
-    fn no_fit_seals_the_batch_immediately() {
-        let (first, _r1) = request(vec![1; 600]);
-        let (next, _r2) = request(vec![2; 600]);
-        let mut state = state_with(vec![next]);
-        let options = BatchOptions::new(8, 1000, Duration::from_millis(1));
-        let mut batch = Vec::new();
-        let mut batch_tokens = 0usize;
-        assert_eq!(
-            super::add_to_batch(&mut state, &mut batch, &mut batch_tokens, first, &options),
-            AddOutcome::Added
-        );
-        let head = state.pending.pop_front().unwrap();
-        assert_eq!(
-            super::add_to_batch(&mut state, &mut batch, &mut batch_tokens, head, &options),
-            AddOutcome::NoFit
-        );
-        assert_eq!(batch.len(), 1);
-        assert_eq!(
-            state.pending.len(),
-            1,
-            "second request stays for the next batch"
-        );
-    }
-
-    #[tokio::test]
-    async fn no_fit_pair_does_not_wait_for_the_window() {
-        let recorder = Recorder::default();
-        // A long window would add 500 ms per batch if the no-fit head did not
-        // seal it immediately.
-        let handle = BatchHandle::spawn(
-            fake(&recorder, None),
-            BatchOptions::new(8, 1000, Duration::from_millis(500)),
-        );
-        let started = Instant::now();
-        let first = handle.submit(vec![1; 600], vec![1]).unwrap();
-        let second = handle.submit(vec![2; 600], vec![1]).unwrap();
-        assert_eq!(first.await.unwrap().unwrap().len(), 600);
-        assert_eq!(second.await.unwrap().unwrap().len(), 600);
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(250),
-            "no-fit pair waited for the window: {elapsed:?}"
-        );
-        let batches = recorder.batches();
-        assert_eq!(
-            batches.len(),
-            2,
-            "600 + 600 cannot share a 1000-token batch"
-        );
-        assert_eq!(batches[0].len(), 1);
-        assert_eq!(batches[1].len(), 1);
-    }
-
-    #[test]
-    fn shutdown_does_not_hang_with_no_work() {
-        let recorder = Recorder::default();
-        let handle = BatchHandle::spawn(
-            fake(&recorder, None),
-            BatchOptions::new(2, 16384, Duration::from_millis(1)),
-        );
-        let started = Instant::now();
-        drop(handle);
-        assert!(started.elapsed() < Duration::from_secs(2));
-        assert!(recorder.batches().is_empty());
+fn host_insert(
+    engine: &Engine,
+    host_cache: &mut Vec<HostCachedState>,
+    entry: CachedState,
+    bytes: usize,
+    budget: usize,
+) {
+    let host = match entry.cache.offload(&engine.gpu) {
+        Ok(host) => host,
+        Err(error) => {
+            tracing::warn!(%error, "state host offload failed");
+            return;
+        }
+    };
+    host_cache.push(HostCachedState {
+        state: entry.state,
+        cache: host,
+        bytes,
+    });
+    let mut total: usize = host_cache.iter().map(|entry| entry.bytes).sum();
+    while total > budget && !host_cache.is_empty() {
+        let removed = host_cache.remove(0);
+        total = total.saturating_sub(removed.bytes);
     }
 }

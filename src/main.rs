@@ -1,25 +1,22 @@
+//! d3-turbo decision server.
+
 use anyhow::{Context, Result, bail};
-use decidra::{
-    api::{self, AppState},
-    backend::Backend,
-    config::Config,
-    telemetry,
-};
+use decidra::{api::AppState, backend::Backend, config::Config, telemetry};
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
 
 const HELP: &str = "\
-decidra — decision inference server (native CUDA backend)
+decidra — state-once inference server for vllm-sr/d3-turbo (native CUDA)
 
 Usage:
-  decidra                 serve
-  decidra --check-config  load tokenizer/head/calibration, print a report, exit
-  decidra --native-check  load the native engine and run one tiny GPU forward
+  decidra                 serve /v1/systemone
+  decidra --check-config  validate the d3-turbo package and print its contract
+  decidra --native-check  load the engine and run the state-once self-test
   decidra --help
   decidra --version
 
-`serve` and `--native-check` require a binary built with `--features native`.
-Configuration is read from the environment; see README.md.
+Only vllm-sr/d3-turbo prefix_bidir packages with a separate F32 readout are
+supported. Configuration is read from the environment; see README.md.
 ";
 
 #[tokio::main]
@@ -53,23 +50,57 @@ fn init_tracing() {
 
 fn check_config() -> Result<()> {
     let config = Config::from_env()?;
-    let metadata = api::load_metadata(&config)?;
-    let report = serde_json::json!({
-        "status": "ok",
-        "report": metadata.report,
-        "choice_label_ids": metadata.label_ids,
-    });
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let decision_path = config.native_model.join("decision_config.json");
+    let decision: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&decision_path)
+            .with_context(|| format!("reading {}", decision_path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", decision_path.display()))?;
+    if decision.get("attention_mode").and_then(|v| v.as_str()) != Some("prefix_bidir") {
+        bail!(
+            "{} is not a prefix_bidir d3-turbo package",
+            decision_path.display()
+        );
+    }
+    let tokenizer = config
+        .tokenizer
+        .clone()
+        .unwrap_or_else(|| config.checkpoint.join("tokenizer.json"));
+    if !tokenizer.is_file() {
+        bail!("tokenizer not found at {}", tokenizer.display());
+    }
+    if !config.native_model.join("readout.safetensors").is_file() {
+        bail!(
+            "readout.safetensors not found in {}",
+            config.native_model.display()
+        );
+    }
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "status": "ok",
+            "model": config.model_id,
+            "checkpoint": config.native_model,
+            "tokenizer": tokenizer,
+            "attention_mode": decision.get("attention_mode"),
+            "format_id": decision.get("format_id"),
+            "codes": decision.get("codes").and_then(|v| v.as_array()).map(|v| v.len()),
+            "max_questions": decidra::config::MAX_QUESTIONS,
+            "max_state_tokens": decidra::config::MAX_STATE_TOKENS,
+            "native_marlin": config.native_marlin,
+            "native_int8": config.native_int8,
+            "native_int8_group_scale": config.native_int8_group_scale,
+            "native_gpu_embed": config.native_gpu_embed,
+        }))?
+    );
     Ok(())
 }
 
 #[cfg(feature = "native")]
-fn load_native(config: Config) -> Result<std::sync::Arc<decidra::native_backend::NativeBackend>> {
-    use std::sync::Arc;
-
+fn load_native(config: Config) -> Result<std::sync::Arc<dyn Backend>> {
     let backend = decidra::native_backend::NativeBackend::load(&config)
-        .context("loading the native CUDA backend")?;
-    Ok(Arc::new(backend))
+        .context("loading the native d3-turbo backend")?;
+    Ok(std::sync::Arc::new(backend))
 }
 
 #[cfg(not(feature = "native"))]
@@ -83,31 +114,18 @@ fn load_native(_config: Config) -> Result<std::sync::Arc<dyn Backend>> {
 #[cfg(feature = "native")]
 async fn native_check() -> Result<()> {
     let config = Config::from_env()?;
-    let metadata = api::load_metadata(&config)?;
-    let ids = metadata.head.verbalizer_ids[metadata.head.noul[0]..metadata.head.noul[1]].to_vec();
-    let prompt_text = decidra::prompt::text_prompt(
-        "noul",
-        "native check",
-        "Is the engine ready?",
-        &["false".to_owned(), "true".to_owned()],
-    );
-
     let load_config = config.clone();
     let backend = tokio::task::spawn_blocking(move || load_native(load_config))
         .await
         .context("native backend loader task failed")??;
     let started = std::time::Instant::now();
-    let logits = backend.logits(&prompt_text, &ids).await?;
-    backend.prompt_tokens(&prompt_text);
     println!(
         "{}",
         serde_json::to_string_pretty(&serde_json::json!({
             "status": "ok",
-            "backend": "native",
+            "backend": backend.name(),
             "model": config.native_model,
-            "prompt": prompt_text,
-            "head_ids": ids,
-            "logits": logits,
+            "state_once_self_test": true,
             "elapsed_secs": started.elapsed().as_secs_f64(),
         }))?
     );
@@ -128,34 +146,27 @@ async fn serve() -> Result<()> {
     let backend = tokio::task::spawn_blocking(move || load_native(load_config))
         .await
         .context("native backend loader task failed")??;
-    let app_state = AppState::load(config, backend)?;
-    let metrics = if app_state.config.metrics_enabled {
+    let metrics = if config.metrics_enabled {
         Some(telemetry::install_recorder()?)
     } else {
         None
     };
-    let state = match metrics {
-        Some(handle) => app_state.with_metrics(handle),
-        None => app_state,
-    };
+    let mut state = AppState::new(config.clone(), backend);
+    if let Some(handle) = metrics {
+        state = state.with_metrics(handle);
+    }
 
     tracing::info!(
-        bind = %state.config.bind_addr,
-        backend = %state.load_report.backend,
-        native_model = %state.config.native_model.display(),
-        checkpoint = %state.config.checkpoint.display(),
-        tokenizer = %state.load_report.tokenizer.display(),
-        head = %state.load_report.head.display(),
-        calibration = %state.load_report.calibration.display(),
-        max_options = state.load_report.max_options,
-        signing = state.config.signing_enabled(),
-        metrics = state.config.metrics_enabled,
-        "starting decidra"
+        bind = %config.bind_addr,
+        model = %config.model_id,
+        checkpoint = %config.native_model.display(),
+        max_questions = decidra::config::MAX_QUESTIONS,
+        max_state_tokens = decidra::config::MAX_STATE_TOKENS,
+        "starting decidra d3-turbo"
     );
-
-    let listener = TcpListener::bind(state.config.bind_addr)
+    let listener = TcpListener::bind(config.bind_addr)
         .await
-        .map_err(|error| anyhow::anyhow!("binding {}: {error}", state.config.bind_addr))?;
+        .map_err(|error| anyhow::anyhow!("binding {}: {error}", config.bind_addr))?;
     axum::serve(listener, state.router())
         .with_graceful_shutdown(shutdown_signal())
         .await?;
@@ -169,7 +180,6 @@ async fn shutdown_signal() {
             std::future::pending::<()>().await;
         }
     };
-
     #[cfg(unix)]
     let terminate = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
@@ -182,10 +192,8 @@ async fn shutdown_signal() {
             }
         }
     };
-
     #[cfg(not(unix))]
     let terminate = std::future::pending::<()>();
-
     tokio::select! {
         _ = ctrl_c => {},
         _ = terminate => {},

@@ -1,15 +1,16 @@
-//! Native CUDA inference engine for JEV-27B (text path).
+//! Native CUDA engine for `vllm-sr/d3-turbo` (`prefix_bidir`, separate F32
+//! readout).
 //!
 //! Typical server use:
 //! ```ignore
 //! let engine = decidra_native::Engine::new(model_dir)?;
-//! engine.preload_all()?;                 // ~12.4 GiB packed weights resident
-//! let hidden = engine.forward_last_hidden(&tokens)?;
-//! let logits = engine.decision_logits(&tokens, &[3721, 1802])?;
+//! engine.preload_all()?;                      // resident weights
+//! let cache = engine.capture_state(&state)?;  // state K/V + GDN state
+//! let rows = engine.readout_state_once_batch(&cache, &question_blocks)?;
 //! ```
 //!
-//! Move the engine to one blocking worker (`spawn_blocking`) and serialize
-//! forwards; it is `Send` but not for concurrent use.
+//! Move the engine to one blocking worker and serialize forwards; it is
+//! `Send` but not for concurrent use.
 pub mod config;
 pub mod cuda;
 pub mod engine;
@@ -18,4 +19,4 @@ pub mod kernels;
 pub mod tensor;
 pub mod weights;
 
-pub use engine::{Engine, LogitsOpts, Stage};
+pub use engine::{Engine, HostStateCache, LogitsOpts, Stage};

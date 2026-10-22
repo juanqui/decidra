@@ -10,6 +10,7 @@ use crate::cuda::Gpu;
 
 pub struct Kernels {
     pub rmsnorm: CudaFunction,
+    pub add_rmsnorm: CudaFunction,
     pub rmsnorm_gated: CudaFunction,
     pub add: CudaFunction,
     pub silu_mul: CudaFunction,
@@ -25,10 +26,13 @@ pub struct Kernels {
     pub conv1d_silu: CudaFunction,
     pub gdn_prepare: CudaFunction,
     pub gdn_recurrent: CudaFunction,
+    /// Broadcast one f32 seed state into every row of a batched state buffer.
+    pub gdn_seed_broadcast: CudaFunction,
     pub gdn_recurrent_shared: CudaFunction,
     pub gdn_recurrent_split: CudaFunction,
     pub gdn_recurrent_shared_batched: CudaFunction,
     pub gdn_recurrent_split_batched: CudaFunction,
+    pub gdn_recurrent_reg_split_batched: CudaFunction,
     pub gdn_chunked: CudaFunction,
     pub gdn_chunked_tc: CudaFunction,
     pub gdn_chunked_tc_prof: CudaFunction,
@@ -64,6 +68,7 @@ impl Kernels {
     pub fn load(gpu: &Gpu) -> Result<Self> {
         Ok(Self {
             rmsnorm: gpu.func("rmsnorm_bf16")?,
+            add_rmsnorm: gpu.func("add_rmsnorm_bf16")?,
             rmsnorm_gated: gpu.func("rmsnorm_gated_bf16")?,
             add: gpu.func("add_bf16")?,
             silu_mul: gpu.func("silu_mul_bf16")?,
@@ -92,6 +97,7 @@ impl Kernels {
             conv1d_silu: gpu.func("conv1d_silu_bf16")?,
             gdn_prepare: gpu.func("gdn_prepare")?,
             gdn_recurrent: gpu.func("gdn_recurrent")?,
+            gdn_seed_broadcast: gpu.func("gdn_seed_broadcast")?,
             gdn_recurrent_shared: {
                 let f = gpu.func("gdn_recurrent_shared")?;
                 f.set_attribute(
@@ -116,6 +122,7 @@ impl Kernels {
                 )?;
                 f
             },
+            gdn_recurrent_reg_split_batched: gpu.func("gdn_recurrent_reg_split_batched")?,
             gdn_recurrent_split_batched: {
                 let f = gpu.func("gdn_recurrent_split_batched")?;
                 f.set_attribute(
@@ -315,6 +322,42 @@ fn cfg_1d(n: usize, block: u32) -> LaunchConfig {
 
 fn elem_block(cols: usize) -> u32 {
     cols.next_power_of_two().clamp(32, 256) as u32
+}
+
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
+pub fn add_rmsnorm(
+    gpu: &Gpu,
+    k: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    mix: &CudaSlice<bf16>,
+    w: &CudaSlice<bf16>,
+    residual: &mut CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+    zero_centered: bool,
+) -> Result<()> {
+    let block = elem_block(cols);
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (block, 1, 1),
+        shared_mem_bytes: block * 4,
+    };
+    let cols_i = cols as i32;
+    let zc = zero_centered as i32;
+    let mut l = gpu.stream.launch_builder(k);
+    l.arg(x);
+    l.arg(mix);
+    l.arg(w);
+    l.arg(residual);
+    l.arg(out);
+    l.arg(&cols_i);
+    l.arg(&eps);
+    l.arg(&zc);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1339,6 +1382,40 @@ where
     Ok(())
 }
 
+/// Copy one recurrent seed into every row of a batched state buffer. One
+/// launch replaces `batch` per-row `memcpy_dtod` calls in the state-once fork.
+pub fn gdn_seed_broadcast<S, ST>(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    seed: &S,
+    state: &mut ST,
+    elems: usize,
+    batch: usize,
+) -> Result<()>
+where
+    S: DevicePtr<f32>,
+    ST: DevicePtrMut<f32>,
+{
+    if elems == 0 || batch == 0 {
+        anyhow::bail!("gdn_seed_broadcast needs non-empty seed and batch");
+    }
+    let cfg = LaunchConfig {
+        grid_dim: (elems.div_ceil(256) as u32, batch as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let elems_i = elems as i32;
+    let (sp, _r0) = seed.device_ptr(&gpu.stream);
+    let (dp, _r1) = state.device_ptr_mut(&gpu.stream);
+    let (sp, dp) = (sp, dp);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(&sp);
+    l.arg(&dp);
+    l.arg(&elems_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn gdn_recurrent<QF, KF, VF, G, B, ST, O>(
     gpu: &Gpu,
@@ -1719,7 +1796,7 @@ where
 
 /// Batched chunked GDN: one launch over `(dv/VC, heads, batch)`.
 #[allow(clippy::too_many_arguments)]
-pub fn gdn_chunked_batched<Q, K, V, G, B, ST, O, OF, LN>(
+fn gdn_chunked_batched_impl<const C: usize, const VC: usize, Q, K, V, G, B, ST, O, OF, LN>(
     gpu: &Gpu,
     f: &CudaFunction,
     q: &Q,
@@ -1750,24 +1827,14 @@ where
     if dk != 128 || dv != 128 {
         anyhow::bail!("chunked GDN kernel requires dk=dv=128, got dk={dk} dv={dv}");
     }
-    let smem = (dk * GDN_CHUNK_VC
-        + 2 * GDN_CHUNK_C * dk
-        + 2 * GDN_CHUNK_C * GDN_CHUNK_VC
-        + GDN_CHUNK_C * GDN_CHUNK_C
-        + 4 * GDN_CHUNK_C)
-        * std::mem::size_of::<f32>();
+    let smem = (dk * VC + 2 * C * dk + 2 * C * VC + C * C + 4 * C) * std::mem::size_of::<f32>();
     let cfg = LaunchConfig {
-        grid_dim: ((dv / GDN_CHUNK_VC) as u32, heads as u32, batch as u32),
+        grid_dim: ((dv / VC) as u32, heads as u32, batch as u32),
         block_dim: (256, 1, 1),
         shared_mem_bytes: smem as u32,
     };
-    let (batch_i, heads_i, dk_i, dv_i, vc_i) = (
-        batch as i32,
-        heads as i32,
-        dk as i32,
-        dv as i32,
-        GDN_CHUNK_VC as i32,
-    );
+    let (batch_i, heads_i, dk_i, dv_i, vc_i) =
+        (batch as i32, heads as i32, dk as i32, dv as i32, VC as i32);
     let (qp, _rq) = q.device_ptr(&gpu.stream);
     let (kp, _rk) = k.device_ptr(&gpu.stream);
     let (vp, _rv) = v.device_ptr(&gpu.stream);
@@ -1792,6 +1859,89 @@ where
     l.arg(&dk_i);
     l.arg(&dv_i);
     l.arg(&vc_i);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_chunked_batched<Q, K, V, G, B, ST, O, OF, LN>(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    q: &Q,
+    k: &K,
+    v: &V,
+    g: &G,
+    beta: &B,
+    state: &mut ST,
+    out: &mut O,
+    offsets: &OF,
+    lens: &LN,
+    batch: usize,
+    heads: usize,
+    dk: usize,
+    dv: usize,
+) -> Result<()>
+where
+    Q: DevicePtr<f32>,
+    K: DevicePtr<f32>,
+    V: DevicePtr<f32>,
+    G: DevicePtr<f32>,
+    B: DevicePtr<f32>,
+    ST: DevicePtrMut<f32>,
+    O: DevicePtrMut<bf16>,
+    OF: DevicePtr<i32>,
+    LN: DevicePtr<i32>,
+{
+    gdn_chunked_batched_impl::<{ GDN_CHUNK_C }, 64, Q, K, V, G, B, ST, O, OF, LN>(
+        gpu, f, q, k, v, g, beta, state, out, offsets, lens, batch, heads, dk, dv,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_reg_split_batched(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    qf: &CudaSlice<f32>,
+    kf: &CudaSlice<f32>,
+    vf: &CudaSlice<f32>,
+    g: &CudaSlice<f32>,
+    beta: &CudaSlice<f32>,
+    state: &mut CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+    offsets: &CudaSlice<i32>,
+    lens: &CudaSlice<i32>,
+    batch: usize,
+    heads: usize,
+    dk: usize,
+    dv: usize,
+) -> Result<()> {
+    let vc = 32.min(dv);
+    if dk != 128 || dv % vc != 0 || vc * 4 > 1024 {
+        anyhow::bail!("register GDN requires dk=128 and dv divisible by vc={vc}");
+    }
+    let chunks = dv / vc;
+    let cfg = LaunchConfig {
+        grid_dim: ((heads * chunks) as u32, batch as u32, 1),
+        block_dim: ((vc * 4) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let (heads_i, dk_i, dv_i, vc_i, ch_i) =
+        (heads as i32, dk as i32, dv as i32, vc as i32, chunks as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(qf);
+    l.arg(kf);
+    l.arg(vf);
+    l.arg(g);
+    l.arg(beta);
+    l.arg(state);
+    l.arg(out);
+    l.arg(offsets);
+    l.arg(lens);
+    l.arg(&heads_i);
+    l.arg(&dk_i);
+    l.arg(&dv_i);
+    l.arg(&vc_i);
+    l.arg(&ch_i);
     unsafe { l.launch(cfg) }?;
     Ok(())
 }

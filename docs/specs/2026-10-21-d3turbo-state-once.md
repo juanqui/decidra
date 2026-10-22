@@ -97,7 +97,7 @@ separate 255-row readout. Two defects blocked d3-turbo:
 
 1. **`prefix_bidir` was treated as `noncausal_full_attention`.** The mask
    differed from the checkpoint (0.044 max Δp above).
-2. **The local d3-turbo W4A8 artifact is random.** `run_awq_d3.py` passed the
+2. **The local d3-turbo W4A8 artifact is random.** The quantizer passed the
    model path to `llmcompressor.oneshot`, which loads
    `AutoModelForCausalLM`. The checkpoint is a `Qwen3_5Model` with
    `language_model.*` keys; `AutoModelForCausalLM` reported every weight
@@ -452,9 +452,9 @@ Verdict: **do-not-ship** at the time, with eight must-fixes. Dispositions:
 | requests over the engine caps returned 502 | `state_once_batch_rows` now splits into capped chunks over one cache; queue cap returns 503 |
 | image/video states silently became text | `d3::contains_media` rejects them with 400; 1 MiB rendering cap before tokenization |
 | self-test only checked finite logits | now also compares state-once against the per-row block path and a noul probability band |
-| choice answers lacked confidence | added entropy confidence |
+| choice answers lacked confidence | added top-above-even confidence (vLLM-SR System One contract) |
 | unbounded state-once queue | 32-request cap, skips cancelled replies, 503 on overload |
-| docs stale | README, D3TURBO and this section updated |
+| docs stale | README, ENGINE and this section updated |
 
 Remaining after round 4: the 32-row smoke gate is still not the 256-row §6.4
 gate; W4A8 batch-of-4 vs single differs by up to 0.037 on valid same-state

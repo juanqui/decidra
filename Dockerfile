@@ -6,7 +6,9 @@
 # toolkit. Only cuBLAS/cuBLASLt and the NVIDIA driver are required at run time;
 # the driver comes from the host through the NVIDIA container toolkit.
 
-FROM nvidia/cuda:13.1.1-devel-ubuntu24.04 AS builder
+ARG CUDA_ARCH=sm_89
+FROM nvidia/cuda:13.0.1-devel-ubuntu24.04 AS builder
+ARG CUDA_ARCH
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \
@@ -20,9 +22,9 @@ ENV PATH=/root/.cargo/bin:$PATH \
     CARGO_HOME=/usr/local/cargo
 
 WORKDIR /src
-COPY Cargo.toml Cargo.lock rust-toolchain.toml README.md LICENSE-MIT LICENSE-APACHE ./
+COPY Cargo.toml Cargo.lock rust-toolchain.toml README.md \
+     LICENSE LICENSE-MIT LICENSE-APACHE NOTICE ./
 COPY src ./src
-COPY crates ./crates
 COPY native ./native
 
 # Compile the server with the in-process native backend. build.rs drives nvcc
@@ -30,6 +32,7 @@ COPY native ./native
 # prefill library; all of it is embedded into the binary.
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
+    DECIDRA_CUDA_ARCH=${CUDA_ARCH} \
     cargo build --release --locked --features native \
     && mkdir -p /out \
     && cp target/release/decidra /out/decidra
@@ -47,8 +50,9 @@ RUN mkdir -p /out/cudalibs \
 FROM ubuntu:24.04
 
 LABEL org.opencontainers.image.title="Decidra" \
-      org.opencontainers.image.description="Native inference engine for decision models" \
+      org.opencontainers.image.description="State-once inference engine for vllm-sr/d3-turbo" \
       org.opencontainers.image.source="https://github.com/juanqui/decidra" \
+      org.opencontainers.image.version="0.2.0" \
       org.opencontainers.image.licenses="MIT OR Apache-2.0"
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -62,6 +66,7 @@ RUN apt-get update \
 
 COPY --from=builder /out/cudalibs/ /opt/decidra/cudalibs/
 COPY --from=builder /out/decidra /usr/local/bin/decidra
+COPY LICENSE LICENSE-MIT LICENSE-APACHE NOTICE /usr/share/licenses/decidra/
 
 ENV DECIDRA_BIND_ADDR=0.0.0.0:8080 \
     DECIDRA_NATIVE_MODEL=/models \
@@ -69,6 +74,20 @@ ENV DECIDRA_BIND_ADDR=0.0.0.0:8080 \
     DECIDRA_TOKENIZER=/models/tokenizer.json \
     DECIDRA_NATIVE_CACHE=true \
     DECIDRA_NATIVE_MARLIN=true \
+    DECIDRA_NATIVE_INT8=true \
+    DECIDRA_NATIVE_INT8_GROUP_SCALE=true \
+    DECIDRA_NATIVE_INT8_EXCLUDE=self_attn.v_proj,self_attn.k_proj \
+    DECIDRA_NATIVE_GDN_CHUNKED=true \
+    DECIDRA_NATIVE_GDN_CHUNKED_MIN_SEQ=16 \
+    DECIDRA_NATIVE_GPU_EMBED=false \
+    DECIDRA_STATE_CACHE_ENTRIES=16 \
+    DECIDRA_STATE_CACHE_BYTES=5368709120 \
+    DECIDRA_STATE_CACHE_PIN=1 \
+    DECIDRA_HOST_STATE_CACHE_BYTES=8589934592 \
+    DECIDRA_BATCH_REQUESTS=32 \
+    DECIDRA_BATCH_ROWS=32 \
+    DECIDRA_BATCH_WINDOW_US=2000 \
+    DECIDRA_STATE_ONCE_MAX_ROWS=64 \
     DECIDRA_METRICS_ENABLED=true \
     LD_LIBRARY_PATH=/opt/decidra/cudalibs
 

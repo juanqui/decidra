@@ -61,3 +61,18 @@ int fi_prefill_bf16_noncausal_fa3(const void* q, const void* k, const void* v,
       256, 256, flashinfer::MaskMode::kNone, false, Variant>(p, stream);
   return static_cast<int>(e);
 }
+
+// Cascade prefill: qo_len question rows over kv_len = state + question keys.
+// One non-causal softmax, exactly the block-cascade question mask.
+extern "C" __attribute__((visibility("default")))
+int fi_prefill_bf16_ext_fa3(const void* q, const void* k, const void* v,
+                            void* out, int qo_len, int kv_len,
+                            cudaStream_t stream) {
+  if (qo_len <= 0 || kv_len < qo_len) return -1;
+  Params p = make_params(q, k, v, out, qo_len, false);
+  p.qo_len = qo_len;
+  p.kv_len = kv_len;
+  cudaError_t e = flashinfer::SinglePrefillWithKVCacheDispatched<
+      256, 256, flashinfer::MaskMode::kNone, false, Variant>(p, stream);
+  return static_cast<int>(e);
+}

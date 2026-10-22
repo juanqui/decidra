@@ -1,0 +1,29 @@
+Decidra
+Copyright 2026 The Decidra Authors
+
+Decidra is licensed under the Apache License, Version 2.0 or the MIT License,
+at your option. See LICENSE, LICENSE-APACHE, and LICENSE-MIT.
+
+This product includes software developed by third parties:
+
+- FlashInfer
+  https://github.com/flashinfer-ai/flashinfer
+  Copyright contributors to the FlashInfer project
+  Licensed under the Apache License, Version 2.0.
+  Vendored headers and notice: native/third_party/flashinfer/.
+
+- NVIDIA CCCL / libcudacxx
+  https://github.com/NVIDIA/cccl
+  Copyright NVIDIA Corporation
+  Licensed under the Apache License, Version 2.0 with LLVM exceptions.
+  Vendored under native/third_party/flashinfer/cccl/.
+
+- Marlin
+  https://github.com/IST-DASLab/marlin
+  Copyright (C) Marlin.2024 Elias Frantar
+  Copyright contributors to the vLLM project
+  Licensed under the Apache License, Version 2.0.
+  Vendored kernel and notice: native/third_party/marlin/.
+
+The vllm-sr/d3-turbo model checkpoint is distributed separately under the
+Apache License, Version 2.0.

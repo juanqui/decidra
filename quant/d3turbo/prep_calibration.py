@@ -36,8 +36,8 @@ def question_of(row: dict) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", default="/srv/models/jev-awq/corpus/calibration.jsonl")
-    parser.add_argument("--out", default="/srv/models/jev-awq/corpus/d3-calibration-block-v1.jsonl")
+    parser.add_argument("--input", default="/srv/models/d3-calibration.jsonl")
+    parser.add_argument("--out", default="/srv/models/d3-calibration-block-v1.jsonl")
     parser.add_argument("--samples", type=int, default=256)
     parser.add_argument("--max-chars", type=int, default=6000)
     parser.add_argument("--max-tokens", type=int, default=4096)

@@ -27,8 +27,8 @@ fn max_delta(a: &[f32], b: &[f32]) -> f32 {
 #[test]
 #[ignore = "requires a d3-turbo checkpoint on a GPU"]
 fn d3_state_once_negative_controls() {
-    let model = std::env::var("DECIDRA_D3_MODEL")
-        .unwrap_or_else(|_| "/srv/models/d3-turbo".to_string());
+    let model =
+        std::env::var("DECIDRA_D3_MODEL").unwrap_or_else(|_| "/srv/models/d3-turbo".to_string());
     let probe =
         std::env::var("DECIDRA_D3_PROBE").unwrap_or_else(|_| "/tmp/d3_once_batch.json".to_string());
     let data: serde_json::Value =

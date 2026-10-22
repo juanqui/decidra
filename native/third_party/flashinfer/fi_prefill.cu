@@ -1,6 +1,6 @@
 // Standalone FlashInfer FA2 prefill for BF16 q[S,24,256], k/v[S,4,256].
 // No PyTorch / ATen / TVM-FFI linkage: only FlashInfer headers + cudart.
-// Two entries: causal (JEV) and noncausal (AutoTrust/d3/d3-turbo/pplx full layers).
+// Two entries: causal and noncausal (d3-turbo full layers).
 #include <flashinfer/attention/prefill.cuh>
 #include <flashinfer/attention/default_prefill_params.cuh>
 

@@ -37,7 +37,10 @@ fn describe(value: &Value) -> String {
     }
 }
 
-pub fn choice_question(instructions: &str, criteria: &serde_json::Map<String, Value>) -> Result<Question> {
+pub fn choice_question(
+    instructions: &str,
+    criteria: &serde_json::Map<String, Value>,
+) -> Result<Question> {
     if criteria.is_empty() {
         bail!("a choice question needs at least one criterion");
     }
@@ -57,7 +60,10 @@ pub fn choice_question(instructions: &str, criteria: &serde_json::Map<String, Va
     })
 }
 
-pub fn noul_question(instructions: &str, criteria: Option<&serde_json::Map<String, Value>>) -> Question {
+pub fn noul_question(
+    instructions: &str,
+    criteria: Option<&serde_json::Map<String, Value>>,
+) -> Question {
     let fallback = ["No / false", "Yes / true"];
     let texts = ["false", "true"]
         .iter()
@@ -84,8 +90,8 @@ pub fn user_prompt(state: &Value, question: &Question, codes: &[String]) -> Resu
             question.texts.len()
         );
     }
-    let empty = matches!(state, Value::Null)
-        || matches!(state, Value::String(text) if text.is_empty());
+    let empty =
+        matches!(state, Value::Null) || matches!(state, Value::String(text) if text.is_empty());
     let body = if empty {
         "(empty)".to_owned()
     } else {
@@ -153,11 +159,7 @@ pub fn state_token_count(offsets: &[(usize, usize)], end_char: usize) -> Result<
 }
 
 /// Token ids and the state/question split of one rendered prompt.
-pub fn encode_split(
-    tokenizer: &Tokenizer,
-    text: &str,
-    state: &Value,
-) -> Result<(Vec<u32>, usize)> {
+pub fn encode_split(tokenizer: &Tokenizer, text: &str, state: &Value) -> Result<(Vec<u32>, usize)> {
     let encoding = tokenizer
         .encode(text, false)
         .map_err(|error| anyhow::anyhow!("tokenizing a d3 prompt: {error}"))?;
@@ -244,7 +246,10 @@ pub fn to_answer(question: &Question, probabilities: &[f32]) -> Result<Value> {
         );
     }
     let total: f32 = probabilities.iter().sum();
-    if !(total > 0.0) || probabilities.iter().any(|p| !p.is_finite() || *p < 0.0) {
+    if !total.is_finite()
+        || total <= 0.0
+        || probabilities.iter().any(|p| !p.is_finite() || *p < 0.0)
+    {
         bail!("option probabilities must be finite, non-negative and sum above zero");
     }
     let shares: Vec<f32> = probabilities.iter().map(|p| p / total).collect();
@@ -254,12 +259,7 @@ pub fn to_answer(question: &Question, probabilities: &[f32]) -> Result<Value> {
             .enumerate()
             .map(|(level, p)| level as f32 * p)
             .sum();
-        let entropy: f32 = shares
-            .iter()
-            .filter(|p| **p > 0.0)
-            .map(|p| -p * p.ln())
-            .sum();
-        let confidence = (1.0 - entropy / (shares.len() as f32).ln()).clamp(0.0, 1.0);
+        let confidence = score_confidence(&shares);
         let probabilities: serde_json::Map<String, Value> = question
             .keys
             .iter()
@@ -295,22 +295,53 @@ pub fn to_answer(question: &Question, probabilities: &[f32]) -> Result<Value> {
         .zip(&shares)
         .map(|(key, p)| (key.clone(), json!(p)))
         .collect();
-    let entropy: f32 = shares
-        .iter()
-        .filter(|p| **p > 0.0)
-        .map(|p| -p * p.ln())
-        .sum();
-    let confidence = if shares.len() > 1 {
-        (1.0 - entropy / (shares.len() as f32).ln()).clamp(0.0, 1.0)
-    } else {
-        1.0
-    };
+    let confidence = choice_confidence(&shares);
     Ok(json!({
         "type": "choice",
         "choice": question.keys[best],
         "probabilities": probabilities,
         "confidence": confidence,
     }))
+}
+
+/// vLLM-SR System One choice confidence: how far the top probability sits
+/// above an even split. This matches the model card and the serving contract;
+/// entropy confidence is not used.
+fn choice_confidence(probabilities: &[f32]) -> f32 {
+    let count = probabilities.len();
+    if count <= 1 {
+        return 1.0;
+    }
+    let top = probabilities
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    ((top - 1.0 / count as f32) / (1.0 - 1.0 / count as f32)).clamp(0.0, 1.0)
+}
+
+/// vLLM-SR System One score confidence: the spread around the most likely
+/// level against an even spread's.
+fn score_confidence(probabilities: &[f32]) -> f32 {
+    let count = probabilities.len();
+    if count <= 1 {
+        return 1.0;
+    }
+    let mut mode = 0;
+    for level in 1..count {
+        if probabilities[level] > probabilities[mode] {
+            mode = level;
+        }
+    }
+    let spread: f32 = probabilities
+        .iter()
+        .enumerate()
+        .map(|(level, p)| p * (level as f32 - mode as f32).abs())
+        .sum();
+    let even: f32 = (0..count)
+        .map(|level| (level as f32 - (count - 1) as f32 / 2.0).abs())
+        .sum::<f32>()
+        / count as f32;
+    (1.0 - spread / even).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -350,6 +381,15 @@ mod tests {
             "<|im_end|>\n<|im_start|>assistant\n\x3cthink\x3e\n\n\x3c/think\x3e\n\n",
         );
         assert_eq!(text, expected);
+    }
+
+    #[test]
+    fn choice_confidence_matches_the_serving_contract() {
+        let card = choice_confidence(&[0.9996, 0.00004, 0.0003]);
+        assert!((card - 0.9994).abs() < 1e-3, "{card}");
+        let measured = choice_confidence(&[0.030755, 0.152012, 0.817233]);
+        assert!((measured - 0.72585).abs() < 1e-4, "{measured}");
+        assert_eq!(choice_confidence(&[1.0]), 1.0);
     }
 
     #[test]

@@ -1,11 +1,12 @@
 //! Weight sources.
 //!
 //! The forward graph is written against `LinearWeight` / `WeightProvider`, so a
-//! checkpoint can be served either from merged BF16 tensors (graph validation)
-//! or from the AWQ W4A16 packed tensors (shipped path) without changing the
-//! graph. Norm weights always come from the same checkpoint as the linears:
-//! AWQ checkpoints are smoothing-adjusted, so mixing them with merged-bf16
-//! norms would be wrong.
+//! checkpoint can be served either from merged BF16 tensors (reference and
+//! SM90 path) or from compressed-tensors W4A16 packed tensors (repacked to
+//! Marlin W4A8 for the INT8 path; excluded modules stay W4A16) without changing
+//! the graph. Norm weights always come from the same checkpoint as the linears:
+//! packed checkpoints can be smoothing-adjusted, so mixing them with
+//! merged-BF16 norms would be wrong.
 use anyhow::{Context, Result, bail};
 use std::sync::Arc;
 
@@ -462,6 +463,7 @@ impl<'a> WeightProvider<'a> {
         let post_norm = self.upload(&self.name(&format!("{l}post_attention_layernorm.weight")))?;
         let gate_proj = self.linear(&self.name(&format!("{l}mlp.gate_proj")))?;
         let up_proj = self.linear(&self.name(&format!("{l}mlp.up_proj")))?;
+
         let down_proj = self.linear(&self.name(&format!("{l}mlp.down_proj")))?;
         let mixer = match kind {
             crate::config::LayerType::FullAttention => {

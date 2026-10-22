@@ -1,544 +1,282 @@
 # Decidra
 
-Decidra is a native inference engine for decision models. It runs one model on
-one NVIDIA GPU and serves typed decisions over HTTP. The HTTP server and the
-GPU engine are one process. There is no Python at serving time.
+**Read the state once. Answer every question.**
 
-- Native CUDA backend: Marlin W4A16 and W4A8-INT8, FlashInfer attention,
-  chunked GDN prefill, device-resident embedding table.
-- Typed decisions: `noul` (binary), `score` (ordinal), `choice` (multi-option).
-- OpenAI-compatible `/v1/chat/completions` and `/v1/completions` for LiteLLM.
-- Exact-decision cache, request batching, Prometheus metrics, optional request
-  signing.
-- Self-contained binaries: kernel cubins and the FlashInfer prefill library are
-  embedded at build time.
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
+[![Version](https://img.shields.io/badge/version-0.2.0-brightgreen.svg)](https://github.com/juanqui/decidra/releases)
+[![Container](https://img.shields.io/badge/container-ghcr.io%2Fjuanqui%2Fdecidra-2496ED?logo=docker&logoColor=white)](https://github.com/juanqui/decidra/pkgs/container/decidra)
 
-## Supported models
+Decidra is a purpose-built CUDA inference engine for exactly one model:
+**`vllm-sr/d3-turbo`**, a 26.1B Qwen3.5 hybrid decision model with the
+`prefix_bidir` attention mask and a separate F32 `[255, 5120]` readout.
 
-Decidra is built for specific decision checkpoints. It is not a general-purpose
-model runner. The JEV-27B-VL and d3-turbo families are supported:
+It is not a general model runner. The HTTP server and the CUDA engine are one
+Rust process; there is no Python, PyTorch, vLLM, or external model server on the
+runtime path. A state is encoded once, then every question forks from that
+cache. On identical hardware and the same checkpoint, Decidra answers the
+64-question benchmark **2.4–4.2× faster** than vLLM-SR, with up to **4.3×
+higher 64-question throughput** at c8. The full side-by-side is below.
 
-| artifact | weights | activations | decision head | status |
-|---|---|---|---|---|
-| [`aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8`](https://huggingface.co/aioutfitters/JEV-27B-VL-AWQ-INT4-W4A8) | INT4, group **128**, symmetric | INT8 **per-token dynamic** (`CompressedTensorsWNA8Int`) | rank-32 **LoRA** on all linears + `lm_head` | **supported** |
-| `awq-w4a16-v2` build (local checkpoint) | INT4, group **64**, asymmetric | engine applies INT8 at runtime (group-64 / per-token) | **merged** decoder + BF16 head | **supported** |
-| [`autotrust/JEV-27B-VL`](https://huggingface.co/autotrust/JEV-27B-VL) | BF16 base | — | LoRA / merged variants | source model; does not fit one 24 GB GPU |
-| `d3-turbo-w4a8-g64-v4` (local, `vllm-sr/d3-turbo`) | INT4, group **64**, symmetric, GPTQ | INT8 **per-token**, per-64-group scales | separate F32 `[255,5120]` | **experimental**; state-once path |
+---
 
-### W4A8 checkpoint
+## Why state-once
 
-This is the artifact at the link above. The engine loads the group-128
-symmetric INT4 weights (Marlin group-8 kernels, offset zero point 8), quantizes
-activations to INT8 per token, and applies the PEFT rank-32 LoRA from
-`adapter_vllm/` to every target linear and `lm_head`. The LoRA scale is read
-from `adapter_config.json` (`64/32 = 2.0`).
+`prefix_bidir` splits a rendered prompt into a state block and question blocks:
+
+```text
+[ system + State: … ][ Question: … options … ][ readout ]
+        state S                 question Q
+```
+
+- every state query sees every state key, in both directions;
+- every question query sees every state key and every key in its own block;
+- **no state query sees a question key.**
+
+The state’s hidden states, post-RoPE full-attention K/V, GDN recurrent state,
+and convolution tail are therefore question-independent. Decidra captures them
+once and serves every question with one ragged pass and one readout GEMM.
+
+```text
+state ──► capture once ──► StateCache ──┬─ full layers: post-RoPE K/V
+                                        └─ GDN layers: f32 state + conv tail
+questions ──► one ragged pass ──► [B, 255] readout ──► typed answers
+```
+
+## Quick start
+
+### Requirements
+
+- Linux x86_64, NVIDIA driver with CUDA 13 support.
+- RTX 4090 / L40S (SM89) or H100 / H200 (SM90).
+- The d3-turbo package mounted read-only. It must contain `config.json`,
+  `decision_config.json` (`attention_mode: prefix_bidir`,
+  `format_id: d3-code-readout-v1`), `tokenizer.json`, `model.safetensors`, and
+  `readout.safetensors`.
+- 24 GB VRAM for the W4A8 g64 package on a 4090; 49 GB BF16 package on
+  H100/H200.
+
+### Docker
+
+The published image targets SM89 (RTX 4090 / L40S):
 
 ```bash
-export DECIDRA_CHECKPOINT=/path/to/JEV-27B-VL-AWQ-INT4-W4A8
-export DECIDRA_NATIVE_MODEL="$DECIDRA_CHECKPOINT"
-export DECIDRA_TOKENIZER="$DECIDRA_CHECKPOINT/tokenizer.json"
-export DECIDRA_LORA_ADAPTER="$DECIDRA_CHECKPOINT/adapter_vllm"
-export DECIDRA_NATIVE_INT8_EXCLUDE=none
-export DECIDRA_NATIVE_INT8_GROUP_SCALE=false
-export DECIDRA_NATIVE_GPU_EMBED=false   # 21.2 GiB; drop for ~3% more speed (23.3 GiB)
-./target/release/decidra
+docker run --rm --gpus '"device=0"' \
+  --user "$(id -u):$(id -g)" \
+  -p 8080:8080 \
+  -v /srv/models/d3-turbo-w4a8-g64-v4:/models:ro \
+  ghcr.io/juanqui/decidra:0.2.0
 ```
-
-Required files for this artifact:
-
-```
-config.json          model architecture + group-128 symmetric W4A8 config
-tokenizer.json       tokenizer
-decision_head/       decision_head.json + calibration.json
-model.safetensors    compressed-tensors W4A8 text weights
-adapter_vllm/        adapter_config.json + adapter_model.safetensors (rank 32)
-```
-
-### d3-turbo state-once (experimental)
-
-The native engine also runs `vllm-sr/d3-turbo`, a Qwen3.5 hybrid with
-`attention_mode: prefix_bidir`: the state is read once, then every question
-forks from cached full-attention K/V, the final GDN recurrent state and the
-convolution tail. `DECIDRA_D3=1` enables the `/v1/systemone` d3 path
-(choice, noul and score, text only). Serve the local
-`d3-turbo-w4a8-g64-v4` artifact with the environment in
-[`docs/D3TURBO.md`](docs/D3TURBO.md); the design and review log are in
-[`docs/specs/2026-10-21-d3turbo-state-once.md`](docs/specs/2026-10-21-d3turbo-state-once.md).
-The same binary is in the Docker image; [`docs/DEPLOY.md`](docs/DEPLOY.md) has
-the `docker run`/Compose profile with `DECIDRA_D3=1`.
-
-Measured on one RTX 4090 with a 2,048-token state and 64 questions: 465 ms
-state capture, 734 ms question pass, ~1.20 s in the engine and 1.65 s through
-the HTTP server. vLLM-SR 0.2.0 serving the same int4 artifact on the same GPU
-takes 3.89 s for the same request (2.36× slower), with the same top choice and
-a largest probability difference of 0.005. A 32-row BF16 smoke gate gives
-31/32 top-1. Per-row Qwen3.5 decision models still use the paths above.
-
-### W4A16 checkpoint
-
-The local `awq-w4a16-v2` build. It uses the engine's original runtime INT8
-activation path (group-64 / per-token); this is the artifact behind the
-**W4A16** tables in Performance and Quality below.
-
-```
-config.json          model architecture + group-64 asymmetric config
-tokenizer.json       tokenizer
-decision_head/       merged decision_head.json + calibration.json
-model*.safetensors   AWQ W4A16 weights
-```
-
-The native backend serves **text decision requests**; the checkpoint's vision
-tower is not used. Other decision models need a backend and checkpoint port; the
-engine does not load them by configuration alone.
-
-## Hardware
-
-Tested on one **RTX 4090 (Ada, SM89), 24 GB**, with a CUDA 13.x driver.
-Also tested on one **NVIDIA L40S (Ada, SM89), 48 GB**: ~78–81% of the 4090's
-throughput on this bandwidth-bound workload, with 64K-context capacity. See
-[`docs/L40S.md`](docs/L40S.md) for the measured comparison and the SM-count-aware
-Marlin launch that L40S uses.
-
-An **H100 SXM (Hopper, SM90, 80 GB)** build also runs with
-`DECIDRA_CUDA_ARCH=sm_90`; on a CUDA 12.4 driver the Rust `cudarc` feature must be
-`cuda-12040` instead of the default `cuda-13000`. The current kernels are
-SM89-tuned on the quantized-linear path (Marlin `mma.sync`); SM90 uses FA3 for
-full attention, and the dequant→BF16 path runs through cuBLAS WGMMA/TMA.
-Measured H100 throughput is 4090-class (57 req/s saturated, 4.2K tok/s at
-19.5K prefill), with 122K-context capacity. vLLM 0.31 (Machete, FLASH_ATTN,
-FlashInfer GDN) is **1.5–1.7× faster on long prefill** and reaches 79 req/s at
-c32. See [`docs/H100.md`](docs/H100.md) and
-[`docs/H100-VLLM.md`](docs/H100-VLLM.md).
-
-The server, API, decision head, and model contract are GPU-agnostic. The native
-kernels are compiled for **SM89 by default** and can be built for **SM90** with
-`DECIDRA_CUDA_ARCH=sm_90`. **RTX Pro 6000 (Blackwell, SM120) is not supported
-yet.** Supporting it is a backend port: the Marlin/INT8 GEMMs, FlashInfer
-prefill, GDN kernels, and the cubin build need SM120 versions. The current Docker
-image will not run on SM120.
-
-## Performance
-
-**Artifacts:** the W4A16 tables use the group-64 merged checkpoint with the
-engine's runtime INT8 path. The W4A8 tables use the HF W4A8 checkpoint + LoRA.
-Same GPU, same prompts, one resident server, exact-decision cache disabled,
-median of 3 runs. vLLM 0.31.0 serves the same checkpoint in each comparison.
-
-### W4A16 checkpoint
-
-Short unique prompts (~73 tokens):
-
-| concurrency | Decidra req/s | vLLM req/s | Decidra p50 / p95 | vLLM p50 / p95 |
-|---:|---:|---:|---|---|
-| 1 | **25.78** | 18.81 | **39.2 / 42.4 ms** | 53.06 / 54.08 ms |
-| 2 | **40.73** | 20.24 | **49.1 / 51.8 ms** | 98.20 / 103.24 ms |
-| 4 | **53.10** | 29.32 | **74.4 / 75.6 ms** | 135.10 / 138.67 ms |
-| 8 | **56.97** | 34.52 | **123.2 / 168.0 ms** | 229.98 / 231.08 ms |
-| 16 | **56.93** | 35.17 | **173.1 / 275.7 ms** | 304.75 / 454.23 ms |
-
-Single cold long request:
-
-| prompt | Decidra | vLLM | Decidra tok/s | vLLM tok/s |
-|---|---:|---:|---:|---:|
-| 4K (4,090 tokens) | **0.833 s** | 1.302 s | 4,908 | 3,142 |
-| 8K (8,178 tokens) | **1.711 s** | 2.660 s | 4,779 | 3,075 |
-| 16K (16,383 tokens) | **3.740 s** | 5.533 s | 4,380 | 2,962 |
-
-Memory and startup:
-
-| metric | Decidra | vLLM 0.31.0 |
-|---|---:|---:|
-| resident GPU memory | **18.83 GiB** (13.1 GiB weights + 2.37 GiB embedding + scratch) | 21,909 MiB |
-| 16K prefill peak | **20.11 GiB** | ~21.9 GiB |
-| startup to ready | **9.2 s** | 145 s |
-
-### W4A8 checkpoint
-
-Engine uses the host embedding table (21.2 GiB peak). vLLM serves the same W4A8
-artifact and adapter with `--max-num-seqs 8` and fp8 KV.
-
-Short unique prompts (~73 tokens):
-
-| concurrency | Decidra req/s | vLLM req/s | Decidra p50 | vLLM p50 |
-|---:|---:|---:|---:|---:|
-| 1 | **24.2** | 11.05 | **41.6 ms** | 83.2 ms |
-| 2 | **38.3** | 14.76 | **52.4 ms** | 159.7 ms |
-| 4 | **53.6** | 22.50 | **73.9 ms** | 174.4 ms |
-| 8 | **56.8** | 25.91 | **122.6 ms** | 273.4 ms |
-| 16 | **56.6** | 22.82 | **188.0 ms** | 494.1 ms |
-
-Single cold long request:
-
-| prompt | Decidra | vLLM | speedup |
-|---|---:|---:|---:|
-| 4K (4,090 tokens) | **0.903 s** | 1.386 s | **1.53×** |
-| 8K (8,178 tokens) | **1.846 s** | 2.308 s | **1.25×** |
-| 16K (16,383 tokens) | **4.159 s** | 4.813 s | **1.16×** |
-
-Memory: **21.2 GiB** peak for the engine vs **21.0 GiB** for vLLM. The GPU
-embedding table variant is 23.3 GiB and about 3% faster on long prompts.
-
-Long prefill runs at 100% GPU utilization and 420–430 W. Short batching reaches
-90–96% utilization. The GPU is the limit at every measured point.
-
-Full method and per-request tables: [`docs/VLLM-COMPARISON.md`](docs/VLLM-COMPARISON.md).
-Kernel-level numbers: [`docs/KERNELS.md`](docs/KERNELS.md).
-
-## Quality
-
-### W4A16 checkpoint
-
-28-row suite against the CPU AWQ golden (`eval/data/awq-cpu-suite28.json`),
-batch size 1:
-
-| implementation | top-1 | max Δ | mean MAE | mean KL | gates |
-|---|---:|---:|---:|---:|---|
-| Decidra | **28/28** | **0.01027** | **0.000717** | **3.27e-5** | **pass** |
-| vLLM 0.31.0 | 28/28 | 0.01377 | 0.00155 | 8.51e-5 | max and MAE fail |
-
-Gates: top-1 `1.0`, mean KL ≤ `1e-3`, mean MAE ≤ `1e-3`, max Δ ≤ `0.011`.
-
-Batched requests have deterministic BF16/M-tiling composition noise. Top-1 was
-28/28 for the suite at c8 and c16; maximum deltas were `1.305e-2` (c8) and
-`1.251e-2` (c16). The strict gates apply at batch size 1.
-
-### W4A8 checkpoint
-
-28-row suite, three implementations of the same W4A8 artifact + adapter against the
-CPU artifact-math golden (`eval/data/w4a8-cpu-suite28.json`: compressed-tensors
-decompress + LoRA + the configured per-token INT8):
-
-| comparison | top-1 | max Δ | mean MAE | mean KL |
-|---|---:|---:|---:|---:|
-| Decidra vs CPU artifact | **28/28** | **0.0176** | **0.00328** | **2.33e-4** |
-| vLLM 0.31.0 vs CPU artifact | 28/28 | 0.0267 | 0.00349 | 3.04e-4 |
-| Decidra vs vLLM | 28/28 | 0.0304 | 0.00266 | 2.20e-4 |
-
-Decidra is closer to the artifact math than vLLM 0.31.0 on max Δ and KL. On the card
-example (billing) the engine gives 0.9606, the CPU artifact 0.9623, the local vLLM
-0.9588. vLLM's W4A8 path behaves as weight-only here: the engine's weight-only path
-(`DECIDRA_NATIVE_INT8=false`) matches it at 28/28, max 9.77e-3, MAE 1.23e-3. The
-provider card's example value (0.9963) is not reproducible with the downloaded
-artifact under any local implementation; it is close to the merged-BF16 teacher
-(0.9969). Against that teacher the W4A8 quantization error is max 0.258, MAE 0.0598,
-KL 0.0697 on this suite (28/28 top-1; engine and vLLM within 0.014 max of each other).
-
-Gate for this artifact: `eval/suite.py --baseline eval/data/w4a8-cpu-suite28.json
---max-delta 0.02 --max-mae 0.004 --max-kl 0.001` against a running W4A8 server.
-The W4A16 CPU golden does not apply to this artifact.
-
-## Build from source
-
-Prerequisites:
-
-- Linux x86_64, NVIDIA driver with CUDA 13.x support.
-- CUDA toolkit 13.x (`nvcc`) for the build.
-- Rust 1.85 or newer (`rustup`).
-- cuBLAS and cuBLASLt at run time (CUDA runtime package or `LD_LIBRARY_PATH`).
-- The AWQ checkpoint (about 18 GB) with the files listed above.
-
-Build both binaries:
-
-```bash
-cargo build --release -p decidra-native
-cargo build --release --features native -p decidra
-```
-
-`decidra-native` is the command-line engine used for kernel and quality work.
-`decidra` is the HTTP server. The build compiles the CUDA kernels with `nvcc`
-and embeds the cubins and the FlashInfer library into both binaries.
-
-If `nvcc` is not on `PATH`, set `DECIDRA_NVCC=/path/to/nvcc`, or let the build
-use Docker with `DECIDRA_CUDA_IMAGE` (default
-`nvidia/cuda:13.1.1-devel-ubuntu24.04`).
-
-## Run the server
-
-```bash
-export DECIDRA_CHECKPOINT=/path/to/awq-w4a16-v2
-export DECIDRA_NATIVE_MODEL="$DECIDRA_CHECKPOINT"
-export DECIDRA_TOKENIZER="$DECIDRA_CHECKPOINT/tokenizer.json"
-export DECIDRA_BIND_ADDR=0.0.0.0:8080
-export LD_LIBRARY_PATH=/path/to/cublas:$LD_LIBRARY_PATH   # if cuBLAS is not in the default path
-
-./target/release/decidra
-```
-
-Checks:
 
 ```bash
 curl -fsS http://127.0.0.1:8080/health
+# {"status":"ready","model":"vllm-sr/d3-turbo","head":"d3-code-readout"}
+```
+
+Build a Hopper image from source:
+
+```bash
+docker build --build-arg CUDA_ARCH=sm_90 -t decidra:0.2.0-h100 .
+```
+
+Or use the provided compose file:
+
+```bash
+DECIDRA_MODEL_DIR=/srv/models/d3-turbo-w4a8-g64-v4 \
+DECIDRA_GPU=0 docker compose up -d --build
+```
+
+### Native build
+
+```bash
+# RTX 4090 / L40S
+cargo build --release --locked --features native
+
+# H100 / H200
+DECIDRA_CUDA_ARCH=sm_90 cargo build --release --locked --features native
+
+CUDA_VISIBLE_DEVICES=0 \
+DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-g64-v4 \
+DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-g64-v4 \
+./target/release/decidra
+```
+
+Validate a package without a GPU:
+
+```bash
 ./target/release/decidra --check-config
-./target/release/decidra --native-check   # loads the GPU engine and runs one forward
 ```
 
-Example decision request:
+Run the state-once startup gate before serving:
 
 ```bash
-curl -fsS http://127.0.0.1:8080/v1/decide \
-  -H 'content-type: application/json' \
-  -d '{"kind":"choice","state":"The customer says the charge was duplicated.","question":"Route this ticket.","options":["billing","support"]}'
+./target/release/decidra --native-check
 ```
-
-Response (abbreviated):
-
-```json
-{
-  "kind": "choice",
-  "effective_kind": "choice",
-  "options": ["billing", "support"],
-  "probabilities": [0.976, 0.024],
-  "choice": "billing",
-  "choice_index": 0,
-  "confidence": 0.976
-}
-```
-
-## LiteLLM
-
-The OpenAI-compatible routes accept a JSON decision request as the user message
-(or prompt) and return the decision JSON. Non-JSON user text returns HTTP 400:
-these routes do not do free-form generation.
-
-```yaml
-model_list:
-  - model_name: jev-awq
-    litellm_params:
-      model: openai/jev-awq
-      api_base: http://127.0.0.1:8080/v1
-      api_key: unused
-```
-
-`model` is accepted and ignored by the decision routes. `/v1/models` lists the
-configured model id.
-
-## Docker
-
-The image contains the server, the embedded kernels, and cuBLAS/cuBLASLt. It does
-not contain the model, a CUDA toolkit, Python, or the FlashInfer source tree.
-The image is about **1.1 GB** on disk; cuBLASLt is the largest component. Both
-supported checkpoints work; the W4A8 artifact needs its `adapter_vllm/` directory
-mounted and the environment below.
-
-Build:
-
-```bash
-docker build -t decidra:0.1.0 .
-```
-
-Run on one GPU, with the checkpoint mounted read-only:
-
-```bash
-docker run --gpus '"device=1"' --rm -p 8080:8080 \
-  --user "$(id -u):$(id -g)" \
-  -v /path/to/awq-w4a16-v2:/models:ro \
-  decidra:0.1.0
-```
-
-The container defaults to `/models` for the checkpoint, native model, and
-tokenizer. Override with `DECIDRA_CHECKPOINT`, `DECIDRA_NATIVE_MODEL`, and
-`DECIDRA_TOKENIZER` if the layout differs. The image runs as UID 10001 by
-default; `--user "$(id -u):$(id -g)"` is the simplest fix when the checkpoint
-files are not world-readable (for example `-rw-------`). The mount must be
-readable by the runtime user.
-
-The host needs the NVIDIA driver and the NVIDIA Container Toolkit. The image
-starts as UID 10001, listens on `0.0.0.0:8080`, and has a `/health` healthcheck.
-
-For the W4A8 checkpoint, mount the artifact (which contains `adapter_vllm/`) and
-set the LoRA/quantization environment:
-
-```bash
-docker run --gpus '"device=1"' --rm -p 8080:8080 \
-  --user "$(id -u):$(id -g)" \
-  -v /path/to/JEV-27B-VL-AWQ-INT4-W4A8:/models:ro \
-  -e DECIDRA_LORA_ADAPTER=/models/adapter_vllm \
-  -e DECIDRA_NATIVE_INT8_EXCLUDE=none \
-  -e DECIDRA_NATIVE_INT8_GROUP_SCALE=false \
-  -e DECIDRA_NATIVE_GPU_EMBED=false \
-  decidra:0.1.0
-```
-
-### GHCR
-
-The private image is published to GitHub Container Registry. The workflow
-[`.github/workflows/docker.yml`](.github/workflows/docker.yml) builds and pushes
-`0.1.0`, `latest`, and the commit SHA on every push to `master`.
-
-```bash
-docker login ghcr.io
-docker pull ghcr.io/juanqui/decidra:0.1.0
-docker run --gpus all --rm -p 8080:8080 \
-  --user "$(id -u):$(id -g)" \
-  -v /path/to/awq-w4a16-v2:/models:ro \
-  ghcr.io/juanqui/decidra:0.1.0
-```
-
-`docker login ghcr.io` needs a token with `read:packages` (and `write:packages`
-to push). To push a build:
-
-```bash
-docker tag decidra:0.1.0 ghcr.io/juanqui/decidra:0.1.0
-docker push ghcr.io/juanqui/decidra:0.1.0
-```
-
-`docker compose up -d --build` also works; see `docker-compose.yml` for the GPU
-device reservation and the model volume.
 
 ## API
 
-| method | path | purpose |
-|---|---|---|
-| GET | `/health` | liveness |
-| GET | `/v1/models` | model ids |
-| GET | `/v1/decide/info` | decision head metadata |
-| POST | `/v1/decide` | one typed decision |
-| POST | `/v1/decisions` | batch of decisions |
-| POST | `/v1/systemone` | System 1 decision protocol |
-| POST | `/v1/chat/completions` | OpenAI chat shape, decision JSON |
-| POST | `/v1/completions` | OpenAI completions shape, decision JSON |
-| GET | `/metrics` | Prometheus metrics |
+`POST /v1/systemone` accepts a state string and a map of typed questions.
 
-Decision request:
+```bash
+curl -fsS http://127.0.0.1:8080/v1/systemone \
+  -H 'content-type: application/json' \
+  -d '{
+    "state": "The order arrived damaged yesterday. The customer has a receipt.",
+    "questions": {
+      "route": {
+        "type": "choice",
+        "instructions": "Which team should handle this request?",
+        "criteria": {
+          "returns": "Refunds, replacements and damaged deliveries",
+          "billing": "Payments, invoices and charges",
+          "technical": "Product setup and faults"
+        }
+      },
+      "receipt": {
+        "type": "noul",
+        "instructions": "Does the customer have a receipt?"
+      }
+    }
+  }'
+```
 
 ```json
 {
-  "kind": "noul | score | choice",
-  "state": "text to judge",
-  "question": "instructions",
-  "options": ["labels for choice/score; omit for noul"]
+  "object": "structured_decision",
+  "model": "vllm-sr/d3-turbo",
+  "answers": {
+    "route": {
+      "type": "choice",
+      "choice": "returns",
+      "probabilities": { "returns": 0.99996, "billing": 0.000018, "technical": 0.000021 },
+      "confidence": 0.99994
+    },
+    "receipt": { "type": "noul", "noul": 0.99981 }
+  },
+  "usage": { "input_tokens": 168, "output_tokens": 0 }
 }
 ```
 
-`options` is required for `choice` (2–256 labels). `noul` ignores supplied
-options and uses `false`/`true`. `score` uses the six labels `0`–`5`.
-`strategy` is `auto`, `single`, `tournament`, or `permute`; `model` is accepted
-and ignored. The protocol and response fields are specified in
-[`docs/specs/2026-10-19-api-specification.md`](docs/specs/2026-10-19-api-specification.md).
+Question types: `choice`, `noul`, and `score` (2–10 ordered levels). Scores
+return `score`, `probabilities`, `confidence`, and `legend`.
+
+| endpoint | purpose |
+|---|---|
+| `POST /v1/systemone` | typed decisions |
+| `GET /health` | readiness and model identity |
+| `GET /v1/models` | model metadata |
+| `GET /metrics` | Prometheus metrics |
+
+Limits: 64 questions per request, 32,768 tokens per question’s state + block,
+1 MiB rendered state and 1 MiB per question, text/JSON only.
+
+## Performance: Decidra vs vLLM-SR
+
+End-to-end `POST /v1/systemone`, warm weights, same checkpoint, same GPU, same
+request: a 2,076-token state and 64 questions. The baseline is **vLLM-SR
+`vllm-srun` 0.2.0 engine mode** (not the generic vLLM server) with
+`--max-num-seqs 64 --enable-shared-context`. A `c8` row means 8 simultaneous
+requests; `q/s` means questions per second, not requests per second.
+
+| GPU | package | test | Decidra | vLLM-SR | advantage |
+|---|---|---|---:|---:|---|
+| RTX 4090 (450 W) | W4A8 g64 | 64q, c1 | **936 ms** | **3.89 s** | **4.2× lower latency** |
+| H100 SXM 80 GB | BF16 | 64q, c1 | **824 ms** | **2.43 s** | **2.9× lower latency** |
+| H100 SXM 80 GB | BF16 | 64q, c8 | **5.10 s / 100 q/s** | **13.66 s / 23 q/s** | **2.7× lower latency, 4.3× q/s** |
+| H200 | BF16 | 64q, c1 | **800 ms** | **2.90 s** | **3.6× lower latency** |
+| H200 | BF16 | 64q, c8 | **5.47 s / 94 q/s** | **13.22 s / 22 q/s** | **2.4× lower latency, 4.3× q/s** |
+| H200 | BF16 | 16q, c8 | **1.32 s / 97 q/s** | **4.30 s / 17 q/s** | **3.3× lower latency, 5.7× q/s** |
+
+The 4090 vLLM-SR comparison is c1 only; a c8 baseline was not measured, so no
+4090 throughput speedup is claimed. On the same 4090 the two paths chose the
+same top answer and differed by at most **0.005 probability** on the repeated
+question. vLLM-SR loads the W4A8 artifact as dequantized W4A16; Decidra serves
+it as W4A8 g64 with per-64-group INT8 activation scales.
+
+### Decidra-only scaling
+
+| GPU | 64q c1 | 64q c8 | 16q c8 |
+|---|---:|---:|---:|
+| RTX 4090, 450 W | **936 ms** | **4.18 s / 69 q/s** | **1.15 s / 69 q/s** |
+| H100 SXM 80 GB | **824 ms** | **5.10 s / 100 q/s** | **1.28 s / 100 q/s** |
+| H200 | **800 ms** | **5.47 s / 94 q/s** | **1.32 s / 97 q/s** |
+
+On the 4090: 1q **43 ms** warm, 8K/64q **1.02 s**, 24K/64q **1.29 s**. The
+16-entry pinned GPU state cache plus an 8 GiB host L2 serves **16 states at
+69 q/s** and **32 states at 63 q/s**; long states are protected by a 2 GiB
+scratch reserve. On H200, long-state 64q is **1.27 s at 8K** and **2.62 s at
+24K**, versus **4.39 s** and **9.45 s** for vLLM-SR.
+
+Full matrices, profiles, and the method are in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md). The requested **127 q/s** target was
+**not reached**; the best measured result is **100 q/s on H100 SXM** at c8.
 
 ## Configuration
 
-All runtime configuration is read from the environment and validated at startup.
-Booleans accept `true/false`, `1/0`, `yes/no`, `on/off`.
-
-### Server
+The image and compose file carry production defaults. The most important knobs:
 
 | variable | default | meaning |
 |---|---|---|
-| `DECIDRA_BIND_ADDR` | `0.0.0.0:8080` | listen address |
-| `DECIDRA_MODEL` | `jev-awq` | model id returned by `/v1/models` |
-| `DECIDRA_SERVED_IDENTITY` | `autotrust/JEV-27B-VL@ba3f0d58+awq-w4a16` | identity for `/v1/systemone` |
-| `DECIDRA_SIGNING_KEY` | unset | enables HMAC request signing when set |
-| `DECIDRA_METRICS_ENABLED` | `true` | expose `/metrics` |
-| `DECIDRA_MAX_BODY_BYTES` | `67108864` | maximum request body |
-| `RUST_LOG` | `decidra=info` | log filter |
+| `DECIDRA_BIND_ADDR` | `0.0.0.0:8080` | HTTP bind |
+| `DECIDRA_CHECKPOINT` | `/srv/models/d3-turbo-w4a8-g64-v4` | model package |
+| `DECIDRA_NATIVE_MODEL` | `$DECIDRA_CHECKPOINT` | engine package |
+| `DECIDRA_NATIVE_MARLIN` | `true` | Marlin W4A8 |
+| `DECIDRA_NATIVE_INT8_EXCLUDE` | `self_attn.v_proj,self_attn.k_proj` | modules kept on W4A16 |
+| `DECIDRA_STATE_CACHE_ENTRIES` | `16` | pinned exact-state entries |
+| `DECIDRA_STATE_CACHE_BYTES` | `5368709120` | GPU state K/V/GDN budget |
+| `DECIDRA_HOST_STATE_CACHE_BYTES` | `8589934592` | host L2 for overflow states |
+| `DECIDRA_BATCH_ROWS` | `32` | question-row budget per pass |
+| `DECIDRA_BATCH_WINDOW_US` | `2000` | request coalescing window |
+| `DECIDRA_METRICS_ENABLED` | `true` | Prometheus `/metrics` |
 
-### Model
-
-| variable | default | meaning |
-|---|---|---|
-| `DECIDRA_CHECKPOINT` | `/srv/models/jev-awq/awq-w4a16-v2` | checkpoint directory |
-| `DECIDRA_NATIVE_MODEL` | checkpoint | AWQ artifact opened by the engine |
-| `DECIDRA_TOKENIZER` | checkpoint tokenizer | tokenizer path |
-| `DECIDRA_CALIBRATION` | checkpoint default | calibration file |
-| `DECIDRA_CALIBRATION_FITTED` | checkpoint default | fitted calibration file |
-| `DECIDRA_HF_SNAPSHOT` | host snapshot path | HF snapshot used for metadata |
-| `DECIDRA_LORA_ADAPTER` | unset | PEFT adapter directory or file; enables the W4A8 LoRA |
-
-### Native engine
-
-| variable | default | meaning |
-|---|---|---|
-| `DECIDRA_NATIVE_CACHE` | `true` | keep packed decoder weights on the GPU |
-| `DECIDRA_NATIVE_MARLIN` | `true` | Marlin W4A16/W4A8 kernels |
-| `DECIDRA_NATIVE_FUSED_W4A16` | `true` | fused fallback policy when Marlin is off |
-| `DECIDRA_NATIVE_BATCH` | `true` | request batching |
-| `DECIDRA_NATIVE_MAX_BATCH` | `8` | maximum requests per batch |
-| `DECIDRA_NATIVE_BATCH_WINDOW_US` | `2000` | batch window (lone requests use 500 µs) |
-| `DECIDRA_NATIVE_MAX_BATCH_TOKENS` | `16384` | batch token cap |
-| `DECIDRA_NATIVE_GDN_CHUNKED` | `true` | chunked GDN prefill |
-| `DECIDRA_NATIVE_GDN_CHUNKED_MIN_SEQ` | `64` | minimum sequence for chunked GDN |
-| `DECIDRA_NATIVE_INT8` | `true` | selective W4A8-INT8 activations |
-| `DECIDRA_NATIVE_INT8_CLIP` | `1.0` | activation clip factor |
-| `DECIDRA_NATIVE_INT8_GROUP_SCALE` | `true` | group-64 activation scales |
-| `DECIDRA_NATIVE_INT8_GROUP_EXCLUDE` | `mlp.gate_proj` | modules kept on the per-token epilogue |
-| `DECIDRA_NATIVE_INT8_EXCLUDE` | `self_attn.o_proj,self_attn.v_proj,self_attn.k_proj` | modules kept on W4A16 |
-| `DECIDRA_NATIVE_INT8_ALL_LAYERS` | `last:8` | all-linear INT8 layer set |
-| `DECIDRA_NATIVE_GPU_EMBED` | `true` | resident GPU embedding table |
-| `DECIDRA_DECISION_CACHE_SIZE` | `256` | exact-decision cache entries; `0` disables |
-
-### Build and diagnostics
-
-| variable | default | meaning |
-|---|---|---|
-| `DECIDRA_NVCC` | `nvcc` on `PATH` | CUDA compiler |
-| `DECIDRA_CUDA_IMAGE` | `nvidia/cuda:13.1.1-devel-ubuntu24.04` | toolchain image when `nvcc` is absent |
-| `DECIDRA_SKIP_BUILD` | unset | reuse existing cubins |
-| `DECIDRA_PROFILE` | unset | per-region GPU timing |
-| `DECIDRA_CPU_PROFILE` | unset | host timing |
-| `DECIDRA_GDN_PROF` | unset | GDN phase counters |
-| `DECIDRA_MARLIN_DEBUG` | unset | Marlin launch diagnostics |
-| `DECIDRA_GEMM_DEBUG` | unset | GEMM selection diagnostics |
-| `DECIDRA_MARLIN_CHUNK` | `0` | split large M launches (tuning) |
-
-## Architecture
-
-```
-src/                  HTTP server, decision head, cache, batching, API
-native/src/           CUDA engine, model loader, Marlin/FlashInfer bindings
-native/kernels/       engine kernels + vendored Marlin
-eval/                 suite, benchmark, mock server, protocol client
-docs/                 SPEC, RESULTS, KERNELS, DEPLOY, VLLM-COMPARISON
-scripts/              run/build helpers
-```
-
-The server owns the request path: authentication/signing, JSON parsing, the
-exact-decision cache, and the batch queue. The native backend owns the model:
-tokenizer, prompt construction, tensor allocation, the decoder forward, and the
-decision-head logits. One batch worker thread owns the GPU context; requests
-are batched FIFO and each request returns only after its forward completes.
-
-Hardware-specific code stays in `native/`. Porting to another NVIDIA GPU means
-building the same kernels for the new architecture and validating the quantized
-GEMM paths; the server and decision head do not change. Model-specific code is
-limited to the checkpoint contract and the architecture in `native/src`.
+See [docs/DEPLOY.md](docs/DEPLOY.md) for the full environment reference, H100
+settings, and operational notes.
 
 ## Tests
 
 ```bash
-cargo test --locked
-cargo clippy --all-targets -- -D warnings
+# CPU server tests
+cargo test --locked -p decidra
 
-# With a server on :8080
-python3 eval/suite.py --a-url http://127.0.0.1:8080 \
-  --baseline eval/data/awq-cpu-suite28.json \
-  --max-kl 0.001 --max-mae 0.001 --max-delta 0.011
+# Formatting and build
+cargo fmt --all -- --check
+cargo check --features native
+
+# Native state-once, parity, negative controls, perf
+make native-check
 ```
 
-Current results: 47 unit tests, 10 integration tests, suite 28/28, KL 3.269e-5,
-MAE 7.166e-4, max Δ 1.027e-2.
+The 32-row HF parity gate, state-once fork parity, batch-vs-single comparison,
+and seed/tail negative controls are documented with exact commands in
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md#correctness-gates).
 
-## Migration from `jev-engine`
+## Documentation
 
-The engine was renamed from `jev-engine` to **Decidra**. The model (JEV-27B-VL)
-and the decision protocol keep their names.
-
-| old | new |
+| document | contents |
 |---|---|
-| `jev-engine` binary | `decidra` |
-| `jev-native` binary | `decidra-native` |
-| `jev-engine` crate | `decidra` |
-| `jev-native` crate | `decidra-native` |
-| `JEV_*` env vars | `DECIDRA_*` |
-| `RUST_LOG=jev_engine=info` | `RUST_LOG=decidra=info` |
-| `jev_*` Prometheus metrics | `decidra_*` |
-| `/opt/jev` image path | `/opt/decidra` |
-| image user `jev` | `decidra` |
+| [docs/ENGINE.md](docs/ENGINE.md) | mask semantics, state cache, kernels, correctness |
+| [docs/BENCHMARKS.md](docs/BENCHMARKS.md) | full matrices, profiles, correctness gates |
+| [docs/DEPLOY.md](docs/DEPLOY.md) | build, Docker, operations, environment reference |
+| [docs/README.md](docs/README.md) | documentation index |
+| [native/README.md](native/README.md) | engine crate and execution contract |
+| [eval/README.md](eval/README.md) | parity and benchmark tools |
+| [quant/d3turbo/](quant/d3turbo/) | W4A8 g64 quantization pipeline |
 
-The API paths, the default model id `jev-awq`, and the checkpoint layout are
-unchanged.
+## Repository layout
+
+```text
+src/             HTTP API, d3 prompt contract, state-once scheduler
+native/          CUDA engine, Marlin, GDN, FlashInfer, F32 readout
+quant/d3turbo/   GPTQ W4A8 group-64 quantization
+eval/            HF comparison and serving benchmarks
+docs/            architecture, benchmarks, deployment
+scripts/         local smoke and launch helpers
+```
 
 ## License
 
-MIT OR Apache-2.0. See [`LICENSE-MIT`](LICENSE-MIT) and
-[`LICENSE-APACHE`](LICENSE-APACHE).
+Decidra is dual-licensed under **MIT OR Apache-2.0**. See [`LICENSE`](LICENSE),
+[`LICENSE-MIT`](LICENSE-MIT), and [`LICENSE-APACHE`](LICENSE-APACHE).
+
+The `vllm-sr/d3-turbo` checkpoint is Apache-2.0. Vendored FlashInfer and Marlin
+sources are Apache-2.0; vendored NVIDIA CCCL headers are Apache-2.0 with LLVM
+exceptions. See [`NOTICE`](NOTICE) and `native/third_party/`.

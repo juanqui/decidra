@@ -309,16 +309,15 @@ struct LoraHead {
 pub struct Engine {
     pub gpu: Gpu,
     pub cfg: Config,
-    /// Full-attention layers run noncausally (AutoTrust/d3/d3-turbo/pplx).
+    /// Full-attention layers run the d3-turbo non-causal/prefix_bidir mask.
     pub noncausal_full: bool,
-    /// Separate decision head (`readout.safetensors`) for checkpoints without a
-    /// full lm_head (d3/d3-turbo/pplx). JEV/AutoTrust use lm_head rows instead.
+    /// Separate F32 decision head (`readout.safetensors`) required by d3-turbo.
     readout: Option<HeadMatrix>,
     pub store: Store,
     pub kernels: Kernels,
     /// Resident weights. Populated lazily by the CLI layer tests (merged BF16 is
     /// far too large to hold on a 24 GB card) and eagerly via `preload_all` for
-    /// the shipped packed W4A16 path.
+    /// the shipped packed W4A8 path.
     weight_cache: Mutex<Vec<Option<Arc<LayerWeights>>>>,
     dump_dir: Mutex<Option<std::path::PathBuf>>,
     /// BF16 scratch for packed W4A16 weights (largest module: 17408x5120).
@@ -328,8 +327,8 @@ pub struct Engine {
     pool: BufferPool,
     f32_pool: F32Pool,
     /// Stream layers instead of keeping them resident. Needed to run the merged
-    /// BF16 checkpoint (51 GiB) on a 24 GiB card; the shipped AWQ path keeps
-    /// every packed layer resident instead.
+    /// BF16 checkpoint (51 GiB) on a 24 GiB card; the shipped packed W4A8 path
+    /// keeps every layer resident instead.
     cache_weights: AtomicBool,
     /// Keep the embedding table resident on the GPU and gather rows on-device.
     gpu_embed: AtomicBool,
@@ -413,9 +412,7 @@ fn block_cascade_mask(seq: usize, split: usize) -> Result<Vec<u8>> {
     if split == 0 || split >= seq {
         bail!("block split {split} out of range for {seq} tokens");
     }
-    let bits = seq
-        .checked_mul(seq)
-        .context("block mask is too large")?;
+    let bits = seq.checked_mul(seq).context("block mask is too large")?;
     let mut mask = vec![0u8; bits.div_ceil(8)];
     for q in 0..seq {
         let end = if q < split { split } else { seq };
@@ -459,9 +456,109 @@ pub struct StateCache {
     gdn_hist: Vec<Option<CudaSlice<bf16>>>,
 }
 
+/// Host-side mirror of a captured state cache. The scheduler keeps overflow
+/// states here instead of dropping them; PCIe restore is much cheaper than a
+/// full state capture.
+pub struct HostStateCache {
+    pub state_len: usize,
+    pub kv: Vec<Option<(Vec<bf16>, Vec<bf16>)>>,
+    pub gdn_state: Vec<Option<Vec<f32>>>,
+    pub gdn_hist: Vec<Option<Vec<bf16>>>,
+}
+
 impl StateCache {
     pub fn state_tokens(&self) -> usize {
         self.state_len
+    }
+
+    /// Copy a captured state to host memory for the scheduler's L2.
+    pub fn offload(&self, gpu: &crate::cuda::Gpu) -> Result<HostStateCache> {
+        let kv = self
+            .kv
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(|(k, v)| {
+                        Ok::<_, anyhow::Error>((
+                            gpu.stream.clone_dtoh(k)?,
+                            gpu.stream.clone_dtoh(v)?,
+                        ))
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let gdn_state = self
+            .gdn_state
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(|state| Ok::<_, anyhow::Error>(gpu.stream.clone_dtoh(state)?))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let gdn_hist = self
+            .gdn_hist
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(|hist| Ok::<_, anyhow::Error>(gpu.stream.clone_dtoh(hist)?))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(HostStateCache {
+            state_len: self.state_len,
+            kv,
+            gdn_state,
+            gdn_hist,
+        })
+    }
+
+    /// Restore a host-side state into a fresh GPU cache.
+    pub fn restore(host: &HostStateCache, gpu: &crate::cuda::Gpu) -> Result<StateCache> {
+        let kv = host
+            .kv
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(|(k, v)| {
+                        Ok::<_, anyhow::Error>((
+                            gpu.stream.clone_htod(k)?,
+                            gpu.stream.clone_htod(v)?,
+                        ))
+                    })
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let gdn_state = host
+            .gdn_state
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(|state| Ok::<_, anyhow::Error>(gpu.stream.clone_htod(state)?))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let gdn_hist = host
+            .gdn_hist
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_ref()
+                    .map(|hist| Ok::<_, anyhow::Error>(gpu.stream.clone_htod(hist)?))
+                    .transpose()
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(StateCache {
+            state_len: host.state_len,
+            kv,
+            gdn_state,
+            gdn_hist,
+        })
     }
 
     /// Diagnostic: zero one GDN layer's recurrent seed. A correct state-once
@@ -560,7 +657,7 @@ pub struct HeadMatrix {
 }
 
 impl HeadMatrix {
-    /// Load a separate `[K, hidden]` decision head (d3/d3-turbo F32, pplx BF16).
+    /// Load the separate `[K, hidden]` F32 d3-turbo readout head.
     fn load(gpu: &Gpu, path: &std::path::Path) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         let st = safetensors::SafeTensors::deserialize(&bytes)
@@ -602,6 +699,13 @@ impl HeadMatrix {
 impl Engine {
     pub fn new(model_dir: &std::path::Path) -> Result<Self> {
         let cfg = Config::from_dir(model_dir)?;
+        if cfg.attention_mode != AttentionMode::BlockCascade {
+            bail!(
+                "Decidra supports only d3-turbo prefix_bidir checkpoints; {} declares {:?}",
+                model_dir.display(),
+                cfg.attention_mode
+            );
+        }
         let store = Store::open(model_dir)?;
         let gpu = Gpu::new(0)?;
         let kernels = Kernels::load(&gpu)?;
@@ -610,16 +714,8 @@ impl Engine {
             && std::env::var("DECIDRA_FLASHINFER_ATTENTION")
                 .map(|v| v != "0")
                 .unwrap_or(true);
-        if cfg.attention_mode != AttentionMode::Causal && !flashinfer_enabled {
-            bail!(
-                "{} attention requires the vendored FlashInfer library; \
-                 refusing to fall back to the causal native kernels",
-                match cfg.attention_mode {
-                    AttentionMode::Full => "non-causal full",
-                    AttentionMode::BlockCascade => "block-cascade",
-                    AttentionMode::Causal => unreachable!(),
-                }
-            );
+        if !flashinfer_enabled {
+            bail!("d3-turbo block-cascade attention requires the vendored FlashInfer library");
         }
         let flashinfer_min_seq = std::env::var("DECIDRA_FLASHINFER_MIN_SEQ")
             .ok()
@@ -630,10 +726,13 @@ impl Engine {
             .map(|(major, _)| major >= 9)
             .unwrap_or(false);
         let fa3_available = sm90 && flashinfer.as_ref().is_some_and(|f| f.has_fa3());
+        // FA3 is opt-in: on the d3 2K-24K workload the FA2 cascade was
+        // faster on H200 (FA3 writes the same work through a different tile
+        // schedule). Keep it available for other shapes.
         let flashinfer_fa3 = fa3_available
             && std::env::var("DECIDRA_FLASHINFER_FA3")
-                .map(|v| v != "0")
-                .unwrap_or(true);
+                .map(|v| v == "1")
+                .unwrap_or(false);
         let flashinfer_fa3_min_seq = std::env::var("DECIDRA_FLASHINFER_FA3_MIN_SEQ")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -641,14 +740,16 @@ impl Engine {
         let weight_cache = Mutex::new(vec![None; cfg.num_hidden_layers]);
         let noncausal_full = cfg.noncausal_full;
         let readout_path = model_dir.join("readout.safetensors");
-        let readout = if readout_path.exists() {
-            Some(
-                HeadMatrix::load(&gpu, &readout_path)
-                    .with_context(|| format!("loading {}", readout_path.display()))?,
-            )
-        } else {
-            None
-        };
+        if !readout_path.is_file() {
+            bail!(
+                "{} has no readout.safetensors; d3-turbo requires the separate F32 code head",
+                model_dir.display()
+            );
+        }
+        let readout = Some(
+            HeadMatrix::load(&gpu, &readout_path)
+                .with_context(|| format!("loading {}", readout_path.display()))?,
+        );
         let mut engine = Self {
             gpu,
             cfg,
@@ -798,11 +899,7 @@ impl Engine {
     ) -> Option<&crate::flashinfer::FlashInfer> {
         // Noncausal models must never fall through to the causal-only native
         // kernels; the FlashInfer minimum sequence guard is for the causal path.
-        let min_seq = if self.cfg.attention_mode != AttentionMode::Causal {
-            0
-        } else {
-            self.flashinfer_min_seq.load(Ordering::Relaxed)
-        };
+        let min_seq = 0;
         if !self.flashinfer_enabled.load(Ordering::Relaxed)
             || seq < min_seq
             || hd != 256
@@ -840,6 +937,24 @@ impl Engine {
 
     pub fn set_gdn_chunked_min_seq(&self, seq: usize) {
         self.gdn_chunked_min_seq.store(seq, Ordering::Relaxed);
+    }
+
+    /// Recreate the cuBLAS handle on the caller's thread. The engine is loaded
+    /// on a Tokio blocking thread and then moved to the dedicated CUDA worker;
+    /// cuBLAS/cuBLASLt handles are not reliably thread-affine across that move.
+    /// Release pooled BF16/f32 scratch to the driver. Called by the scheduler
+    /// before admitting a large state when free memory is tight.
+    pub fn trim_pools(&self) -> Result<()> {
+        self.gpu.synchronize()?;
+        self.pool.free.lock().unwrap().clear();
+        self.f32_pool.free.lock().unwrap().clear();
+        Ok(())
+    }
+
+    pub fn rebind_blas(&mut self) -> Result<()> {
+        self.gpu.blas = cudarc::cublas::CudaBlas::new(self.gpu.stream.clone())
+            .context("rebinding cuBLAS handle on the CUDA worker thread")?;
+        Ok(())
     }
 
     pub fn set_conv_tiled(&self, enabled: bool) {
@@ -1251,15 +1366,7 @@ impl Engine {
             );
         }
         let x = timed!(self, "embed", self.embed(tokens)?);
-        self.forward_dev(
-            x,
-            tokens.len(),
-            0,
-            layer,
-            stage,
-            last_only,
-            Some(split),
-        )
+        self.forward_dev(x, tokens.len(), 0, layer, stage, last_only, Some(split))
     }
 
     /// Continue from an externally supplied hidden state (f32, `[seq, hidden]`).
@@ -1540,27 +1647,17 @@ impl Engine {
             MixerWeights::Gdn(a) => self.gdn_batch(&h, b, a, io)?,
         };
         let mut x1 = self.alloc_bf16(total * hidden)?;
-        timed!(
-            self,
-            "add.residual",
-            kernels::add(
-                &self.gpu,
-                &self.kernels.add,
-                x,
-                &mix,
-                &mut x1,
-                total * hidden
-            )?
-        );
         let mut h2 = self.alloc_bf16(total * hidden)?;
         timed!(
             self,
-            "norm.post",
-            kernels::rmsnorm(
+            "add_rmsnorm.post",
+            kernels::add_rmsnorm(
                 &self.gpu,
-                &self.kernels.rmsnorm,
-                &x1,
+                &self.kernels.add_rmsnorm,
+                x,
+                &mix,
                 &w.post_norm,
+                &mut x1,
                 &mut h2,
                 total,
                 hidden,
@@ -1568,7 +1665,7 @@ impl Engine {
                 true,
             )?
         );
-        let mlp = self.mlp(&h2, total, w)?;
+        let mlp = self.mlp(&h2, total, &w)?;
         let mut out = self.alloc_bf16(total * hidden)?;
         timed!(
             self,
@@ -1686,9 +1783,7 @@ impl Engine {
         // (attention is a small fraction of the forward).
         let mut attn = self.alloc_bf16(total * heads * hd)?;
         let __attn_t = self.prof_begin("attn");
-        if self.cfg.attention_mode == AttentionMode::BlockCascade
-            && io.cascade.is_none()
-        {
+        if io.cascade.is_none() {
             bail!("BlockCascade batch attention needs a StateCache");
         }
         if let (Some(cache), Some(layer)) = (io.cascade, io.cascade_layer) {
@@ -1751,81 +1846,85 @@ impl Engine {
                 let mut ov = attn
                     .try_slice_mut(o * heads * hd..(o + l) * heads * hd)
                     .context("batch cascade out view")?;
-                fi.prefill_ext(&self.gpu, &qv, &k_view, &v_view, &mut ov, l, kv_len)?;
+                let use_fa3 = self.flashinfer_fa3.load(Ordering::Relaxed)
+                    && kv_len >= self.flashinfer_fa3_min_seq.load(Ordering::Relaxed);
+                if use_fa3 && fi.has_fa3_ext() {
+                    fi.prefill_ext_fa3(&self.gpu, &qv, &k_view, &v_view, &mut ov, l, kv_len)?;
+                } else {
+                    fi.prefill_ext(&self.gpu, &qv, &k_view, &v_view, &mut ov, l, kv_len)?;
+                }
             }
             drop(k_all);
             drop(v_all);
         } else {
-        let scale = 1.0 / (hd as f32).sqrt();
-        let tc = match hd {
-            64 => Some(&self.kernels.attention_tc_64),
-            128 => Some(&self.kernels.attention_tc_128),
-            256 => Some(&self.kernels.attention_tc_256),
-            _ => None,
-        };
-        let hv = heads * hd;
-        let kvv = kv * hd;
-        let use_warp = self.warp_attention.load(Ordering::Relaxed);
-        for s in 0..b.batch() {
-            let o = b.offsets[s];
-            let l = b.lens[s];
-            let qv = qn
-                .try_slice(o * hv..(o + l) * hv)
-                .context("attention q view")?;
-            let kvw = kn
-                .try_slice(o * kvv..(o + l) * kvv)
-                .context("attention k view")?;
-            let vvw = vv
-                .try_slice(o * kvv..(o + l) * kvv)
-                .context("attention v view")?;
-            let mut ov = attn
-                .try_slice_mut(o * hv..(o + l) * hv)
-                .context("attention out view")?;
-            let fi = if b.batch() == 1
-                || self.cfg.attention_mode != AttentionMode::Causal
-            {
-                self.flashinfer_for(l, hd, heads, kv)
-            } else {
-                None
+            let scale = 1.0 / (hd as f32).sqrt();
+            let tc = match hd {
+                64 => Some(&self.kernels.attention_tc_64),
+                128 => Some(&self.kernels.attention_tc_128),
+                256 => Some(&self.kernels.attention_tc_256),
+                _ => None,
             };
-            if let Some(fi) = fi {
-                let use_fa3 = self.flashinfer_fa3.load(Ordering::Relaxed)
-                    && l >= self.flashinfer_fa3_min_seq.load(Ordering::Relaxed);
-                if self.cfg.attention_mode != AttentionMode::Causal {
-                    if use_fa3 {
-                        fi.prefill_noncausal_fa3(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
-                    } else {
-                        fi.prefill_noncausal(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
-                    }
-                } else if use_fa3 {
-                    fi.prefill_fa3(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+            let hv = heads * hd;
+            let kvv = kv * hd;
+            let use_warp = self.warp_attention.load(Ordering::Relaxed);
+            for s in 0..b.batch() {
+                let o = b.offsets[s];
+                let l = b.lens[s];
+                let qv = qn
+                    .try_slice(o * hv..(o + l) * hv)
+                    .context("attention q view")?;
+                let kvw = kn
+                    .try_slice(o * kvv..(o + l) * kvv)
+                    .context("attention k view")?;
+                let vvw = vv
+                    .try_slice(o * kvv..(o + l) * kvv)
+                    .context("attention v view")?;
+                let mut ov = attn
+                    .try_slice_mut(o * hv..(o + l) * hv)
+                    .context("attention out view")?;
+                let fi = if b.batch() == 1 || true {
+                    self.flashinfer_for(l, hd, heads, kv)
                 } else {
-                    fi.prefill(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
-                }
-            } else {
-                if self.cfg.attention_mode != AttentionMode::Causal {
-                    bail!("non-causal attention has no FlashInfer fallback");
-                }
-                match (use_warp, tc) {
-                    (true, Some(tc)) => kernels::attention_tc(
-                        &self.gpu, tc, &qv, &kvw, &vvw, &mut ov, l, heads, kv, hd, scale,
-                    )?,
-                    _ => kernels::attention_warp(
-                        &self.gpu,
-                        &self.kernels.attention_warp,
-                        &qv,
-                        &kvw,
-                        &vvw,
-                        &mut ov,
-                        l,
-                        heads,
-                        kv,
-                        hd,
-                        scale,
-                    )?,
+                    None
+                };
+                if let Some(fi) = fi {
+                    let use_fa3 = self.flashinfer_fa3.load(Ordering::Relaxed)
+                        && l >= self.flashinfer_fa3_min_seq.load(Ordering::Relaxed);
+                    if true {
+                        if use_fa3 {
+                            fi.prefill_noncausal_fa3(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+                        } else {
+                            fi.prefill_noncausal(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+                        }
+                    } else if use_fa3 {
+                        fi.prefill_fa3(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+                    } else {
+                        fi.prefill(&self.gpu, &qv, &kvw, &vvw, &mut ov, l)?;
+                    }
+                } else {
+                    if true {
+                        bail!("non-causal attention has no FlashInfer fallback");
+                    }
+                    match (use_warp, tc) {
+                        (true, Some(tc)) => kernels::attention_tc(
+                            &self.gpu, tc, &qv, &kvw, &vvw, &mut ov, l, heads, kv, hd, scale,
+                        )?,
+                        _ => kernels::attention_warp(
+                            &self.gpu,
+                            &self.kernels.attention_warp,
+                            &qv,
+                            &kvw,
+                            &vvw,
+                            &mut ov,
+                            l,
+                            heads,
+                            kv,
+                            hd,
+                            scale,
+                        )?,
+                    }
                 }
             }
-        }
         }
         self.prof_end("attn", __attn_t);
         drop(qn);
@@ -2043,12 +2142,18 @@ impl Engine {
                 .get(layer)
                 .and_then(|entry| entry.as_ref())
                 .context("state cache has no recurrent state for a GDN layer")?;
-            for s in 0..b.batch() {
-                let mut dst = state
-                    .try_slice_mut(s * nv * dk * dv..(s + 1) * nv * dk * dv)
-                    .context("batched GDN state destination")?;
-                self.gpu.stream.memcpy_dtod(seed, &mut dst)?;
+            let elems = nv * dk * dv;
+            if seed.len() < elems {
+                bail!("state recurrent cache is too small");
             }
+            kernels::gdn_seed_broadcast(
+                &self.gpu,
+                &self.kernels.gdn_seed_broadcast,
+                seed,
+                &mut *state,
+                elems,
+                b.batch(),
+            )?;
         } else {
             self.gpu.stream.memset_zeros(&mut *state)?;
         }
@@ -2068,10 +2173,17 @@ impl Engine {
         // One batched TF32 launch when every sequence is long enough; mixed
         // batches keep the per-sequence loop so short items stay on the
         // accurate shared recurrence.
-        let all_chunked = chunked_tc
+        let all_chunked =
+            chunked_tc && dk == 128 && dv == 128 && b.lens.iter().all(|&l| l >= chunk_min);
+        // Register-resident recurrence is the default for short question
+        // blocks; it avoids shared state and is 3-4% faster. Longer blocks keep
+        // the chunked kernel, whose chunking amortizes state traffic.
+        let gdn_reg = std::env::var("DECIDRA_GDN_REG")
+            .map(|v| v != "0")
+            .unwrap_or(true)
             && dk == 128
             && dv == 128
-            && b.lens.iter().all(|&l| l >= chunk_min);
+            && b.lens.iter().all(|&l| l <= 256);
         let dv_chunks = if dv >= 64 {
             self.gdn_chunks.load(Ordering::Relaxed).max(1).min(dv / 16)
         } else {
@@ -2080,7 +2192,25 @@ impl Engine {
         timed!(
             self,
             "gdn.recurrent",
-            if all_chunked {
+            if gdn_reg {
+                kernels::gdn_recurrent_reg_split_batched(
+                    &self.gpu,
+                    &self.kernels.gdn_recurrent_reg_split_batched,
+                    &*qf,
+                    &*kf,
+                    &*vf,
+                    &*gg,
+                    &*beta,
+                    &mut *state,
+                    &mut *core,
+                    &b.offsets_dev,
+                    &b.lens_dev,
+                    b.batch(),
+                    nv,
+                    dk,
+                    dv,
+                )?
+            } else if all_chunked {
                 kernels::gdn_chunked_batched(
                     &self.gpu,
                     &self.kernels.gdn_chunked_tc_batched,
@@ -2160,11 +2290,7 @@ impl Engine {
                     let mut ov = core
                         .try_slice_mut(o * nv * dv..(o + l) * nv * dv)
                         .context("gdn out view")?;
-                    if (chunked || chunked_tc)
-                        && l >= chunk_min
-                        && dk == 128
-                        && dv == 128
-                    {
+                    if (chunked || chunked_tc) && l >= chunk_min && dk == 128 && dv == 128 {
                         kernels::gdn_chunked(
                             &self.gpu,
                             if chunked_tc {
@@ -2316,18 +2442,8 @@ impl Engine {
             let rows = self.gather_last_rows(&h, &b, hidden)?;
             let host = self.to_f32(&rows, b.batch() * hidden)?;
             let x = self.gpu.stream.clone_htod(&host)?;
-            let mut logits = self
-                .gpu
-                .stream
-                .alloc_zeros::<f32>(b.batch() * head.rows)?;
-            self.blas_gemm_f32(
-                &x,
-                b.batch(),
-                hidden,
-                &head.weight,
-                head.rows,
-                &mut logits,
-            )?;
+            let mut logits = self.gpu.stream.alloc_zeros::<f32>(b.batch() * head.rows)?;
+            self.blas_gemm_f32(&x, b.batch(), hidden, &head.weight, head.rows, &mut logits)?;
             let values: Vec<f32> = self.gpu.stream.clone_dtoh(&logits)?;
             for (i, ids) in head_ids.iter().enumerate() {
                 let row = &values[i * head.rows..(i + 1) * head.rows];
@@ -2434,24 +2550,17 @@ impl Engine {
         }
 
         let mut x1 = self.alloc_bf16(seq * hidden)?;
-        timed!(
-            self,
-            "add.residual",
-            kernels::add(&self.gpu, &self.kernels.add, x, &mix, &mut x1, seq * hidden)?
-        );
-        if capture {
-            self.dump_dev("03_after_attn_residual", &x1, seq, hidden)?;
-        }
-
         let mut h2 = self.alloc_bf16(seq * hidden)?;
         timed!(
             self,
-            "norm.post",
-            kernels::rmsnorm(
+            "add_rmsnorm.post",
+            kernels::add_rmsnorm(
                 &self.gpu,
-                &self.kernels.rmsnorm,
-                &x1,
+                &self.kernels.add_rmsnorm,
+                x,
+                &mix,
                 &w.post_norm,
+                &mut x1,
                 &mut h2,
                 seq,
                 hidden,
@@ -2459,6 +2568,9 @@ impl Engine {
                 true,
             )?
         );
+        if capture {
+            self.dump_dev("03_after_attn_residual", &x1, seq, hidden)?;
+        }
         if capture {
             self.dump_dev("04_post_attn_norm", &h2, seq, hidden)?;
         }
@@ -2589,10 +2701,7 @@ impl Engine {
         if let (Some(cache), Some(layer)) = (io.cascade, io.cascade_layer) {
             return self.full_attention_cascade(h, seq, w, capture, cache, layer);
         }
-        if cfg.attention_mode == AttentionMode::BlockCascade
-            && split.is_none()
-            && io.k_out.is_none()
-        {
+        if split.is_none() && io.k_out.is_none() {
             bail!("BlockCascade requires a split, a state capture, or a StateCache");
         }
         let (heads, kv, hd) = (
@@ -2732,7 +2841,7 @@ impl Engine {
                     }
                 };
                 fi.prefill_custom(&self.gpu, &*qn, &*kn, &*vv, mask, &mut *attn, seq)?;
-            } else if cfg.attention_mode != AttentionMode::Causal {
+            } else if true {
                 if use_fa3 {
                     fi.prefill_noncausal_fa3(&self.gpu, &*qn, &*kn, &*vv, &mut *attn, seq)?;
                 } else {
@@ -2744,7 +2853,7 @@ impl Engine {
                 fi.prefill(&self.gpu, &*qn, &*kn, &*vv, &mut *attn, seq)?;
             }
         } else if self.warp_attention.load(Ordering::Relaxed) {
-            if cfg.attention_mode != AttentionMode::Causal {
+            if true {
                 bail!("non-causal attention has no FlashInfer fallback");
             }
             let tc = match hd {
@@ -2783,7 +2892,7 @@ impl Engine {
                 )?;
             }
         } else {
-            if cfg.attention_mode != AttentionMode::Causal {
+            if true {
                 bail!("non-causal attention has no FlashInfer fallback");
             }
             // --legacy-attention: warp-per-query kernel.
@@ -2971,15 +3080,13 @@ impl Engine {
         let fi = self
             .flashinfer_for(kv_len, hd, heads, kv)
             .context("cascade attention needs the vendored FlashInfer library")?;
-        fi.prefill_ext(
-            &self.gpu,
-            &*qn,
-            &*k_all,
-            &*v_all,
-            &mut *attn,
-            seq,
-            kv_len,
-        )?;
+        let use_fa3 = self.flashinfer_fa3.load(Ordering::Relaxed)
+            && kv_len >= self.flashinfer_fa3_min_seq.load(Ordering::Relaxed);
+        if use_fa3 && fi.has_fa3_ext() {
+            fi.prefill_ext_fa3(&self.gpu, &*qn, &*k_all, &*v_all, &mut *attn, seq, kv_len)?;
+        } else {
+            fi.prefill_ext(&self.gpu, &*qn, &*k_all, &*v_all, &mut *attn, seq, kv_len)?;
+        }
         drop(qn);
         drop(kn);
         drop(k_all);
@@ -3194,10 +3301,7 @@ impl Engine {
         let mut core = self.alloc_bf16(seq * nv * dv)?;
         let min_seq = self.gdn_split_min_seq.load(Ordering::Relaxed);
         let chunk_min = self.gdn_chunked_min_seq.load(Ordering::Relaxed);
-        if self.gdn_chunked_tc.load(Ordering::Relaxed)
-            && seq >= chunk_min
-            && dk == 128
-            && dv == 128
+        if self.gdn_chunked_tc.load(Ordering::Relaxed) && seq >= chunk_min && dk == 128 && dv == 128
         {
             if std::env::var("DECIDRA_GDN_PROF").is_ok() {
                 let blocks = (dv / kernels::GDN_CHUNK_VC) * nv;
@@ -3878,7 +3982,7 @@ impl Engine {
     }
 
     /// Full forward + final norm + lm_head rows (or the separate readout head
-    /// for d3/d3-turbo/pplx) for `head_ids`, at the last position.
+    /// d3-turbo readout for `head_ids`, at the last position.
     pub fn decision_logits(&self, tokens: &[u32], head_ids: &[u32]) -> Result<Vec<f32>> {
         if self.readout.is_some() {
             let hidden = self.forward_last_hidden(tokens)?;
@@ -3908,7 +4012,6 @@ impl Engine {
         let last = self.cfg.num_hidden_layers.saturating_sub(1) as isize;
         self.forward_split(tokens, split, last, Stage::Logits, true)
     }
-
 
     /// Encode one d3-turbo state block and retain everything a question pass
     /// needs: per-full-layer post-RoPE K/V and per-GDN-layer recurrent state
@@ -3964,12 +4067,11 @@ impl Engine {
                     kv[i] = Some((k, v));
                 }
                 MixerWeights::Gdn(_) => {
-                    let mut state = self
-                        .gpu
-                        .stream
-                        .alloc_zeros::<f32>(cfg.linear_num_value_heads
+                    let mut state = self.gpu.stream.alloc_zeros::<f32>(
+                        cfg.linear_num_value_heads
                             * cfg.linear_key_head_dim
-                            * cfg.linear_value_head_dim)?;
+                            * cfg.linear_value_head_dim,
+                    )?;
                     let conv_dim = 2 * cfg.gdn_key_dim() + cfg.gdn_value_dim();
                     let mut hist = self.gpu.stream.alloc_zeros::<bf16>(3 * conv_dim)?;
                     let mut io = LayerIo {
@@ -4058,7 +4160,6 @@ impl Engine {
         self.readout_hidden(host, head_ids)
     }
 
-
     /// Batched state-once questions: one forward over every question block,
     /// each forked from the same cached state. Full-attention layers run one
     /// cascade launch per row; GDN layers seed one recurrent slot per row.
@@ -4094,20 +4195,34 @@ impl Engine {
             .readout
             .as_ref()
             .context("this checkpoint has no separate readout head")?;
-        Ok(rows.chunks_exact(head.rows).map(|row| row.to_vec()).collect())
+        Ok(rows
+            .chunks_exact(head.rows)
+            .map(|row| row.to_vec())
+            .collect())
     }
 
     /// Run a state-once question set, splitting it at the same caps the
     /// checkpoint runtime uses (64 rows, 2^18 keys, 2^27 scores). Chunks share
     /// one `StateCache`; results are restored to input order.
-    fn state_once_batch_rows(
-        &self,
-        cache: &StateCache,
-        questions: &[&[u32]],
-    ) -> Result<Vec<f32>> {
-        const MAX_ROWS: usize = 64;
-        const MAX_KEYS: usize = 1 << 18;
-        const MAX_SCORES: usize = 1 << 27;
+    fn state_once_batch_rows(&self, cache: &StateCache, questions: &[&[u32]]) -> Result<Vec<f32>> {
+        // 64 rows is the checkpoint runtime default. H100/H200 can amortize
+        // weight reads across more coalesced requests; raise the caps there
+        // with DECIDRA_STATE_ONCE_MAX_ROWS/_KEYS/_SCORES.
+        let max_rows = std::env::var("DECIDRA_STATE_ONCE_MAX_ROWS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(64);
+        let max_keys = std::env::var("DECIDRA_STATE_ONCE_MAX_KEYS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1 << 18);
+        let max_scores = std::env::var("DECIDRA_STATE_ONCE_MAX_SCORES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(1 << 27);
+        if max_rows == 0 || max_keys == 0 || max_scores == 0 {
+            bail!("state-once caps must be positive");
+        }
         if questions.is_empty() {
             bail!("empty state-once question batch");
         }
@@ -4128,15 +4243,13 @@ impl Engine {
             let rows = current.len() + 1;
             let keys = rows * (state + next_max);
             let scores = rows * next_max * (state + next_max);
-            if rows == 1 && (keys > MAX_KEYS || scores > MAX_SCORES) {
+            if rows == 1 && (keys > max_keys || scores > max_scores) {
                 bail!(
                     "one question needs {keys} keys / {scores} scores, over the \
-                     {MAX_KEYS}/{MAX_SCORES} caps"
+                     {max_keys}/{max_scores} caps"
                 );
             }
-            if !current.is_empty()
-                && (rows > MAX_ROWS || keys > MAX_KEYS || scores > MAX_SCORES)
-            {
+            if !current.is_empty() && (rows > max_rows || keys > max_keys || scores > max_scores) {
                 chunks.push(std::mem::take(&mut current));
                 max_q = 0;
             }
@@ -4201,10 +4314,7 @@ impl Engine {
             .context("this checkpoint has no separate readout head")?;
         let host = self.to_f32(&rows, b.batch() * self.cfg.hidden_size)?;
         let x = self.gpu.stream.clone_htod(&host)?;
-        let mut out = self
-            .gpu
-            .stream
-            .alloc_zeros::<f32>(b.batch() * head.rows)?;
+        let mut out = self.gpu.stream.alloc_zeros::<f32>(b.batch() * head.rows)?;
         self.blas_gemm_f32(
             &x,
             b.batch(),

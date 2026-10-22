@@ -1,9 +1,10 @@
 [package]
 name = "decidra-native"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Native CUDA backend for Decidra (AWQ W4A16 decision models), no Python runtime"
+description = "Native CUDA engine for Decidra: vllm-sr/d3-turbo prefix_bidir state-once inference"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/juanqui/decidra"
 rust-version = "1.85"
 publish = false
 

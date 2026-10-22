@@ -1,45 +1,37 @@
 [package]
 name = "decidra"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Decidra: native inference engine for decision models (AWQ W4A16, CUDA)"
+description = "Decidra: state-once inference engine for vllm-sr/d3-turbo (native CUDA)"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/juanqui/decidra"
 rust-version = "1.85"
 
 [workspace]
-members = ["native", "crates/decidra-cache"]
+members = ["native"]
 resolver = "3"
 
 [features]
 default = []
 # Links the in-process `decidra-native` CUDA engine. Off by default so `cargo test`
-# builds the API against `MockBackend` without a CUDA toolchain.
+# builds the API without a CUDA toolchain.
 native = ["dep:decidra-native"]
 
 [dependencies]
 anyhow = "1"
 axum = "0.8"
 bytes = "1"
-crc32fast = "1"
-futures = "0.3"
-hex = "0.4"
-hmac = "0.12"
 metrics = "0.24"
 metrics-exporter-prometheus = "0.18"
 decidra-native = { path = "native", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-sha2 = "0.10"
 thiserror = "2"
 tokenizers = "0.21"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v4"] }
-
-[dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
 
 [profile.release]
 lto = "thin"

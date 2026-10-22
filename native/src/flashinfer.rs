@@ -50,8 +50,6 @@ type ExtFn = unsafe extern "C" fn(
     *mut c_void,
 ) -> c_int;
 
-
-
 unsafe extern "C" {
     fn dlopen(filename: *const c_char, flags: c_int) -> *mut c_void;
     fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
@@ -138,6 +136,7 @@ pub struct FlashInfer {
     func_noncausal: PrefillFn,
     func_custom: Option<CustomFn>,
     func_ext: Option<ExtFn>,
+    func_ext_fa3: Option<ExtFn>,
     handle_fa3: *mut c_void,
     func_fa3: Option<PrefillFn>,
     func_noncausal_fa3: Option<PrefillFn>,
@@ -188,9 +187,20 @@ impl FlashInfer {
                 "fi_prefill_bf16_noncausal_fa3",
             )
         };
-        let (handle_fa3, func_fa3, func_noncausal_fa3) = match fa3 {
-            Some((h, f, fnc)) => (h, Some(f), Some(fnc)),
-            None => (std::ptr::null_mut(), None, None),
+        let (handle_fa3, func_fa3, func_noncausal_fa3, func_ext_fa3) = match fa3 {
+            Some((h, f, fnc)) => {
+                let ext = unsafe {
+                    let sym = CString::new("fi_prefill_bf16_ext_fa3").ok()?;
+                    let ptr = dlsym(h, sym.as_ptr());
+                    if ptr.is_null() {
+                        None
+                    } else {
+                        Some(std::mem::transmute::<*mut c_void, ExtFn>(ptr))
+                    }
+                };
+                (h, Some(f), Some(fnc), ext)
+            }
+            None => (std::ptr::null_mut(), None, None, None),
         };
         Some(Arc::new(Self {
             handle,
@@ -198,6 +208,7 @@ impl FlashInfer {
             func_noncausal,
             func_custom: custom,
             func_ext: ext,
+            func_ext_fa3,
             handle_fa3,
             func_fa3,
             func_noncausal_fa3,
@@ -206,6 +217,10 @@ impl FlashInfer {
 
     pub fn has_fa3(&self) -> bool {
         self.func_fa3.is_some()
+    }
+
+    pub fn has_fa3_ext(&self) -> bool {
+        self.func_ext_fa3.is_some()
     }
 
     fn invoke<Q, K, V, O>(
@@ -230,7 +245,10 @@ impl FlashInfer {
         if q.len() < need_q || k.len() < need_kv || v.len() < need_kv || out.len() < need_q {
             bail!(
                 "{label}: buffers too small for seq {seq}: q={} k={} v={} out={}",
-                q.len(), k.len(), v.len(), out.len()
+                q.len(),
+                k.len(),
+                v.len(),
+                out.len()
             );
         }
         let (qp, _g0) = q.device_ptr(&gpu.stream);
@@ -408,6 +426,55 @@ impl FlashInfer {
         Ok(())
     }
 
+    /// FA3 cascade prefill with independent query/key lengths.
+    pub fn prefill_ext_fa3<Q, K, V, O>(
+        &self,
+        gpu: &crate::cuda::Gpu,
+        q: &Q,
+        k: &K,
+        v: &V,
+        out: &mut O,
+        qo_len: usize,
+        kv_len: usize,
+    ) -> Result<()>
+    where
+        Q: DevicePtr<bf16>,
+        K: DevicePtr<bf16>,
+        V: DevicePtr<bf16>,
+        O: DevicePtrMut<bf16>,
+    {
+        let Some(func) = self.func_ext_fa3 else {
+            bail!("FlashInfer FA3 extended prefill is not available");
+        };
+        if q.len() < qo_len * 24 * 256
+            || k.len() < kv_len * 4 * 256
+            || v.len() < kv_len * 4 * 256
+            || out.len() < qo_len * 24 * 256
+        {
+            bail!("FA3 extended prefill buffers too small for qo {qo_len} kv {kv_len}");
+        }
+        let (qp, _g0) = q.device_ptr(&gpu.stream);
+        let (kp, _g1) = k.device_ptr(&gpu.stream);
+        let (vp, _g2) = v.device_ptr(&gpu.stream);
+        let (op, _g3) = out.device_ptr_mut(&gpu.stream);
+        let stream = gpu.stream.cu_stream() as *mut c_void;
+        let rc = unsafe {
+            func(
+                qp as *const c_void,
+                kp as *const c_void,
+                vp as *const c_void,
+                op as *mut c_void,
+                qo_len as c_int,
+                kv_len as c_int,
+                stream,
+            )
+        };
+        if rc != 0 {
+            bail!("FlashInfer FA3 extended prefill failed with cudaError {rc}");
+        }
+        Ok(())
+    }
+
     /// Non-causal prefill with independent query/key lengths.
     pub fn prefill_ext<Q, K, V, O>(
         &self,
@@ -456,7 +523,6 @@ impl FlashInfer {
         }
         Ok(())
     }
-
 }
 
 impl Drop for FlashInfer {

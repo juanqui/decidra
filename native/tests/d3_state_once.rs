@@ -8,12 +8,12 @@ use decidra_native::Engine;
 #[test]
 #[ignore = "requires a d3-turbo checkpoint on a GPU"]
 fn d3_state_once_batch() {
-    let model = std::env::var("DECIDRA_D3_MODEL")
-        .unwrap_or_else(|_| "/srv/models/d3-turbo".to_string());
+    let model =
+        std::env::var("DECIDRA_D3_MODEL").unwrap_or_else(|_| "/srv/models/d3-turbo".to_string());
     let probe =
         std::env::var("DECIDRA_D3_PROBE").unwrap_or_else(|_| "/tmp/d3_once_batch.json".to_string());
-    let out =
-        std::env::var("DECIDRA_D3_OUT").unwrap_or_else(|_| "/tmp/d3_once_batch_out.json".to_string());
+    let out = std::env::var("DECIDRA_D3_OUT")
+        .unwrap_or_else(|_| "/tmp/d3_once_batch_out.json".to_string());
     let data: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&probe).expect("probe")).expect("json");
     let state: Vec<u32> = data["state"]
@@ -42,18 +42,50 @@ fn d3_state_once_batch() {
         .collect();
 
     let engine = Engine::new(Path::new(&model)).expect("engine");
-    if std::env::var("DECIDRA_NATIVE_CACHE").map(|v| v == "0").unwrap_or(false) {
+    if std::env::var("DECIDRA_NATIVE_CACHE")
+        .map(|v| v == "0")
+        .unwrap_or(false)
+    {
         engine.set_cache_weights(false);
     }
-    if std::env::var("DECIDRA_MARLIN").map(|v| v != "0").unwrap_or(false) {
+    if std::env::var("DECIDRA_MARLIN")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
         engine.set_marlin(true);
         engine.set_marlin_int8(
             std::env::var("DECIDRA_INT8")
                 .map(|v| v != "0")
                 .unwrap_or(true),
         );
+        engine.set_int8_group_scale(
+            std::env::var("DECIDRA_INT8_GROUP")
+                .map(|v| v != "0")
+                .unwrap_or(false),
+        );
+        let exclude = std::env::var("DECIDRA_INT8_EXCLUDE")
+            .unwrap_or_else(|_| "self_attn.o_proj,self_attn.v_proj,self_attn.k_proj".to_owned());
+        engine.set_int8_exclude(
+            exclude
+                .split(',')
+                .filter(|part| !part.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        );
+        engine.set_int8_group_exclude(vec!["mlp.gate_proj".to_owned()]);
+        engine.set_int8_all_layers(
+            &std::env::var("DECIDRA_INT8_ALL_LAYERS").unwrap_or_else(|_| "last:8".to_owned()),
+        );
+        if let Ok(clip) = std::env::var("DECIDRA_INT8_CLIP") {
+            if let Ok(clip) = clip.parse::<f32>() {
+                engine.set_int8_clip(clip);
+            }
+        }
     }
-    if std::env::var("DECIDRA_GDN_CHUNKED").map(|v| v != "0").unwrap_or(false) {
+    if std::env::var("DECIDRA_GDN_CHUNKED")
+        .map(|v| v != "0")
+        .unwrap_or(false)
+    {
         engine.set_gdn_chunked(true);
         engine.set_gdn_chunked_tc(true);
     }
