@@ -234,6 +234,8 @@ accuracy gate on d3-turbo. It is not a default or recommended serving path.
 | FP8 all-linear (recommended) | 623 ms / 103 q/s | **32/32** | **0.0115** |
 
 The full W4A4 checkpoint used 1,024 d3 `prefix_bidir` calibration rows and
-GPTQ; see `docs/ENGINE.md` and `quant/quantize_nvfp4.py`. The FP4 kernel and
+GPTQ; see `docs/ENGINE.md` and `quant/quantize_nvfp4.py`. A Max-Q NVFP4 run was
+not possible on this host: its 600 W power limit did not change when asked for
+300 W, so the numbers above are 600 W only. The FP4 kernel and
 checkpoint loader are retained for experiments; quality-sensitive deployments
 should use BF16 or the validated FP8 path.
