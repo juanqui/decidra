@@ -122,7 +122,11 @@ free VRAM, trims the scratch pools, trims the CUDA async-allocator pool with
 `cuMemPoolTrimTo`, and offloads pinned states to the host L2 if the pass would
 otherwise run below the reserve. The reserve scales with state length
 (192 KiB/token + 1 GiB, minimum 1.5 GiB), because state capture and the
-question pass allocate several per-token scratch buffers in addition to K/V. A real state-capture or question-pass OOM gets one trim-and-retry attempt. The state cache, host cache, and free-VRAM gauges are
+question pass allocate several per-token scratch buffers in addition to K/V.
+State capture also forces scratch buffers to be released as they are dropped
+for the duration of the capture; retaining them made a 12,192-token state
+exceed 24 GiB while a 12,288-token state passed only because it crossed the old
+low-memory cutoff. A real state-capture or question-pass OOM gets one trim-and-retry attempt. The state cache, host cache, and free-VRAM gauges are
 exported as `semel_state_cache_*`, `semel_host_cache_states`, and
 `semel_gpu_free_bytes`.
 

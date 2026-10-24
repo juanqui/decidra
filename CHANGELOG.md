@@ -5,8 +5,10 @@
 - Fixed state-once OOMs under coalesced and long requests: the batch row
   budget now sums queued question rows, scratch reserves scale with state
   length, cached states are offloaded when needed, and the CUDA
-  async-allocator pool is trimmed with `cuMemPoolTrimTo`. Added cache/free-VRAM
-  metrics and one-shot retries for both state-capture and question-pass OOMs.
+  async-allocator pool is trimmed with `cuMemPoolTrimTo`. State capture now
+  releases scratch for the whole capture instead of retaining it below the old
+  12,288-token low-memory cutoff. Added cache/free-VRAM metrics and one-shot
+  retries for both state-capture and question-pass OOMs.
 - Added native SM120 NVFP4 checkpoint loading and FP4×FP4 cuBLASLt GEMMs.
 - Added dynamic NVFP4 activation quantization with a coalesced one-CTA-per-row
   kernel and block-scaled VEC16_UE4M3 scale repacking.

@@ -287,6 +287,23 @@ impl Drop for CaptureGuard<'_> {
     }
 }
 
+/// Force the scratch pools to release dropped buffers for the duration of a
+/// state capture. Near the old 12,288-token threshold, retaining per-layer
+/// scratch made a 12,192-token capture exceed 24 GiB while a 12,288-token
+/// capture only survived because it crossed the arbitrary cutoff.
+struct LowMemGuard<'a> {
+    bf16: &'a AtomicBool,
+    f32: &'a AtomicBool,
+    prev_bf16: bool,
+    prev_f32: bool,
+}
+impl Drop for LowMemGuard<'_> {
+    fn drop(&mut self) {
+        self.bf16.store(self.prev_bf16, Ordering::Relaxed);
+        self.f32.store(self.prev_f32, Ordering::Relaxed);
+    }
+}
+
 struct LtLayout(lt_sys::cublasLtMatrixLayout_t);
 impl Drop for LtLayout {
     fn drop(&mut self) {
@@ -4442,9 +4459,16 @@ impl Engine {
         self.prof.entries.lock().unwrap().clear();
         self.capturing.store(true, Ordering::Relaxed);
         let _capture_guard = CaptureGuard(&self.capturing);
-        let low_mem = seq >= 12_288;
-        self.pool.low_mem.store(low_mem, Ordering::Relaxed);
-        self.f32_pool.low_mem.store(low_mem, Ordering::Relaxed);
+        // Capture is a one-off full-prefill pass. Always release dropped
+        // scratch immediately; retaining it can exceed 24 GiB at state sizes
+        // just below the old 12,288-token cutoff.
+        let low_mem = LowMemGuard {
+            bf16: &self.pool.low_mem,
+            f32: &self.f32_pool.low_mem,
+            prev_bf16: self.pool.low_mem.swap(true, Ordering::Relaxed),
+            prev_f32: self.f32_pool.low_mem.swap(true, Ordering::Relaxed),
+        };
+        let _low_mem = low_mem;
         let cfg = &self.cfg;
         let layers = cfg.num_hidden_layers;
         let mut kv: Vec<Option<(CudaSlice<bf16>, CudaSlice<bf16>)>> =
