@@ -50,7 +50,17 @@ struct HostCachedState {
 /// Leave room for the question-pass scratch (attention scores/masks, GDN
 /// recurrence, INT8 accumulation) before launching a group. The pool is
 /// trimmed first; cached states are offloaded to the host L2 if needed.
-const QUESTION_PASS_RESERVE: usize = 1536 * 1024 * 1024;
+const MIN_PASS_RESERVE: usize = 1536 * 1024 * 1024;
+
+/// Capture and question passes allocate several per-token buffers in addition
+/// to the cached K/V. Scale the reserve with the state length; a fixed reserve
+/// is enough for 2K but not for 16K-32K states.
+fn pass_reserve(state_len: usize) -> usize {
+    state_len
+        .saturating_mul(192 * 1024)
+        .saturating_add(1024 * 1024 * 1024)
+        .max(MIN_PASS_RESERVE)
+}
 
 /// State cache is dominated by 16 full-attention K/V layers (64 KiB/token)
 /// plus the fixed GDN recurrent state.
@@ -251,7 +261,8 @@ fn run_group(
     // suggests: attention scores/masks, GDN recurrence and INT8 accumulators.
     // Reclaim pooled scratch and, if necessary, move other states to the host
     // L2 before either restoring/capturing a state or launching questions.
-    let state_need = entry_bytes.saturating_add(QUESTION_PASS_RESERVE);
+    let pass_need = pass_reserve(state.len());
+    let state_need = entry_bytes.saturating_add(pass_need);
     if cached.is_none() {
         if let Err(message) = ensure_headroom(
             engine,
@@ -293,13 +304,46 @@ fn run_group(
             }
         }
     } else {
-        match engine.capture_state(state) {
+        let mut captured = engine.capture_state(state);
+        if captured
+            .as_ref()
+            .is_err_and(|error| error.to_string().contains("out of memory"))
+        {
+            // A long state can still exceed the scaled estimate. Drop all
+            // reclaimable scratch/host-cached states and retry once.
+            metrics::counter!("semel_state_capture_oom_retries_total").increment(1);
+            let _ = engine.trim_pools();
+            let _ = ensure_headroom(
+                engine,
+                cache,
+                host_cache,
+                state_need,
+                host_state_cache_bytes,
+                "state capture retry",
+            );
+            captured = engine.capture_state(state);
+        }
+        match captured {
             Ok(captured) => CachedState {
                 state: state.to_vec(),
                 cache: captured,
                 bytes: entry_bytes,
             },
             Err(error) => {
+                let free_mib = engine
+                    .gpu
+                    .mem_info()
+                    .map(|(free, _)| free / (1024 * 1024))
+                    .unwrap_or(0);
+                tracing::error!(
+                    state_tokens = state.len(),
+                    free_mib,
+                    cached_states = cache.len(),
+                    host_states = host_cache.len(),
+                    pass_need_mib = pass_need / (1024 * 1024),
+                    %error,
+                    "state capture failed"
+                );
                 let message = format!("state capture failed: {error}");
                 for job in jobs {
                     let _ = job.reply.send(Err(message.clone()));
@@ -326,7 +370,7 @@ fn run_group(
         engine,
         cache,
         host_cache,
-        QUESTION_PASS_RESERVE,
+        pass_need,
         host_state_cache_bytes,
         "question pass",
     ) {
@@ -350,7 +394,7 @@ fn run_group(
             engine,
             cache,
             host_cache,
-            QUESTION_PASS_RESERVE,
+            pass_need,
             host_state_cache_bytes,
             "question pass retry",
         );

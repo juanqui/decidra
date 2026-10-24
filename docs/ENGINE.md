@@ -120,8 +120,9 @@ question rows across coalesced requests, not just the first request. Before a
 state restore/capture and again before the question pass, the worker checks
 free VRAM, trims the scratch pools, trims the CUDA async-allocator pool with
 `cuMemPoolTrimTo`, and offloads pinned states to the host L2 if the pass would
-otherwise run below a 1.5 GiB reserve. A real question-pass OOM gets one
-trim-and-retry attempt. The state cache, host cache, and free-VRAM gauges are
+otherwise run below the reserve. The reserve scales with state length
+(192 KiB/token + 1 GiB, minimum 1.5 GiB), because state capture and the
+question pass allocate several per-token scratch buffers in addition to K/V. A real state-capture or question-pass OOM gets one trim-and-retry attempt. The state cache, host cache, and free-VRAM gauges are
 exported as `semel_state_cache_*`, `semel_host_cache_states`, and
 `semel_gpu_free_bytes`.
 
