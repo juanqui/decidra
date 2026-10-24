@@ -107,6 +107,34 @@ impl Gpu {
         self.ctx.name().context("device name")
     }
 
+    /// Return cached blocks in the CUDA default memory pool to the driver.
+    /// cudarc allocates through `cuMemAllocAsync` when memory pools are
+    /// supported, so dropping a CudaSlice alone does not increase
+    /// `cudaMemGetInfo` free memory until the pool is trimmed.
+    pub fn trim_allocator(&self) -> Result<()> {
+        self.synchronize()?;
+        unsafe {
+            let mut device: sys::CUdevice = 0;
+            let rc = sys::cuDeviceGet(&mut device, self.ctx.ordinal() as i32);
+            if rc != sys::CUresult::CUDA_SUCCESS {
+                bail!("cuDeviceGet failed: {rc:?}");
+            }
+            let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+            let rc = sys::cuDeviceGetDefaultMemPool(&mut pool, device);
+            if rc != sys::CUresult::CUDA_SUCCESS {
+                bail!("cuDeviceGetDefaultMemPool failed: {rc:?}");
+            }
+            if pool.is_null() {
+                bail!("CUDA default memory pool is null");
+            }
+            let rc = sys::cuMemPoolTrimTo(pool, 0);
+            if rc != sys::CUresult::CUDA_SUCCESS {
+                bail!("cuMemPoolTrimTo failed: {rc:?}");
+            }
+        }
+        Ok(())
+    }
+
     /// (free_bytes, total_bytes)
     pub fn mem_info(&self) -> Result<(usize, usize)> {
         self.ctx.mem_get_info().context("cudaMemGetInfo")

@@ -1008,6 +1008,7 @@ impl Engine {
         self.gpu.synchronize()?;
         self.pool.free.lock().unwrap().clear();
         self.f32_pool.free.lock().unwrap().clear();
+        self.gpu.trim_allocator()?;
         Ok(())
     }
 

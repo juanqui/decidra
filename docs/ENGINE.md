@@ -115,6 +115,16 @@ state. On H100/H200, `DECIDRA_STATE_ONCE_MAX_ROWS` (default 64) can be raised
 to amortize weight reads across coalesced requests; the engine still splits at
 the key/score caps.
 
+GPU admission is memory-aware. `DECIDRA_BATCH_ROWS` budgets the **sum** of
+question rows across coalesced requests, not just the first request. Before a
+state restore/capture and again before the question pass, the worker checks
+free VRAM, trims the scratch pools, trims the CUDA async-allocator pool with
+`cuMemPoolTrimTo`, and offloads pinned states to the host L2 if the pass would
+otherwise run below a 1.5 GiB reserve. A real question-pass OOM gets one
+trim-and-retry attempt. The state cache, host cache, and free-VRAM gauges are
+exported as `semel_state_cache_*`, `semel_host_cache_states`, and
+`semel_gpu_free_bytes`.
+
 ## 4. Quantization
 
 The shipped recipe is **GPTQ-only, INT4 symmetric group 64, INT8 per-token

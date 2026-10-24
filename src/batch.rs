@@ -47,6 +47,11 @@ struct HostCachedState {
     bytes: usize,
 }
 
+/// Leave room for the question-pass scratch (attention scores/masks, GDN
+/// recurrence, INT8 accumulation) before launching a group. The pool is
+/// trimmed first; cached states are offloaded to the host L2 if needed.
+const QUESTION_PASS_RESERVE: usize = 1536 * 1024 * 1024;
+
 /// State cache is dominated by 16 full-attention K/V layers (64 KiB/token)
 /// plus the fixed GDN recurrent state.
 fn state_cache_bytes_for(state_len: usize) -> usize {
@@ -79,17 +84,23 @@ impl BatchHandle {
                         Ok(job) => job,
                         Err(_) => break,
                     };
-                    let first_rows = first.questions.len().max(1);
-                    let max_jobs = (batch_rows / first_rows).max(1).min(batch_requests);
+                    // Budget the *sum* of question rows in the group, not just
+                    // rows of the first request. A 1-question request followed
+                    // by 64-question requests must not turn a 32-row budget into
+                    // a 2,048-row pass.
+                    let mut rows = first.questions.len().max(1);
                     let mut jobs = vec![first];
                     let deadline = Instant::now() + Duration::from_micros(batch_window_us);
-                    while jobs.len() < max_jobs {
+                    while jobs.len() < batch_requests && rows < batch_rows {
                         let now = Instant::now();
                         if now >= deadline {
                             break;
                         }
                         match rx.recv_timeout(deadline - now) {
-                            Ok(job) => jobs.push(job),
+                            Ok(job) => {
+                                rows = rows.saturating_add(job.questions.len().max(1));
+                                jobs.push(job);
+                            }
                             Err(mpsc::RecvTimeoutError::Timeout) => break,
                             Err(mpsc::RecvTimeoutError::Disconnected) => {
                                 // Flush the jobs already collected, then stop.
@@ -217,7 +228,7 @@ fn run_group(
     host_state_cache_bytes: usize,
 ) {
     let cached = cache.iter().position(|entry| entry.state == state);
-    let host_cached = if cached.is_none() {
+    let mut host_cached = if cached.is_none() {
         host_cache.iter().position(|entry| entry.state == state)
     } else {
         None
@@ -227,40 +238,41 @@ fn run_group(
         .map(|v| v != "0")
         .unwrap_or(true);
     let entry_bytes = state_cache_bytes_for(state.len());
-    if cached.is_none() && host_cached.is_none() {
-        let cached_bytes: usize = cache.iter().map(|entry| entry.bytes).sum();
-        if !pin_cache {
-            while !cache.is_empty()
-                && (cache.len() >= state_cache_entries
-                    || cached_bytes.saturating_add(entry_bytes) > state_cache_bytes)
-            {
-                cache.remove(0);
-            }
+    let cached_bytes: usize = cache.iter().map(|entry| entry.bytes).sum();
+    if !pin_cache {
+        while !cache.is_empty()
+            && (cache.len() >= state_cache_entries
+                || cached_bytes.saturating_add(entry_bytes) > state_cache_bytes)
+        {
+            cache.remove(0);
         }
-        if let Ok((free, _)) = engine.gpu.mem_info() {
-            let reserve = 2 * 1024 * 1024 * 1024;
-            if free < entry_bytes.saturating_add(reserve) {
-                cache.clear();
-                let _ = engine.trim_pools();
-                if let Ok((free, _)) = engine.gpu.mem_info() {
-                    if free < entry_bytes.saturating_add(reserve) {
-                        let message = format!(
-                            "insufficient GPU memory for a {}-token state (need ~{} MiB, {} MiB free)",
-                            state.len(),
-                            entry_bytes / (1024 * 1024),
-                            free / (1024 * 1024)
-                        );
-                        for job in jobs {
-                            let _ = job.reply.send(Err(message.clone()));
-                        }
-                        return;
-                    }
-                }
+    }
+    // A question pass allocates substantially more scratch than a cache hit
+    // suggests: attention scores/masks, GDN recurrence and INT8 accumulators.
+    // Reclaim pooled scratch and, if necessary, move other states to the host
+    // L2 before either restoring/capturing a state or launching questions.
+    let state_need = entry_bytes.saturating_add(QUESTION_PASS_RESERVE);
+    if cached.is_none() {
+        if let Err(message) = ensure_headroom(
+            engine,
+            cache,
+            host_cache,
+            state_need,
+            host_state_cache_bytes,
+            "state capture/restore",
+        ) {
+            for job in jobs {
+                let _ = job.reply.send(Err(message.clone()));
             }
+            return;
+        }
+        // Offloading other states may have evicted this one from the host L2.
+        if host_cached.is_some() {
+            host_cached = host_cache.iter().position(|entry| entry.state == state);
         }
     }
     let capture_started = Instant::now();
-    let from_host = host_cached;
+    let from_host = host_cached.is_some();
 
     let entry = if let Some(index) = cached {
         cache.remove(index)
@@ -310,8 +322,40 @@ fn run_group(
         questions.extend(job.questions.iter().map(|question| question.as_slice()));
         ranges.push((start, questions.len()));
     }
+    if let Err(message) = ensure_headroom(
+        engine,
+        cache,
+        host_cache,
+        QUESTION_PASS_RESERVE,
+        host_state_cache_bytes,
+        "question pass",
+    ) {
+        for job in jobs {
+            let _ = job.reply.send(Err(message.clone()));
+        }
+        return;
+    }
     let pass_started = Instant::now();
-    let rows = engine.readout_state_once_batch(&entry.cache, &questions);
+    let mut rows = engine.readout_state_once_batch(&entry.cache, &questions);
+    if rows
+        .as_ref()
+        .is_err_and(|error| error.to_string().contains("out of memory"))
+    {
+        // A failed allocation can leave fragmented/pooled blocks behind even
+        // when the preflight looked healthy. Reclaim once and retry before
+        // failing the request.
+        metrics::counter!("semel_question_pass_oom_retries_total").increment(1);
+        let _ = engine.trim_pools();
+        let _ = ensure_headroom(
+            engine,
+            cache,
+            host_cache,
+            QUESTION_PASS_RESERVE,
+            host_state_cache_bytes,
+            "question pass retry",
+        );
+        rows = engine.readout_state_once_batch(&entry.cache, &questions);
+    }
     let pass_ms = pass_started.elapsed().as_secs_f64() * 1e3;
     metrics::counter!(if hit {
         "semel_state_cache_hits_total"
@@ -358,16 +402,20 @@ fn run_group(
         }
     }
 
+    metrics::gauge!("semel_state_cache_states").set(cache.len() as f64);
+    metrics::gauge!("semel_state_cache_bytes")
+        .set(cache.iter().map(|entry| entry.bytes).sum::<usize>() as f64);
+    metrics::gauge!("semel_host_cache_states").set(host_cache.len() as f64);
     if state_cache_entries > 0 {
         let cached_bytes: usize = cache.iter().map(|entry| entry.bytes).sum();
         let has_room = cache.len() < state_cache_entries
             && cached_bytes.saturating_add(entry.bytes) <= state_cache_bytes;
         if has_room {
             cache.push(entry);
-            if let Some(index) = from_host {
-                host_cache.remove(index);
+            if from_host {
+                host_cache.retain(|cached| cached.state != state);
             }
-        } else if from_host.is_none() && host_state_cache_bytes > 0 {
+        } else if !from_host && host_state_cache_bytes > 0 {
             host_insert(
                 engine,
                 host_cache,
@@ -377,6 +425,75 @@ fn run_group(
             );
         }
     }
+}
+
+fn ensure_headroom(
+    engine: &Engine,
+    cache: &mut Vec<CachedState>,
+    host_cache: &mut Vec<HostCachedState>,
+    need: usize,
+    host_state_cache_bytes: usize,
+    context: &str,
+) -> std::result::Result<(), String> {
+    let mut free = engine
+        .gpu
+        .mem_info()
+        .map(|(free, _)| free)
+        .map_err(|error| format!("failed to query GPU memory: {error}"))?;
+    metrics::gauge!("semel_gpu_free_bytes").set(free as f64);
+    if free < need {
+        // Only pay for a synchronize + CUDA mempool trim when the hot path
+        // cannot satisfy the request. Unconditional trimming on every group
+        // returns scratch to the driver only to reallocate it immediately.
+        if let Err(error) = engine.trim_pools() {
+            return Err(format!("failed to trim scratch pools: {error}"));
+        }
+        free = engine
+            .gpu
+            .mem_info()
+            .map(|(free, _)| free)
+            .map_err(|error| format!("failed to query GPU memory: {error}"))?;
+        metrics::gauge!("semel_gpu_free_bytes").set(free as f64);
+    }
+    let mut offloaded = 0usize;
+    while free < need && !cache.is_empty() {
+        let entry = cache.remove(0);
+        let bytes = entry.bytes;
+        host_insert(engine, host_cache, entry, bytes, host_state_cache_bytes);
+        offloaded += 1;
+        // The CUDA mempool retains freed blocks; trim before re-querying.
+        if let Err(error) = engine.trim_pools() {
+            return Err(format!("failed to trim after state offload: {error}"));
+        }
+        free = engine
+            .gpu
+            .mem_info()
+            .map(|(free, _)| free)
+            .map_err(|error| format!("failed to query GPU memory: {error}"))?;
+        metrics::gauge!("semel_gpu_free_bytes").set(free as f64);
+    }
+    if free < need {
+        return Err(format!(
+            "insufficient GPU memory for {context}: {} MiB free, {} MiB required",
+            free / (1024 * 1024),
+            need / (1024 * 1024)
+        ));
+    }
+    if offloaded > 0 {
+        tracing::warn!(
+            offloaded,
+            free_mib = free / (1024 * 1024),
+            context,
+            "offloaded cached states to fit GPU scratch"
+        );
+    }
+    tracing::debug!(
+        free_mib = free / (1024 * 1024),
+        cached_states = cache.len(),
+        context,
+        "GPU memory preflight"
+    );
+    Ok(())
 }
 
 fn host_insert(
