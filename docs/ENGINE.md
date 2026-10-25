@@ -165,8 +165,8 @@ bit-exactly, and uses the real block mask for calibration:
 The GDN layers receive the 2-D padding mask. The mask path is
 `Qwen3_5TextModel.forward`'s `attention_mask` dict.
 
-Artifact: `/srv/models/d3-turbo-w4a8-vision-v1` (15 GB after stripping the
-CausalLM `lm_head`). Dequant gate: 496/496 modules pass cosine ≥ 0.95 against
+Artifact: `/srv/models/d3-turbo-w4a8-vision-v1` (16.4 GB: W4A8 language
+weights, F32 readout, and the BF16 vision tower). Dequant gate: 496/496 modules pass cosine ≥ 0.95 against
 the BF16 source; the v4 32-row eval passes:
 
 | variant | top-1 | mean MAE | max Δp | flips |
@@ -280,7 +280,7 @@ cascade attention (~27 ms), RMSNorm/residual/epilogue kernels, and the state
 cache/readout path. The FP8 linears are at roughly 80% of the SM120 FP8 tensor
 peak at the sustained clock.
 
-## 5. Performance on one RTX 4090 (450 W cap)## 5. Performance on one RTX 4090 (450 W cap)
+## 5. Performance on one RTX 4090
 
 Both GPUs are capped at 450 W. The 4090 draws ~449 W at ~2.82 GHz. Defaults:
 W4A8 g64, gate/up/down/o/q INT8 group, k/v W4A16, register GDN, suffix-only
@@ -289,7 +289,7 @@ with a 2 GiB scratch reserve.
 
 | phase / batch | time |
 |---|---:|
-| preload (15 GB + Marlin repack) | 9.0 s |
+| preload (16.4 GB + Marlin repack) | 9.4 s |
 | state capture, 2K tokens | ~400–500 ms |
 | 64q pass profile at 450 W (3,236 question tokens) | 685 ms regions / 733 ms p50 |
 | gate / up / down at 450 W | 108 / 108 / 104 ms |
@@ -353,7 +353,7 @@ cascade work below, not another precision switch.
 and fits the 80 GB H100 (49 GB weights + 2.4 GB embedding + caches). A
 re-quantized W4A8/g64 H200 artifact was measured but **failed the 32-row
 accuracy gate** (29/32 top-1, two unsafe flips); do not use it. The shipped
-15 GB W4A8 v4 artifact is the RTX 4090 production path, where Marlin's
+16.4 GB W4A8 vision artifact is the RTX 4090 production path, where Marlin's
 SM80-style MMA is fast; on H200 the same W4A8 path was slower (1.26 s warm /
 1.77 s cold for 64q, 58 q/s at c8) than BF16. SM90 W4A8 needs a WGMMA kernel
 before it can beat BF16.
@@ -376,7 +376,7 @@ The H200 engine preload of the BF16 package took 39 s; H100 33 s.
 
 **Same-machine baseline (450 W historical).** vLLM-SR `vllm-srun` 0.2.0
 (native engine, `--max-num-seqs 64 --enable-shared-context`) served the same
-15 GB int4 artifact and the same 2,076-token state / 64-question request on
+16.4 GB vision artifact and the same 2,076-token state / 64-question request on
 the same RTX 4090 at 450 W: **3.89 s** per request. The native server answered
 in **1.65 s cold / 1.17 s warm**, **2.4–3.3× faster**,
 with the same top choice and a largest probability difference of 0.005 on the

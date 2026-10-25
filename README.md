@@ -52,9 +52,12 @@ questions ──► one ragged pass ──► [B, 255] readout ──► typed a
 - The d3-turbo package mounted read-only. It must contain `config.json`,
   `decision_config.json` (`attention_mode: prefix_bidir`,
   `format_id: d3-code-readout-v1`), `tokenizer.json`, `model.safetensors`, and
-  `readout.safetensors`.
-- 24 GB VRAM for the W4A8 g64 package on a 4090; 49 GB BF16 on H100/H200;
-  96 GB on the RTX PRO 6000, which fits either BF16 or W4A8 plus state caches.
+  `readout.safetensors`. Image requests additionally require the BF16
+  `visual.*` tensors, `preprocessor_config.json`, and the vision config in
+  `config.json`; the published vision artifact includes all of them.
+- 24 GB VRAM for the W4A8 vision package (W4A8 language + BF16 image tower)
+  on a 4090; 49 GB BF16 on H100/H200; 96 GB on the RTX PRO 6000, which fits
+  either BF16 or W4A8 plus state caches.
 
 ### Docker
 
@@ -211,6 +214,7 @@ requests; `q/s` means questions per second, not requests per second.
 | GPU | package | test | Decidra | vLLM-SR | advantage |
 |---|---|---|---:|---:|---|
 | RTX 4090 (450 W) | W4A8 g64 | 64q, c1 | **936 ms** | **3.89 s** | **4.2× lower latency** |
+| RTX 4090 (600 W) | W4A8 vision | 80×60 PNG image, c1 | **104 ms cold / 35 ms cached** | — | — |
 | H100 SXM 80 GB | BF16 | 64q, c1 | **824 ms** | **2.43 s** | **2.9× lower latency** |
 | H100 SXM 80 GB | BF16 | 64q, c8 | **5.10 s / 100 q/s** | **13.66 s / 23 q/s** | **2.7× lower latency, 4.3× q/s** |
 | RTX PRO 6000, 600 W | BF16 | 64q, c1 | **775 ms** | **3.23 s** | **4.2× lower latency** |
@@ -225,7 +229,8 @@ The 4090 vLLM-SR comparison is c1 only; a c8 baseline was not measured, so no
 4090 throughput speedup is claimed. On the same 4090 the two paths chose the
 same top answer and differed by at most **0.005 probability** on the repeated
 question. vLLM-SR loads the W4A8 artifact as dequantized W4A16; Decidra serves
-it as W4A8 g64 with per-64-group INT8 activation scales.
+it as W4A8 language weights with per-64-group INT8 activation scales; the
+vision tower stays BF16.
 
 ### Decidra-only scaling
 

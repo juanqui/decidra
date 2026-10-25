@@ -7,7 +7,7 @@ package is mounted read-only; weights are never baked into the image.
 
 - NVIDIA RTX 4090 / L40S (SM89), H100 / H200 (SM90), or RTX PRO 6000
   Blackwell (SM120), CUDA 13.x driver.
-- 24 GB VRAM for the W4A8 g64 v4 package on a 4090. The current host caps
+- 24 GB VRAM for the W4A8 vision package on a 4090. The current host caps
   both GPUs at **450 W**; the SM89 numbers in the benchmark report reflect
   that. A 16-entry / 5 GiB pinned GPU state cache, an 8 GiB host L2, and a
   2 GiB scratch reserve keep 24K states from exhausting the card.
@@ -161,4 +161,5 @@ The runtime image also carries `LICENSE`, `LICENSE-MIT`, `LICENSE-APACHE`, and
 `NOTICE` under `/usr/share/licenses/decidra/`.
 The server refuses to start unless the package is `prefix_bidir`, the F32
 readout exists, and the state-once self-test agrees with the per-row block
-path. Images and videos are rejected by the text path with HTTP 400.
+path. Image requests require a checkpoint with the BF16 `visual.*` tower;
+text-only checkpoints and videos return HTTP 400.

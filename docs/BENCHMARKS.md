@@ -1,7 +1,7 @@
 # Decidra 0.2 benchmarks
 
-All numbers are end-to-end `POST /v1/systemone` on the same 15.5 GB / 49 GB
-d3-turbo package families, weights preloaded, one state per request unless
+All numbers are end-to-end `POST /v1/systemone` on the same 16.4 GB vision /
+49 GB d3-turbo package families, weights preloaded, one state per request unless
 noted. The native server is Decidra (in-process CUDA, state-once); the baseline
 is vLLM-SR `vllm-srun` 0.2.0 engine mode with `--max-num-seqs 64
 --max-num-batched-tokens 32768 --enable-shared-context`.
@@ -10,7 +10,7 @@ is vLLM-SR `vllm-srun` 0.2.0 engine mode with `--max-num-seqs 64
 
 | device | VRAM | arch | package | attention |
 |---|---:|---|---|---|
-| RTX 4090 | 24 GB | SM89 | W4A8 g64 v4, 15 GB, 450 W | FA2 |
+| RTX 4090 | 24 GB | SM89 | W4A8 vision, 16.4 GB, 450 W | FA2 |
 | H100 80GB HBM3 | 81.6 GB | SM90 | BF16, 49 GB | FA2 |
 | H200 | 143.8 GB | SM90 | BF16, 49 GB | FA2 |
 
@@ -185,6 +185,21 @@ Long state (native, c1): 64q at 8K **1.27 s**, at 24K **2.62 s**. State-once
 self-test Δp 0.00119. Preload 39 s.
 Distinct-state cold c8 at 64q: **4.57 s, 64 q/s** (state cache cannot share).
 
+## Image path on RTX 4090 (600 W)
+
+Single 80×60 PNG, one choice question, W4A8 language weights plus the BF16
+27-block vision tower:
+
+| path | latency |
+|---|---:|
+| cold image state (decode + resize + vision tower + state capture) | **104 ms** |
+| cached image state (same image and state tokens) | **35 ms** |
+| text 64q c1, clean server | **929 ms / 69 q/s** |
+| text 64q c8, clean server | **4.16 s / 69 q/s** |
+
+Image answers match the BF16 Python reference **13/13** on the image eval
+corpus; text remains **31/32** on the 32-row gate.
+
 ## Correctness gates
 
 | check | result |
@@ -218,7 +233,7 @@ for short question blocks and adds ~4%; it is the best measured single-request
 path. The remaining gap is dominated by the GDN scan's arithmetic intensity and
 the per-row cascade attention launches. The next work is a batched ragged
 cascade and a fused/tensor-core GDN scan, plus an SM90 W4A8 WGMMA kernel if the
-15 GB artifact must be used on H100/H200.
+16.4 GB vision artifact must be used on H100/H200.
 
 
 ## NVFP4 experimental (RTX PRO 6000, 600 W)
