@@ -196,3 +196,17 @@ Free VRAM after preload: 28.05 GiB; 24K warm cache leaves ~20 GiB.
 Remaining plan rounds (cross-state batching, CUDA graphs, cold GDN VC32,
 FP8/MLP representation, pinned restore) are not complete; the research plan
 remains the source for the next iterations.
+
+## Execution status at handoff
+
+- Rounds completed: 0 baseline, 1 48 GB policy, 2 Marlin epilogue/resource,
+  3 W4A16 precision, 4 profile, 5 split shared-state attention (accepted for
+  long contexts). Six experimental rounds, at least five requested.
+- L40S production candidate: R1 environment plus `DECIDRA_ATTN_SPLIT=1` for
+  states >= total question rows (8K/24K). 2K uses the proven cascade path.
+- L40S instance destroyed after copying raw results. The private HF artifact
+  repository `juanquivilla/d3-turbo-w4a8-vision-v2-l40s` remains available for
+  future L40S deployment; local production is untouched.
+- Remaining plan rounds (cross-state batching, CUDA Graphs, VC32 cold GDN,
+  FP8/MLP representation, pinned restore, feature cache) are the next
+  iterations, documented in the plan.
