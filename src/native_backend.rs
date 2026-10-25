@@ -137,7 +137,7 @@ impl NativeBackend {
             queue,
             d3,
             supports_vision,
-            image_slots: Arc::new(tokio::sync::Semaphore::new(4)),
+            image_slots: Arc::new(tokio::sync::Semaphore::new(config.image_decode_concurrency)),
         })
     }
 }
@@ -428,14 +428,27 @@ impl NativeBackend {
                 "this checkpoint has no vision tower; image inputs are unavailable".to_owned(),
             ));
         }
-        let _image_slot = if raw_images.is_empty() {
+        let image_slot = if raw_images.is_empty() {
             None
         } else {
-            Some(self.image_slots.clone().try_acquire_owned().map_err(|_| {
-                EngineError::Overloaded("image decoding is busy; retry shortly".to_owned())
-            })?)
+            Some(
+                tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    self.image_slots.clone().acquire_owned(),
+                )
+                .await
+                .map_err(|_| {
+                    EngineError::Overloaded(
+                        "image decoder queue is saturated; retry shortly".to_owned(),
+                    )
+                })?
+                .map_err(|_| EngineError::Internal("image decoder stopped".to_owned()))?,
+            )
         };
         let prepared = tokio::task::spawn_blocking(move || {
+            // The permit lives in the blocking task: client cancellation must
+            // not release a decoder slot while the decode is still running.
+            let _image_slot = image_slot;
             if raw_images.len() > MAX_IMAGES {
                 return Err(EngineError::Config(format!(
                     "at most {MAX_IMAGES} images per request"

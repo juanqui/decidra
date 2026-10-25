@@ -557,7 +557,9 @@ fn run_group(
         if has_room {
             cache.push(entry);
             if from_host {
-                host_cache.retain(|cached| cached.state != state);
+                host_cache.retain(|cached| {
+                    !same_state_identity(state, &digest, &cached.state, &cached.digest)
+                });
             }
         } else if !from_host && host_state_cache_bytes > 0 {
             host_insert(

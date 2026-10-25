@@ -9,8 +9,9 @@ use std::{sync::Arc, time::SystemTime};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -29,6 +30,7 @@ pub struct AppState {
     pub config: Arc<Config>,
     pub backend: Arc<dyn Backend>,
     pub metrics: Option<PrometheusHandle>,
+    request_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl AppState {
@@ -37,6 +39,7 @@ impl AppState {
             config: Arc::new(config),
             backend,
             metrics: None,
+            request_slots: Arc::new(tokio::sync::Semaphore::new(128)),
         }
     }
 
@@ -54,6 +57,7 @@ impl AppState {
             .route("/v1/systemone", post(systemone))
             .route("/metrics", get(metrics_endpoint))
             .layer(DefaultBodyLimit::max(body_limit))
+            .layer(middleware::from_fn_with_state(state.clone(), admit_request))
             .with_state(state)
     }
 }
@@ -85,8 +89,26 @@ async fn metrics_endpoint(State(state): State<AppState>) -> Response {
     }
 }
 
+/// Bound in-flight requests before the body extractor allocates up to the
+/// 64 MiB body limit. Image waiters retain their parsed bodies, so this is the
+/// outer memory-admission gate; the 64 decoder slots queue behind it.
+async fn admit_request(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    let permit = match state.request_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "server is busy; retry shortly",
+            );
+        }
+    };
+    let response = next.run(request).await;
+    drop(permit);
+    response
+}
+
 async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
-    let body: Value = match serde_json::from_slice(&body) {
+    let parsed: Value = match serde_json::from_slice(&body) {
         Ok(value) => value,
         Err(_) => {
             return error(
@@ -95,6 +117,8 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
             );
         }
     };
+    drop(body);
+    let body = parsed;
     let Some(object) = body.as_object() else {
         return error(StatusCode::BAD_REQUEST, "send a JSON object");
     };
@@ -223,12 +247,18 @@ fn extract_state_images(state: &mut Value, images: &mut Vec<String>) -> Result<(
     let has_image = parts
         .iter()
         .any(|part| part.get("type").and_then(Value::as_str) == Some("image_url"));
-    let has_video = parts
-        .iter()
-        .any(|part| part.get("type").and_then(Value::as_str) == Some("video_url"));
+    let unsupported_media =
+        parts
+            .iter()
+            .find_map(|part| match part.get("type").and_then(Value::as_str) {
+                Some(kind @ ("video_url" | "input_audio" | "file")) => Some(kind),
+                _ => None,
+            });
     if !has_image {
-        if has_video {
-            return Err("video content in state is not supported by this engine".to_owned());
+        if let Some(kind) = unsupported_media {
+            return Err(format!(
+                "{kind} content in state is not supported by this engine"
+            ));
         }
         return Ok(());
     }
@@ -326,9 +356,13 @@ mod tests {
         let mut images = Vec::new();
         let mut missing = json!([{"type": "image_url"}]);
         assert!(extract_state_images(&mut missing, &mut images).is_err());
-        let mut unsupported = json!([
-            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}
-        ]);
-        assert!(extract_state_images(&mut unsupported, &mut images).is_err());
+        for unsupported in [
+            json!([{"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}]),
+            json!([{"type": "input_audio", "input_audio": {}}]),
+            json!([{"type": "file", "file": {}}]),
+        ] {
+            let mut unsupported = unsupported;
+            assert!(extract_state_images(&mut unsupported, &mut images).is_err());
+        }
     }
 }

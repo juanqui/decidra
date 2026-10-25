@@ -47,7 +47,7 @@ services:
       DECIDRA_BATCH_WINDOW_US: ${DECIDRA_BATCH_WINDOW_US:-2000}
       DECIDRA_STATE_ONCE_MAX_ROWS: ${DECIDRA_STATE_ONCE_MAX_ROWS:-64}
     volumes:
-      - ${DECIDRA_MODEL_DIR:-/srv/models/d3-turbo-w4a8-g64-v4}:/models:ro
+      - ${DECIDRA_MODEL_DIR:-/srv/models/d3-turbo-w4a8-vision-v2}:/models:ro
     deploy:
       resources:
         reservations:

@@ -78,14 +78,120 @@ fn split_data_url(value: &str) -> Result<(String, &str)> {
     Ok((rest.to_owned(), payload))
 }
 
+fn le24(bytes: &[u8]) -> usize {
+    bytes[0] as usize | (bytes[1] as usize) << 8 | (bytes[2] as usize) << 16
+}
+
+fn check_webp_frame(width: usize, height: usize) -> Result<()> {
+    if width == 0 || height == 0 {
+        bail!("the WebP frame has no pixels");
+    }
+    check_source_dimensions(width as u32, height as u32)
+}
+
+/// The `image` crate's WebP backend does not enforce the strict dimension
+/// limits on embedded VP8/VP8L frames: a 1x1 VP8X canvas can contain a
+/// 16k x 16k frame that is allocated before the canvas check. Walk the RIFF
+/// container and validate every canvas/frame pair before decoding.
+fn validate_webp_container(bytes: &[u8]) -> Result<()> {
+    if bytes.len() < 12 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WEBP" {
+        return Ok(());
+    }
+    let mut pos = 12usize;
+    while pos + 8 <= bytes.len() {
+        let fourcc = &bytes[pos..pos + 4];
+        let size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let start = pos + 8;
+        let end = start
+            .checked_add(size)
+            .filter(|end| *end <= bytes.len())
+            .context("the WebP container has a truncated chunk")?;
+        let data = &bytes[start..end];
+        match fourcc {
+            b"VP8X" if data.len() >= 10 => {
+                check_webp_frame(le24(&data[4..7]) + 1, le24(&data[7..10]) + 1)?;
+            }
+            b"VP8 " if data.len() >= 10 && &data[3..6] == b"\x9d\x01\x2a" => {
+                let width = (u16::from_le_bytes([data[6], data[7]]) & 0x3fff) as usize;
+                let height = (u16::from_le_bytes([data[8], data[9]]) & 0x3fff) as usize;
+                check_webp_frame(width, height)?;
+            }
+            b"VP8L" if data.len() >= 5 && data[0] == 0x2f => {
+                let bits = u32::from_le_bytes([data[1], data[2], data[3], data[4]]);
+                check_webp_frame(
+                    (bits & 0x3fff) as usize + 1,
+                    ((bits >> 14) & 0x3fff) as usize + 1,
+                )?;
+            }
+            b"ANMF" if data.len() >= 16 => {
+                check_webp_frame(le24(&data[6..9]) + 1, le24(&data[9..12]) + 1)?;
+                let mut nested = 16usize;
+                while nested + 8 <= data.len() {
+                    let kind = &data[nested..nested + 4];
+                    let length = u32::from_le_bytes([
+                        data[nested + 4],
+                        data[nested + 5],
+                        data[nested + 6],
+                        data[nested + 7],
+                    ]) as usize;
+                    let start = nested + 8;
+                    let end = start
+                        .checked_add(length)
+                        .filter(|end| *end <= data.len())
+                        .context("the WebP animation has a truncated frame")?;
+                    let frame = &data[start..end];
+                    match kind {
+                        b"VP8 " if frame.len() >= 10 && &frame[3..6] == b"\x9d\x01\x2a" => {
+                            let width =
+                                (u16::from_le_bytes([frame[6], frame[7]]) & 0x3fff) as usize;
+                            let height =
+                                (u16::from_le_bytes([frame[8], frame[9]]) & 0x3fff) as usize;
+                            check_webp_frame(width, height)?;
+                        }
+                        b"VP8L" if frame.len() >= 5 && frame[0] == 0x2f => {
+                            let bits = u32::from_le_bytes([frame[1], frame[2], frame[3], frame[4]]);
+                            check_webp_frame(
+                                (bits & 0x3fff) as usize + 1,
+                                ((bits >> 14) & 0x3fff) as usize + 1,
+                            )?;
+                        }
+                        _ => {}
+                    }
+                    nested = end + (length & 1);
+                }
+            }
+            _ => {}
+        }
+        pos = end + (size & 1);
+    }
+    Ok(())
+}
+
 pub fn decode_bytes(bytes: &[u8]) -> Result<ImageMedia> {
+    validate_webp_container(bytes)?;
+    // Read only the header first. The pixel-product and aspect checks must run
+    // before `decode()` allocates the frame; per-axis decoder limits alone
+    // allow e.g. an 8000x8000 image through.
+    let probe = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("the image could not be identified")?;
+    let (width, height) = probe
+        .into_dimensions()
+        .context("the image could not be decoded")?;
+    check_source_dimensions(width, height)?;
+
     let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
         .context("the image could not be identified")?;
     let mut limits = image::Limits::default();
     limits.max_image_width = Some(MAX_SOURCE_PIXELS as u32);
     limits.max_image_height = Some(MAX_SOURCE_PIXELS as u32);
-    limits.max_alloc = Some(256 * 1024 * 1024);
+    limits.max_alloc = Some(MAX_SOURCE_PIXELS * 8);
     reader.limits(limits);
     let image = reader.decode().context("the image could not be decoded")?;
     from_dynamic(image)
@@ -216,6 +322,41 @@ mod tests {
             image.write_to(&mut out, image::ImageFormat::Png).unwrap();
         }
         out.into_inner()
+    }
+
+    fn webp_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + data.len() + 1);
+        out.extend_from_slice(kind);
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(data);
+        if data.len() % 2 == 1 {
+            out.push(0);
+        }
+        out
+    }
+
+    #[test]
+    fn webp_embedded_frame_limits_are_checked_before_decode() {
+        // VP8X declares a 1x1 canvas; the embedded VP8 frame declares
+        // 16383x16383. The image crate would allocate that frame.
+        let mut vp8x = vec![0u8; 10];
+        vp8x[4..7].copy_from_slice(&[0, 0, 0]);
+        vp8x[7..10].copy_from_slice(&[0, 0, 0]);
+        let mut vp8 = vec![0u8; 10];
+        vp8[3..6].copy_from_slice(&[0x9d, 0x01, 0x2a]);
+        vp8[6..8].copy_from_slice(&(16_383u16 & 0x3fff).to_le_bytes());
+        vp8[8..10].copy_from_slice(&(16_383u16 & 0x3fff).to_le_bytes());
+        let mut body = b"WEBP".to_vec();
+        body.extend(webp_chunk(b"VP8X", &vp8x));
+        body.extend(webp_chunk(b"VP8 ", &vp8));
+        let mut file = b"RIFF".to_vec();
+        file.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        file.extend(body);
+        let error = decode_bytes(&file).unwrap_err().to_string();
+        assert!(
+            error.contains("pixel source limit") || error.contains("pixels"),
+            "{error}"
+        );
     }
 
     #[test]

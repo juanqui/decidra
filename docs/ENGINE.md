@@ -92,8 +92,8 @@ Build with `--features native` and start with:
 
 ```
 CUDA_VISIBLE_DEVICES=0 DECIDRA_BIND_ADDR=127.0.0.1:8899 \
-DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-vision-v1 \
-DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-vision-v1 \
+DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-vision-v2 \
+DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-vision-v2 \
 DECIDRA_NATIVE_GPU_EMBED=0 ./target/release/decidra
 ```
 
@@ -115,8 +115,9 @@ runtime decodes strict PNG/JPEG/WebP data URLs, applies the Qwen2VL
 `smart_resize` resize and bicubic filter, runs the BF16 vision tower, scatters the
 projected features into the state embeddings, and captures the state with the
 image's mRoPE positions. Requests are capped at 16 images and 8,192 expanded
-vision tokens; image decode is dimension-checked before allocation and limited
-to four concurrent blocking decoders. The vision tower is never quantized: the final
+vision tokens; image decode is dimension-checked before allocation. Up to 64
+decode/tokenize tasks run concurrently and excess requests wait for a decode
+slot; the CUDA worker queue can still return 503 under sustained saturation. The vision tower is never quantized: the final
 artifact is W4A8 language weights plus BF16 `visual.*` tensors. Video remains
 unsupported. Per request: at most 64 questions; each question's state plus its
 own block is at most 32K tokens. The serving worker coalesces requests, keeps an
@@ -143,15 +144,16 @@ exported as `semel_state_cache_*`, `semel_host_cache_states`, and
 ## 4. Quantization
 
 The shipped recipe is **GPTQ-only, INT4 symmetric group 64, INT8 per-token
-activations with per-64-group scales**, 1,024 block-masked calibration rows.
-AWQ is not shipped: both AWQ+GPTQ test artifacts were far from BF16 (max Δp
-0.50), while GPTQ-only stayed within 0.04 on the same row. The vision artifact
-keeps the proven v4 language weights (31/32 on the 32-row gate) and merges the
-333 source `visual.*` tensors in BF16. A fresh GPTQ run with the 1k calibration
-file regressed to 29/32 and was rejected; image decisions still match the BF16
-Python reference 13/13 on the image eval corpus. The quantizer's `post()` step
-now injects `attention_mode=prefix_bidir`, merges the BF16 visual tensors, and
-copies the readout and runtime files.
+activations with per-64-group scales**, using the 256-row block-masked v4
+calibration set. AWQ is not shipped: both AWQ+GPTQ test artifacts were far from
+BF16 (max Δp 0.50). The final v2 vision artifact is a fresh sequential GPTQ run
+on those rows, with `max_seq_length=2048` and an 18 GiB GPU memory budget on a
+24 GB RTX 4090. It passes **32/32** on the 32-row text gate (mean MAE 0.0148,
+max Δp 0.0984), then merges all 333 source `visual.*` tensors in BF16. Image
+decisions match the BF16 Python reference **13/13**. A separate run using the
+1k calibration file regressed to 29/32 and was rejected. The quantizer's
+`post()` step injects `attention_mode=prefix_bidir`, merges the BF16 visual
+tensors, and copies the readout and runtime files.
 
 The previous W4A8 artifact was quantized from **randomly initialized weights**
 because `llmcompressor.oneshot(model=<path>)` loaded `AutoModelForCausalLM`
@@ -168,14 +170,15 @@ bit-exactly, and uses the real block mask for calibration:
 The GDN layers receive the 2-D padding mask. The mask path is
 `Qwen3_5TextModel.forward`'s `attention_mask` dict.
 
-Artifact: `/srv/models/d3-turbo-w4a8-vision-v1` (16.4 GB: W4A8 language
+Artifact: `/srv/models/d3-turbo-w4a8-vision-v2` (16.4 GB: W4A8 language
 weights, F32 readout, and the BF16 vision tower). Dequant gate: 496/496 modules pass cosine ≥ 0.95 against
-the BF16 source; the v4 32-row eval passes:
+the BF16 source; the shipped v2 32-row eval passes:
 
 | variant | top-1 | mean MAE | max Δp | flips |
 |---|---:|---:|---:|---|
+| **v2 fresh GPTQ, shipped SM89 defaults** | **32/32** | **0.0148** | **0.0984** | **0** |
 | W4A16 (dequant weights) | 31/32 | 0.0154 | 0.083 | 1 near-tie (BF16 margin 0.025) |
-| W4A8, shipped SM89 defaults (gate/up/down/o/q INT8 group, k/v W4A16) | 31/32 | 0.0158 | 0.0837 | 1 near-tie |
+| W4A8, v4 shipped SM89 defaults (gate/up/down/o/q INT8 group, k/v W4A16) | 31/32 | 0.0158 | 0.0837 | 1 near-tie |
 | W4A8, old gate-W4A16 config | 31/32 | 0.0156 | 0.0942 | 1 near-tie |
 | W4A8, all linears INT8 group | 31/32 | 0.0147 | 0.1047 near-tie / 0.0855 non-near | 1 near-tie |
 | W4A16, same artifact | 31/32 | 0.0151 | 0.0875 | 1 near-tie |
@@ -408,13 +411,13 @@ CUDA_VISIBLE_DEVICES=1 DECIDRA_NATIVE_CACHE=0 DECIDRA_GDN_CHUNKED=1 \
 # 2K state, 64 questions
 CUDA_VISIBLE_DEVICES=1 DECIDRA_MARLIN=1 DECIDRA_INT8=1 DECIDRA_INT8_GROUP=1 \
   DECIDRA_PRELOAD=1 DECIDRA_GDN_CHUNKED=1 DECIDRA_GDN_CHUNK_MIN=16 \
-  DECIDRA_D3_MODEL=/srv/models/d3-turbo-w4a8-vision-v1 \
+  DECIDRA_D3_MODEL=/srv/models/d3-turbo-w4a8-vision-v2 \
   DECIDRA_D3_PROBE="$ROOT/eval/data/d3_once_64_2k.json" \
   cargo test --release -p decidra-native --test d3_perf -- --ignored --nocapture
 
 # artifact dequant gate
 python3 quant/d3turbo/verify_quant.py \
-  --quant /srv/models/d3-turbo-w4a8-vision-v1 --group 64
+  --quant /srv/models/d3-turbo-w4a8-vision-v2 --group 64
 ```
 
 ## 7. Remaining work

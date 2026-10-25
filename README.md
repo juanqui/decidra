@@ -67,7 +67,7 @@ The published image targets SM89 (RTX 4090 / L40S):
 docker run --rm --gpus '"device=0"' \
   --user "$(id -u):$(id -g)" \
   -p 8080:8080 \
-  -v /srv/models/d3-turbo-w4a8-vision-v1:/models:ro \
+  -v /srv/models/d3-turbo-w4a8-vision-v2:/models:ro \
   ghcr.io/juanqui/decidra:0.2.0
 ```
 
@@ -86,7 +86,7 @@ docker build --build-arg CUDA_ARCH=sm_120 -t decidra:0.2.0-rtx-pro-6000 .
 Or use the provided compose file:
 
 ```bash
-DECIDRA_MODEL_DIR=/srv/models/d3-turbo-w4a8-vision-v1 \
+DECIDRA_MODEL_DIR=/srv/models/d3-turbo-w4a8-vision-v2 \
 DECIDRA_GPU=0 docker compose up -d --build
 ```
 
@@ -103,8 +103,8 @@ DECIDRA_CUDA_ARCH=sm_90 cargo build --release --locked --features native
 DECIDRA_CUDA_ARCH=sm_120 cargo build --release --locked --features native
 
 CUDA_VISIBLE_DEVICES=0 \
-DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-vision-v1 \
-DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-vision-v1 \
+DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-vision-v2 \
+DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-vision-v2 \
 ./target/release/decidra
 ```
 
@@ -205,7 +205,9 @@ Both forms can be combined; top-level images precede state content images.
 
 Accepted formats are PNG, JPEG and WebP data URLs, up to 8 MB encoded, 16 MP
 source pixels, aspect ratio 200, 16 images, and 8,192 expanded vision tokens
-per request. The runtime converts to RGB (alpha is
+per request. Up to 64 image decode/tokenize tasks run concurrently; excess
+requests wait for a decode slot. The single CUDA worker queue can still return
+HTTP 503 under sustained saturation. The runtime converts to RGB (alpha is
 dropped, EXIF orientation is not applied), applies the Qwen2VL `smart_resize`
 and bicubic resize, and uses the model's mRoPE image positions. Image states
 are cached by the decoded image identity plus state tokens, so the same text
@@ -233,7 +235,7 @@ requests; `q/s` means questions per second, not requests per second.
 | GPU | package | test | Decidra | vLLM-SR | advantage |
 |---|---|---|---:|---:|---|
 | RTX 4090 (450 W) | W4A8 g64 | 64q, c1 | **936 ms** | **3.89 s** | **4.2× lower latency** |
-| RTX 4090 (600 W) | W4A8 vision | 80×60 PNG image, c1 | **104 ms cold / 35 ms cached** | — | — |
+| RTX 4090 (600 W) | W4A8 vision | 80×60 PNG image, c1 | **88 ms cold / 34 ms cached** | — | — |
 | H100 SXM 80 GB | BF16 | 64q, c1 | **824 ms** | **2.43 s** | **2.9× lower latency** |
 | H100 SXM 80 GB | BF16 | 64q, c8 | **5.10 s / 100 q/s** | **13.66 s / 23 q/s** | **2.7× lower latency, 4.3× q/s** |
 | RTX PRO 6000, 600 W | BF16 | 64q, c1 | **775 ms** | **3.23 s** | **4.2× lower latency** |
@@ -290,7 +292,8 @@ The image and compose file carry production defaults. The most important knobs:
 | variable | default | meaning |
 |---|---|---|
 | `DECIDRA_BIND_ADDR` | `0.0.0.0:8080` | HTTP bind |
-| `DECIDRA_CHECKPOINT` | `/srv/models/d3-turbo-w4a8-vision-v1` | model package |
+| `DECIDRA_CHECKPOINT` | `/srv/models/d3-turbo-w4a8-vision-v2` | model package |
+| `DECIDRA_IMAGE_DECODE_CONCURRENCY` | `64` | image decode slots; excess waits |
 | `DECIDRA_NATIVE_MODEL` | `$DECIDRA_CHECKPOINT` | engine package |
 | `DECIDRA_NATIVE_MARLIN` | `true` | Marlin W4A8 |
 | `DECIDRA_NATIVE_INT8_EXCLUDE` | `self_attn.v_proj,self_attn.k_proj` | modules kept on W4A16 |

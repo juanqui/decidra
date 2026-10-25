@@ -11,12 +11,15 @@ use anyhow::{Context, Result, bail};
 
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 pub const DEFAULT_MODEL: &str = "vllm-sr/d3-turbo";
-pub const DEFAULT_CHECKPOINT: &str = "/srv/models/d3-turbo-w4a8-vision-v1";
+pub const DEFAULT_CHECKPOINT: &str = "/srv/models/d3-turbo-w4a8-vision-v2";
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
-pub const DEFAULT_MAX_QUEUE: usize = 32;
+pub const DEFAULT_MAX_QUEUE: usize = 64;
 pub const DEFAULT_BATCH_REQUESTS: usize = 32;
 pub const DEFAULT_BATCH_ROWS: usize = 32;
 pub const DEFAULT_BATCH_WINDOW_US: u64 = 2_000;
+/// Concurrent image decode/tokenize tasks. Requests wait for a slot instead
+/// of failing, so a burst of controller requests is backpressured, not 503'd.
+pub const DEFAULT_IMAGE_DECODE_CONCURRENCY: usize = 64;
 pub const DEFAULT_STATE_CACHE_ENTRIES: usize = 16;
 /// SM89 keeps large states from exhausting 24 GiB; one oversized state is
 /// still admitted after evicting the rest.
@@ -26,13 +29,13 @@ pub const DEFAULT_HOST_STATE_CACHE_BYTES: usize = 8 * 1024 * 1024 * 1024;
 pub const MAX_STATE_TOKENS: usize = 32_768;
 pub const MAX_QUESTIONS: usize = 64;
 
-/// Production W4A8 configuration for the v4 d3-turbo artifact. The exclusions
+/// Production W4A8 configuration for the v2 d3-turbo artifact. The exclusions
 /// are the measured gate configuration: `o/v/k` and `gate_proj` stay on the
 /// W4A16 epilogue, the rest use INT8 per-token/per-64-group activations.
 pub const DEFAULT_INT8_EXCLUDE: &str = "self_attn.v_proj,self_attn.k_proj";
 /// Empty: every INT8 linear uses per-64-group activation scales. Together with
 /// the SM89 default exclusions this keeps gate/up/down/o/q on W4A8, keeps k/v
-/// on W4A16, and passes the 32-row gate (31/32 top-1, max Δp 0.0837).
+/// on W4A16, and passes the 32-row gate (32/32 top-1, max Δp 0.0984).
 pub const DEFAULT_INT8_GROUP_EXCLUDE: &str = "";
 
 #[derive(Debug, Clone)]
@@ -64,6 +67,8 @@ pub struct Config {
     pub max_body_bytes: usize,
     /// Requests waiting behind the single CUDA worker before 503.
     pub max_queue: usize,
+    /// Concurrent blocking image decode/tokenize tasks.
+    pub image_decode_concurrency: usize,
     /// Maximum requests coalesced into one worker pass.
     pub batch_requests: usize,
     /// Soft question-row budget for one worker pass; the first job's question
@@ -127,6 +132,11 @@ impl Config {
         if max_queue == 0 {
             bail!("DECIDRA_MAX_QUEUE must be at least 1");
         }
+        let image_decode_concurrency = env_usize("DECIDRA_IMAGE_DECODE_CONCURRENCY")?
+            .unwrap_or(DEFAULT_IMAGE_DECODE_CONCURRENCY);
+        if image_decode_concurrency == 0 {
+            bail!("DECIDRA_IMAGE_DECODE_CONCURRENCY must be at least 1");
+        }
         let batch_requests = env_usize("DECIDRA_BATCH_REQUESTS")?.unwrap_or(DEFAULT_BATCH_REQUESTS);
         if batch_requests == 0 {
             bail!("DECIDRA_BATCH_REQUESTS must be at least 1");
@@ -168,6 +178,7 @@ impl Config {
             metrics_enabled,
             max_body_bytes,
             max_queue,
+            image_decode_concurrency,
             batch_requests,
             batch_rows,
             batch_window_us,

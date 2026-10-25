@@ -55,8 +55,8 @@ source outside the default image.
 ```bash
 # RTX 4090 / L40S (SM89 W4A8)
 CUDA_VISIBLE_DEVICES=0 \
-DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-vision-v1 \
-DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-vision-v1 \
+DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-vision-v2 \
+DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-vision-v2 \
 DECIDRA_NATIVE_GPU_EMBED=false \
 DECIDRA_STATE_CACHE_ENTRIES=16 \
 DECIDRA_STATE_CACHE_BYTES=5368709120 \
@@ -113,7 +113,7 @@ docker build --build-arg CUDA_ARCH=sm_90 -t decidra:0.2.0-h100 .
 
 docker run --rm --gpus '"device=0"' --user "$(id -u):$(id -g)" \
   -p 8899:8080 \
-  -v /srv/models/d3-turbo-w4a8-vision-v1:/models:ro \
+  -v /srv/models/d3-turbo-w4a8-vision-v2:/models:ro \
   decidra:0.2.0
 ```
 
@@ -127,7 +127,7 @@ copies the real cuBLAS/cuBLASLt files.
 |---|---|---|
 | `DECIDRA_BIND_ADDR` | `0.0.0.0:8080` | HTTP bind |
 | `DECIDRA_MODEL` | `vllm-sr/d3-turbo` | client-facing model id |
-| `DECIDRA_CHECKPOINT` | `/srv/models/d3-turbo-w4a8-vision-v1` | package |
+| `DECIDRA_CHECKPOINT` | `/srv/models/d3-turbo-w4a8-vision-v2` | package |
 | `DECIDRA_NATIVE_MODEL` | `$DECIDRA_CHECKPOINT` | engine package |
 | `DECIDRA_TOKENIZER` | `<checkpoint>/tokenizer.json` | tokenizer |
 | `DECIDRA_NATIVE_CACHE` | `true` | resident packed weights |
@@ -139,7 +139,8 @@ copies the real cuBLAS/cuBLASLt files.
 | `DECIDRA_NATIVE_GDN_CHUNKED` | `true` | chunked GDN prefill |
 | `DECIDRA_NATIVE_GDN_CHUNKED_MIN_SEQ` | `16` | chunked threshold |
 | `DECIDRA_NATIVE_GPU_EMBED` | `false` | GPU embedding table (2.4 GiB) |
-| `DECIDRA_MAX_QUEUE` | `32` | queued requests before 503 |
+| `DECIDRA_MAX_QUEUE` | `64` | queued requests before 503 |
+| `DECIDRA_IMAGE_DECODE_CONCURRENCY` | `64` | concurrent image decode/tokenize tasks; excess waits |
 | `DECIDRA_BATCH_REQUESTS` | `32` | max requests per pass |
 | `DECIDRA_BATCH_ROWS` | `32` | soft question-row budget per pass |
 | `DECIDRA_BATCH_WINDOW_US` | `2000` | coalescing window |

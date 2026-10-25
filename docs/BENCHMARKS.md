@@ -192,19 +192,21 @@ Single 80×60 PNG, one choice question, W4A8 language weights plus the BF16
 
 | path | latency |
 |---|---:|
-| cold image state (decode + resize + vision tower + state capture) | **104 ms** |
-| cached image state (same image and state tokens) | **35 ms** |
+| cold image state (decode + resize + vision tower + state capture) | **88 ms** |
+| cached image state (same image and state tokens) | **34 ms** |
 | text 64q c1, clean server | **929 ms / 69 q/s** |
 | text 64q c8, clean server | **4.16 s / 69 q/s** |
+| 64 concurrent distinct image states, one choice question each | **64/64 HTTP 200, 9.1 s** |
 
 Image answers match the BF16 Python reference **13/13** on the image eval
-corpus; text remains **31/32** on the 32-row gate.
+corpus; the fresh v2 text artifact passes **32/32** on the 32-row gate.
 
 ## Correctness gates
 
 | check | result |
 |---|---|
-| 32-row HF parity, shipped SM89 defaults | 31/32 top-1, MAE 0.0158, max Δp 0.0837, pass |
+| 32-row HF parity, shipped v2 SM89 defaults | 32/32 top-1, MAE 0.0148, max Δp 0.0984, pass |
+| 32-row HF parity, v4 SM89 defaults | 31/32 top-1, MAE 0.0158, max Δp 0.0837, pass |
 | 32-row HF parity, old gate-W4A16 config | 31/32 top-1, MAE 0.0156, max Δp 0.0942, pass |
 | 32-row HF parity, W4A8 v4 register GDN | 31/32 top-1, MAE 0.0150, max Δp 0.0854, pass |
 | state-once vs per-row block | max Δp 0.00645 |

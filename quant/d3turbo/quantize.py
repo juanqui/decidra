@@ -5,9 +5,10 @@ The shipped recipe is GPTQ-only. AWQ is available for experiments but is not
 used for the published artifact: both AWQ+GPTQ test artifacts were far from
 BF16, while GPTQ-only stayed within 0.04 on the same row.
 
-    python3 quant/d3turbo/quantize.py --no-awq --group 64 --samples 1024 \\
+    python3 quant/d3turbo/quantize.py --no-awq --group 64 --samples 256 \\
+        --max-seq 2048 --pipeline sequential --max-memory 18GiB \\
         --calib /srv/models/d3-calibration-block-v1.jsonl \\
-        --out /srv/models/d3-turbo-w4a8-g64-v4
+        --out /srv/models/d3-turbo-w4a8-vision-v2
 
 The previous artifact was quantized from a randomly initialized model because
 `oneshot(model=<path>)` loads `AutoModelForCausalLM`; this checkpoint is a
@@ -39,7 +40,7 @@ from llmcompressor.modifiers.quantization import GPTQModifier
 from llmcompressor.modifiers.transform.awq import AWQMapping, AWQModifier
 
 MODEL = Path("/srv/models/d3-turbo")
-OUT = Path("/srv/models/d3-turbo-w4a8-g64")
+OUT = Path("/srv/models/d3-turbo-w4a8-vision-v2")
 CALIB = Path("/srv/models/d3-calibration-block-v1.jsonl")
 IGNORE = [
     "lm_head",

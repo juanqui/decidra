@@ -10,7 +10,7 @@ use decidra_native::Engine;
 #[ignore = "requires a d3-turbo checkpoint on a GPU"]
 fn d3_state_once_perf() {
     let model = std::env::var("DECIDRA_D3_MODEL")
-        .unwrap_or_else(|_| "/srv/models/d3-turbo-w4a8-vision-v1".to_string());
+        .unwrap_or_else(|_| "/srv/models/d3-turbo-w4a8-vision-v2".to_string());
     let probe =
         std::env::var("DECIDRA_D3_PROBE").unwrap_or_else(|_| "/tmp/d3_once_batch.json".to_string());
     let repeat: usize = std::env::var("DECIDRA_D3_REPEAT")
