@@ -457,6 +457,31 @@ extern "C" __global__ void rmsnorm_gated_bf16(const bf16* __restrict__ x,
 // ---------------------------------------------------------------------------
 // Elementwise, bf16-rounded like the torch ops they replace.
 // ---------------------------------------------------------------------------
+// Merge two normalized attention outputs using base-2 LSE statistics.
+extern "C" __global__ void merge_attn_lse_bf16(
+    const bf16* __restrict__ a, const float* __restrict__ lse_a,
+    const bf16* __restrict__ b, const float* __restrict__ lse_b,
+    bf16* __restrict__ out, int rows, int heads, int head_dim) {
+  long n = (long)rows * heads * head_dim;
+  for (long i = blockIdx.x * blockDim.x + threadIdx.x; i < n;
+       i += (long)gridDim.x * blockDim.x) {
+    int d = i % head_dim;
+    long ph = i / head_dim;
+    int h = ph % heads;
+    int row = ph / heads;
+    float sa = lse_a[(long)row * heads + h];
+    float sb = lse_b[(long)row * heads + h];
+    float m = fmaxf(sa, sb);
+    float wa = exp2f(fmaxf(sa - m, -INFINITY));
+    float wb = exp2f(fmaxf(sb - m, -INFINITY));
+    float den = wa + wb;
+    float xa = bf2f(a[i]);
+    float xb = bf2f(b[i]);
+    float v = den > 0.f ? (wa * xa + wb * xb) / den : 0.f;
+    out[i] = f2bf(v);
+  }
+}
+
 extern "C" __global__ void add_bf16(const bf16* __restrict__ a,
                                     const bf16* __restrict__ b,
                                     bf16* __restrict__ out, int n) {

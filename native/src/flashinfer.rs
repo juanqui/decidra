@@ -40,6 +40,19 @@ type CustomFn = unsafe extern "C" fn(
 ) -> c_int;
 
 /// `(q, k, v, out, qo_len, kv_len, stream)`.
+/// `(q, k, v, out, lse, qo_len, kv_len, stream)`.
+type ExtLseFn = unsafe extern "C" fn(
+    *const c_void,
+    *const c_void,
+    *const c_void,
+    *mut c_void,
+    *mut f32,
+    c_int,
+    c_int,
+    *mut c_void,
+) -> c_int;
+
+/// `(q, k, v, out, qo_len, kv_len, stream)`.
 type ExtFn = unsafe extern "C" fn(
     *const c_void,
     *const c_void,
@@ -136,6 +149,7 @@ pub struct FlashInfer {
     func_noncausal: PrefillFn,
     func_custom: Option<CustomFn>,
     func_ext: Option<ExtFn>,
+    func_ext_lse: Option<ExtLseFn>,
     func_ext_fa3: Option<ExtFn>,
     handle_fa3: *mut c_void,
     func_fa3: Option<PrefillFn>,
@@ -178,6 +192,15 @@ impl FlashInfer {
                 Some(std::mem::transmute::<*mut c_void, ExtFn>(ptr))
             }
         };
+        let ext_lse = unsafe {
+            let sym = CString::new("fi_prefill_bf16_ext_lse").ok()?;
+            let ptr = dlsym(handle, sym.as_ptr());
+            if ptr.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut c_void, ExtLseFn>(ptr))
+            }
+        };
         let fa3 = unsafe {
             open_lib(
                 EMBEDDED_FA3,
@@ -208,11 +231,16 @@ impl FlashInfer {
             func_noncausal,
             func_custom: custom,
             func_ext: ext,
+            func_ext_lse: ext_lse,
             func_ext_fa3,
             handle_fa3,
             func_fa3,
             func_noncausal_fa3,
         }))
+    }
+
+    pub fn has_ext_lse(&self) -> bool {
+        self.func_ext_lse.is_some()
     }
 
     pub fn has_fa3(&self) -> bool {
@@ -520,6 +548,60 @@ impl FlashInfer {
         };
         if rc != 0 {
             bail!("FlashInfer extended prefill failed with cudaError {rc}");
+        }
+        Ok(())
+    }
+
+    /// Non-causal extended prefill returning log-sum-exp (base 2) per query.
+    pub fn prefill_ext_lse<Q, K, V, O, L>(
+        &self,
+        gpu: &crate::cuda::Gpu,
+        q: &Q,
+        k: &K,
+        v: &V,
+        out: &mut O,
+        lse: &mut L,
+        qo_len: usize,
+        kv_len: usize,
+    ) -> Result<()>
+    where
+        Q: DevicePtr<bf16>,
+        K: DevicePtr<bf16>,
+        V: DevicePtr<bf16>,
+        O: DevicePtrMut<bf16>,
+        L: DevicePtrMut<f32>,
+    {
+        let Some(func) = self.func_ext_lse else {
+            bail!("FlashInfer extended prefill LSE is not available");
+        };
+        if q.len() < qo_len * 24 * 256
+            || k.len() < kv_len * 4 * 256
+            || v.len() < kv_len * 4 * 256
+            || out.len() < qo_len * 24 * 256
+            || lse.len() < qo_len * 24
+        {
+            bail!("extended LSE buffers too small for qo {qo_len} kv {kv_len}");
+        }
+        let (qp, _g0) = q.device_ptr(&gpu.stream);
+        let (kp, _g1) = k.device_ptr(&gpu.stream);
+        let (vp, _g2) = v.device_ptr(&gpu.stream);
+        let (op, _g3) = out.device_ptr_mut(&gpu.stream);
+        let (lp, _g4) = lse.device_ptr_mut(&gpu.stream);
+        let stream = gpu.stream.cu_stream() as *mut c_void;
+        let rc = unsafe {
+            func(
+                qp as *const c_void,
+                kp as *const c_void,
+                vp as *const c_void,
+                op as *mut c_void,
+                lp as *mut f32,
+                qo_len as c_int,
+                kv_len as c_int,
+                stream,
+            )
+        };
+        if rc != 0 {
+            bail!("FlashInfer extended LSE prefill failed with cudaError {rc}");
         }
         Ok(())
     }

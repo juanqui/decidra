@@ -1897,6 +1897,91 @@ impl Engine {
                 .get(layer)
                 .and_then(|entry| entry.as_ref())
                 .context("state cache has no K/V for a full-attention layer")?;
+            let fi = self
+                .flashinfer_for(
+                    state_len + b.lens.iter().copied().max().unwrap_or(0),
+                    hd,
+                    heads,
+                    kv,
+                )
+                .context("cascade attention needs the vendored FlashInfer library")?;
+            let split = std::env::var("DECIDRA_ATTN_SPLIT")
+                .map(|v| v != "0")
+                .unwrap_or(false)
+                && fi.has_ext_lse()
+                && state_len >= total;
+            if split {
+                let mut state_out = self.alloc_bf16(total * heads * hd)?;
+                let mut private_out = self.alloc_bf16(total * heads * hd)?;
+                let mut state_lse = self.alloc_f32(total * heads)?;
+                let mut private_lse = self.alloc_f32(total * heads)?;
+                fi.prefill_ext_lse(
+                    &self.gpu,
+                    &*qn,
+                    state_k,
+                    state_v,
+                    &mut *state_out,
+                    &mut *state_lse,
+                    total,
+                    state_len,
+                )
+                .context("shared-state attention")?;
+                for s in 0..b.batch() {
+                    let o = b.offsets[s];
+                    let l = b.lens[s];
+                    let qv = qn
+                        .try_slice(o * heads * hd..(o + l) * heads * hd)
+                        .context("split q view")?;
+                    let kvw = kn
+                        .try_slice(o * kv * hd..(o + l) * kv * hd)
+                        .context("split k view")?;
+                    let vvw = vv
+                        .try_slice(o * kv * hd..(o + l) * kv * hd)
+                        .context("split v view")?;
+                    let mut ov = private_out
+                        .try_slice_mut(o * heads * hd..(o + l) * heads * hd)
+                        .context("split out view")?;
+                    let mut lv = private_lse
+                        .try_slice_mut(o * heads..(o + l) * heads)
+                        .context("split lse view")?;
+                    fi.prefill_ext_lse(&self.gpu, &qv, &kvw, &vvw, &mut ov, &mut lv, l, l)
+                        .context("private-question attention")?;
+                }
+                kernels::merge_attn_lse_bf16(
+                    &self.gpu,
+                    &self.kernels.merge_attn_lse_bf16,
+                    &state_out,
+                    &state_lse,
+                    &private_out,
+                    &private_lse,
+                    &mut attn,
+                    total,
+                    heads,
+                    hd,
+                )
+                .context("LSE attention merge")?;
+                self.prof_end("attn", __attn_t);
+                let gated = match gate {
+                    Some(g) => {
+                        let mut o = self.alloc_bf16(total * heads * hd)?;
+                        timed!(
+                            self,
+                            "attn.gate",
+                            kernels::sigmoid_gate(
+                                &self.gpu,
+                                &self.kernels.sigmoid_gate,
+                                &attn,
+                                &g,
+                                &mut o,
+                                total * heads * hd,
+                            )?
+                        );
+                        o
+                    }
+                    None => attn,
+                };
+                return Ok(timed!(self, "gemm.o", self.gemm(&gated, total, &w.o_proj)?));
+            }
             let max_len = b.lens.iter().copied().max().unwrap_or(0);
             let kv_cap = state_len + max_len;
             let mut k_all = self.alloc_bf16(kv_cap * kv * hd)?;
@@ -1913,9 +1998,6 @@ impl Engine {
                     .context("batch cascade V state view")?;
                 self.gpu.stream.memcpy_dtod(state_v, &mut dst)?;
             }
-            let fi = self
-                .flashinfer_for(kv_cap, hd, heads, kv)
-                .context("cascade attention needs the vendored FlashInfer library")?;
             for s in 0..b.batch() {
                 let o = b.offsets[s];
                 let l = b.lens[s];

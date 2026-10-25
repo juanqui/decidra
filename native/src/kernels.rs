@@ -13,6 +13,7 @@ pub struct Kernels {
     pub add_rmsnorm: CudaFunction,
     pub rmsnorm_gated: CudaFunction,
     pub add: CudaFunction,
+    pub merge_attn_lse_bf16: CudaFunction,
     pub silu_mul: CudaFunction,
     pub sigmoid_gate: CudaFunction,
     pub split_q_gate: CudaFunction,
@@ -88,6 +89,7 @@ impl Kernels {
             add_rmsnorm: gpu.func("add_rmsnorm_bf16")?,
             rmsnorm_gated: gpu.func("rmsnorm_gated_bf16")?,
             add: gpu.func("add_bf16")?,
+            merge_attn_lse_bf16: gpu.func("merge_attn_lse_bf16")?,
             silu_mul: gpu.func("silu_mul_bf16")?,
             sigmoid_gate: gpu.func("sigmoid_gate_bf16")?,
             split_q_gate: gpu.func("split_q_gate_bf16")?,
@@ -2566,6 +2568,37 @@ pub fn gdn_prepare_compact(
     builder.arg(&num_v_i);
     builder.arg(&dk_i);
     builder.arg(&dv_i);
+    unsafe { builder.launch(cfg)? };
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn merge_attn_lse_bf16(
+    gpu: &Gpu,
+    func: &CudaFunction,
+    a: &CudaSlice<bf16>,
+    lse_a: &CudaSlice<f32>,
+    b: &CudaSlice<bf16>,
+    lse_b: &CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+    rows: usize,
+    heads: usize,
+    head_dim: usize,
+) -> Result<()> {
+    let n = rows * heads * head_dim;
+    let cfg = LaunchConfig::for_num_elems(n as u32);
+    let mut builder = gpu.stream.launch_builder(func);
+    builder.arg(a);
+    builder.arg(lse_a);
+    builder.arg(b);
+    builder.arg(lse_b);
+    builder.arg(out);
+    let rows_i = rows as i32;
+    let heads_i = heads as i32;
+    let dim_i = head_dim as i32;
+    builder.arg(&rows_i);
+    builder.arg(&heads_i);
+    builder.arg(&dim_i);
     unsafe { builder.launch(cfg)? };
     Ok(())
 }

@@ -143,6 +143,22 @@ int fi_prefill_bf16_custom(const void* q, const void* k, const void* v, const vo
 // Non-causal prefill with independent query/key lengths (cascade without a
 // dense mask): qo_len question rows over kv_len = state + question keys.
 extern "C" __attribute__((visibility("default")))
+int fi_prefill_bf16_ext_lse(const void* q, const void* k, const void* v, void* out,
+                            float* lse, int qo_len, int kv_len, cudaStream_t stream) {
+  if (qo_len <= 0 || kv_len < qo_len) return -1;
+  Params p = make_params(q, k, v, out, qo_len);
+  p.qo_len = static_cast<uint32_t>(qo_len);
+  p.kv_len = static_cast<uint32_t>(kv_len);
+  p.lse = lse;
+  bf16* tmp = split_workspace(qo_len, kv_len, stream);
+  cudaError_t e = flashinfer::SinglePrefillWithKVCacheDispatched<
+      256, 256, flashinfer::PosEncodingMode::kNone,
+      /*USE_FP16_QK_REDUCTION=*/false, flashinfer::MaskMode::kNone,
+      Variant>(p, tmp, stream);
+  return static_cast<int>(e);
+}
+
+extern "C" __attribute__((visibility("default")))
 int fi_prefill_bf16_ext(const void* q, const void* k, const void* v, void* out,
                         int qo_len, int kv_len, cudaStream_t stream) {
   if (qo_len <= 0 || kv_len < qo_len) return -1;
