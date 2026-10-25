@@ -735,6 +735,60 @@ extern "C" __global__ void gdn_prepare(const bf16* __restrict__ qkv,
   }
 }
 
+// Compact question-only preparation: normalized Q/K are stored once per key
+// head instead of duplicated across the three value heads that share them.
+extern "C" __global__ void gdn_prepare_compact_bf16(
+    const bf16* __restrict__ qkv, const bf16* __restrict__ b,
+    const bf16* __restrict__ a, const float* __restrict__ A_log,
+    const float* __restrict__ dt_bias, float* __restrict__ qf,
+    float* __restrict__ kf, float* __restrict__ vf, float* __restrict__ g,
+    float* __restrict__ beta, int num_k, int num_v, int dk, int dv) {
+  extern __shared__ float red[];
+  int t = blockIdx.x;
+  int vh = blockIdx.y;
+  int rep = num_v / num_k;
+  int kh = vh / rep;
+  int key_dim = num_k * dk;
+  int row_stride = 2 * key_dim + num_v * dv;
+  const bf16* row = qkv + (size_t)t * row_stride;
+
+  if (vh % rep == 0) {
+    float ss = 0.f;
+    for (int j = threadIdx.x; j < dk; j += blockDim.x) {
+      float qv = bf2f(row[kh * dk + j]);
+      ss += qv * qv;
+    }
+    float qn = block_reduce_sum(ss, red);
+    float qscale = (1.0f / sqrtf(qn + 1e-6f)) * (1.0f / sqrtf((float)dk));
+    __syncthreads();
+    for (int j = threadIdx.x; j < dk; j += blockDim.x)
+      qf[((size_t)t * num_k + kh) * dk + j] = bf2f(row[kh * dk + j]) * qscale;
+
+    ss = 0.f;
+    for (int j = threadIdx.x; j < dk; j += blockDim.x) {
+      float kv = bf2f(row[key_dim + kh * dk + j]);
+      ss += kv * kv;
+    }
+    float kn = block_reduce_sum(ss, red);
+    float kscale = 1.0f / sqrtf(kn + 1e-6f);
+    __syncthreads();
+    for (int j = threadIdx.x; j < dk; j += blockDim.x)
+      kf[((size_t)t * num_k + kh) * dk + j] =
+          bf2f(row[key_dim + kh * dk + j]) * kscale;
+  }
+
+  for (int j = threadIdx.x; j < dv; j += blockDim.x)
+    vf[((size_t)t * num_v + vh) * dv + j] =
+        bf2f(row[2 * key_dim + vh * dv + j]);
+
+  if (threadIdx.x == 0) {
+    float av = bf2f(a[t * num_v + vh]) + dt_bias[vh];
+    float sp = av > 20.f ? av : log1pf(expf(av));
+    g[t * num_v + vh] = -expf(A_log[vh]) * sp;
+    beta[t * num_v + vh] = rb(1.f / (1.f + expf(-bf2f(b[t * num_v + vh]))));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // GDN recurrent (gated delta rule), float32 state.
 // qf,kf,vf: [seq, heads, d]; g,beta: [seq, heads]; state: [heads, dk, dv]
@@ -2001,6 +2055,47 @@ extern "C" __global__ void conv1d_silu_batched_bf16(
   }
 }
 
+// Tiled seeded conv + SiLU: one channel per thread, time tiles in grid.y,
+// sequences in grid.z. Reads the immutable history tail directly.
+extern "C" __global__ void conv1d_silu_seeded_tiled_bf16(
+    const bf16* __restrict__ x, const bf16* __restrict__ hist,
+    const bf16* __restrict__ w, bf16* __restrict__ out,
+    const int* __restrict__ offsets, const int* __restrict__ lens,
+    int batch, int ch) {
+  int s = blockIdx.z;
+  if (s >= batch) return;
+  int l = lens[s];
+  int t0 = blockIdx.y * CONV_TILE;
+  int t1 = min(t0 + CONV_TILE, l);
+  if (t0 >= t1) return;
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= ch) return;
+  int o = offsets[s];
+  const float w0 = bf2f(w[c * 4 + 0]);
+  const float w1 = bf2f(w[c * 4 + 1]);
+  const float w2 = bf2f(w[c * 4 + 2]);
+  const float w3 = bf2f(w[c * 4 + 3]);
+  auto at = [&](int src) {
+    return src < 0 ? bf2f(hist[(src + 3) * ch + c])
+                   : bf2f(x[(size_t)(o + src) * ch + c]);
+  };
+  float xm3 = at(t0 - 3);
+  float xm2 = at(t0 - 2);
+  float xm1 = at(t0 - 1);
+  for (int t = t0; t < t1; ++t) {
+    float xt = at(t);
+    float acc = fmaf(xm3, w0, 0.f);
+    acc = fmaf(xm2, w1, acc);
+    acc = fmaf(xm1, w2, acc);
+    acc = fmaf(xt, w3, acc);
+    float v = rb(acc);
+    out[(size_t)(o + t) * ch + c] = f2bf(v / (1.0f + expf(-v)));
+    xm3 = xm2;
+    xm2 = xm1;
+    xm1 = xt;
+  }
+}
+
 // 4-lane split GDN recurrence, one CTA per (head slice, sequence).
 // grid: (heads*chunks, batch); block: vc*4; smem: dk*(vc+1)*4.
 extern "C" __global__ void gdn_recurrent_split_batched(
@@ -2118,6 +2213,65 @@ extern "C" __global__ void gdn_recurrent_reg_split_batched(
 
 #pragma unroll
   for (int i = 0; i < PER; ++i) col[(size_t)(i0 + i) * dv + j] = s[i];
+}
+
+// Register-resident recurrence with an immutable shared seed and no final
+// state write: question blocks read the cached state directly.
+extern "C" __global__ void gdn_recurrent_reg_split_seeded_bf16(
+    const float* __restrict__ qf, const float* __restrict__ kf,
+    const float* __restrict__ vf, const float* __restrict__ g,
+    const float* __restrict__ beta, const float* __restrict__ seed,
+    bf16* __restrict__ out, const int* __restrict__ offsets,
+    const int* __restrict__ lens, int heads, int num_k, int dk, int dv,
+    int vc, int chunks) {
+  constexpr int L = 4;
+  constexpr int PER = 32;
+  int sidx = blockIdx.y;
+  int h = blockIdx.x / chunks;
+  int chunk = blockIdx.x % chunks;
+  int kh = h / (heads / num_k);
+  int tid = threadIdx.x;
+  int j = tid / L;
+  int lane = tid % L;
+  if (j >= vc || lane >= L) return;
+  int base = offsets[sidx];
+  int seq = lens[sidx];
+  int v0 = chunk * vc;
+  int gj = v0 + j;
+  int i0 = lane * PER;
+  const float* col = seed + (size_t)h * dk * dv + v0;
+  float s[PER];
+#pragma unroll
+  for (int i = 0; i < PER; ++i) s[i] = col[(size_t)(i0 + i) * dv + j];
+
+  for (int t = 0; t < seq; ++t) {
+    int row = base + t;
+    float dec = expf(g[row * heads + h]);
+    float bt = beta[row * heads + h];
+    const float* kt = kf + ((size_t)row * num_k + kh) * dk + i0;
+    const float* qt = qf + ((size_t)row * num_k + kh) * dk + i0;
+    float kv = 0.f;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+      float sv = s[i] * dec;
+      s[i] = sv;
+      kv += sv * kt[i];
+    }
+    kv += __shfl_xor_sync(0xffffffffu, kv, 1);
+    kv += __shfl_xor_sync(0xffffffffu, kv, 2);
+    float del = (vf[((size_t)row * heads + h) * dv + gj] - kv) * bt;
+    float o = 0.f;
+#pragma unroll
+    for (int i = 0; i < PER; ++i) {
+      float sv = s[i] + kt[i] * del;
+      s[i] = sv;
+      o += sv * qt[i];
+    }
+    o += __shfl_xor_sync(0xffffffffu, o, 1);
+    o += __shfl_xor_sync(0xffffffffu, o, 2);
+    if (lane == 0)
+      out[((size_t)row * heads + h) * dv + gj] = f2bf(o);
+  }
 }
 
 // Single-column shared-state GDN recurrence, one CTA per (head slice, seq).

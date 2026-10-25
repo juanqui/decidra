@@ -25,6 +25,7 @@ pub struct Kernels {
     pub attention_tc_256: CudaFunction,
     pub conv1d_silu: CudaFunction,
     pub gdn_prepare: CudaFunction,
+    pub gdn_prepare_compact: CudaFunction,
     pub gdn_recurrent: CudaFunction,
     /// Broadcast one f32 seed state into every row of a batched state buffer.
     pub gdn_seed_broadcast: CudaFunction,
@@ -33,11 +34,13 @@ pub struct Kernels {
     pub gdn_recurrent_shared_batched: CudaFunction,
     pub gdn_recurrent_split_batched: CudaFunction,
     pub gdn_recurrent_reg_split_batched: CudaFunction,
+    pub gdn_recurrent_reg_split_seeded_bf16: CudaFunction,
     pub gdn_chunked: CudaFunction,
     pub gdn_chunked_tc: CudaFunction,
     pub gdn_chunked_tc_prof: CudaFunction,
     pub gdn_chunked_tc_batched: CudaFunction,
     pub conv1d_silu_batched: CudaFunction,
+    pub conv1d_silu_seeded_tiled_batched: CudaFunction,
     pub conv1d_silu_tiled: CudaFunction,
     pub conv1d_silu_tiled_batched: CudaFunction,
     pub gather_rows: CudaFunction,
@@ -110,6 +113,7 @@ impl Kernels {
             },
             conv1d_silu: gpu.func("conv1d_silu_bf16")?,
             gdn_prepare: gpu.func("gdn_prepare")?,
+            gdn_prepare_compact: gpu.func("gdn_prepare_compact_bf16")?,
             gdn_recurrent: gpu.func("gdn_recurrent")?,
             gdn_seed_broadcast: gpu.func("gdn_seed_broadcast")?,
             gdn_recurrent_shared: {
@@ -137,6 +141,7 @@ impl Kernels {
                 f
             },
             gdn_recurrent_reg_split_batched: gpu.func("gdn_recurrent_reg_split_batched")?,
+            gdn_recurrent_reg_split_seeded_bf16: gpu.func("gdn_recurrent_reg_split_seeded_bf16")?,
             gdn_recurrent_split_batched: {
                 let f = gpu.func("gdn_recurrent_split_batched")?;
                 f.set_attribute(
@@ -178,6 +183,7 @@ impl Kernels {
                 f
             },
             conv1d_silu_batched: gpu.func("conv1d_silu_batched_bf16")?,
+            conv1d_silu_seeded_tiled_batched: gpu.func("conv1d_silu_seeded_tiled_bf16")?,
             conv1d_silu_tiled: gpu.func("conv1d_silu_tiled_bf16")?,
             conv1d_silu_tiled_batched: gpu.func("conv1d_silu_tiled_batched_bf16")?,
             gather_rows: gpu.func("gather_rows_bf16")?,
@@ -2427,5 +2433,139 @@ pub fn add_rows(
     l.arg(add);
     l.arg(&nn);
     unsafe { l.launch(cfg_1d(n, 256)) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn conv1d_silu_seeded_tiled(
+    gpu: &Gpu,
+    func: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    hist: &CudaSlice<bf16>,
+    weight: &CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+    offsets: &CudaSlice<i32>,
+    lens: &CudaSlice<i32>,
+    batch: usize,
+    channels: usize,
+    max_len: usize,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (
+            channels.div_ceil(256) as u32,
+            max_len.div_ceil(16) as u32,
+            batch as u32,
+        ),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = gpu.stream.launch_builder(func);
+    builder.arg(x);
+    builder.arg(hist);
+    builder.arg(weight);
+    builder.arg(out);
+    builder.arg(offsets);
+    builder.arg(lens);
+    let batch_i = batch as i32;
+    let channels_i = channels as i32;
+    builder.arg(&batch_i);
+    builder.arg(&channels_i);
+    unsafe { builder.launch(cfg)? };
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_recurrent_reg_split_seeded_batched(
+    gpu: &Gpu,
+    func: &CudaFunction,
+    qf: &CudaSlice<f32>,
+    kf: &CudaSlice<f32>,
+    vf: &CudaSlice<f32>,
+    g: &CudaSlice<f32>,
+    beta: &CudaSlice<f32>,
+    seed: &CudaSlice<f32>,
+    out: &mut CudaSlice<bf16>,
+    offsets: &CudaSlice<i32>,
+    lens: &CudaSlice<i32>,
+    batch: usize,
+    heads: usize,
+    num_k: usize,
+    dk: usize,
+    dv: usize,
+) -> Result<()> {
+    let vc = if dv >= 64 { 64 } else { dv };
+    let chunks = dv.div_ceil(vc);
+    let cfg = LaunchConfig {
+        grid_dim: ((heads * chunks) as u32, batch as u32, 1),
+        block_dim: ((vc * 4) as u32, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let mut builder = gpu.stream.launch_builder(func);
+    for arg in [qf, kf, vf, g, beta] {
+        builder.arg(arg);
+    }
+    builder.arg(seed);
+    builder.arg(out);
+    builder.arg(offsets);
+    builder.arg(lens);
+    let heads_i = heads as i32;
+    let num_k_i = num_k as i32;
+    let dk_i = dk as i32;
+    let dv_i = dv as i32;
+    let vc_i = vc as i32;
+    let chunks_i = chunks as i32;
+    builder.arg(&heads_i);
+    builder.arg(&num_k_i);
+    builder.arg(&dk_i);
+    builder.arg(&dv_i);
+    builder.arg(&vc_i);
+    builder.arg(&chunks_i);
+    unsafe { builder.launch(cfg)? };
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn gdn_prepare_compact(
+    gpu: &Gpu,
+    func: &CudaFunction,
+    qkv: &CudaSlice<bf16>,
+    b: &CudaSlice<bf16>,
+    a: &CudaSlice<bf16>,
+    a_log: &CudaSlice<f32>,
+    dt_bias: &CudaSlice<f32>,
+    qf: &mut CudaSlice<f32>,
+    kf: &mut CudaSlice<f32>,
+    vf: &mut CudaSlice<f32>,
+    g: &mut CudaSlice<f32>,
+    beta: &mut CudaSlice<f32>,
+    rows: usize,
+    num_k: usize,
+    num_v: usize,
+    dk: usize,
+    dv: usize,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, num_v as u32, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 1024,
+    };
+    let mut builder = gpu.stream.launch_builder(func);
+    for arg in [qkv, b, a] {
+        builder.arg(arg);
+    }
+    builder.arg(a_log);
+    builder.arg(dt_bias);
+    for arg in [qf, kf, vf, g, beta] {
+        builder.arg(arg);
+    }
+    let num_k_i = num_k as i32;
+    let num_v_i = num_v as i32;
+    let dk_i = dk as i32;
+    let dv_i = dv as i32;
+    builder.arg(&num_k_i);
+    builder.arg(&num_v_i);
+    builder.arg(&dk_i);
+    builder.arg(&dv_i);
+    unsafe { builder.launch(cfg)? };
     Ok(())
 }

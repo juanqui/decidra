@@ -45,8 +45,15 @@ static Params make_params(const void* q, const void* k, const void* v, void* out
 // pass) already have enough CTAs and keep the no-workspace path.
 static bf16* split_workspace(int qo_len, int kv_len, cudaStream_t stream) {
   if (qo_len > 256 || kv_len < 512) return nullptr;
-  int sms = 0;
-  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+  static int cached_sms = 0;
+  static bf16* cached_workspace = nullptr;
+  static size_t cached_bytes = 0;
+  static cudaStream_t cached_stream = nullptr;
+  int sms = cached_sms;
+  if (sms == 0) {
+    cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, 0);
+    cached_sms = sms;
+  }
   int q_tiles = (qo_len * 6 + 63) / 64;
   int chunks = (2 * sms) / (4 * q_tiles) + 1;
   if (chunks < 2) chunks = 2;
@@ -56,13 +63,26 @@ static bf16* split_workspace(int qo_len, int kv_len, cudaStream_t stream) {
   size_t elems = (size_t)chunks * qo_len * 24 * 256;
   size_t bytes = elems * sizeof(bf16) +
                  (size_t)chunks * qo_len * 24 * sizeof(float);
-  void* ptr = nullptr;
-  if (cudaMallocAsync(&ptr, bytes, stream) != cudaSuccess) return nullptr;
-  return static_cast<bf16*>(ptr);
-}
-
-static void free_workspace(bf16* ptr, cudaStream_t stream) {
-  if (ptr != nullptr) cudaFreeAsync(ptr, stream);
+  if (cached_stream != stream) {
+    if (cached_workspace != nullptr) {
+      cudaFree(cached_workspace);
+      cached_workspace = nullptr;
+      cached_bytes = 0;
+    }
+    cached_stream = stream;
+  }
+  if (cached_bytes < bytes) {
+    if (cached_workspace != nullptr) cudaFree(cached_workspace);
+    void* ptr = nullptr;
+    if (cudaMalloc(&ptr, bytes) != cudaSuccess) {
+      cached_workspace = nullptr;
+      cached_bytes = 0;
+      return nullptr;
+    }
+    cached_workspace = static_cast<bf16*>(ptr);
+    cached_bytes = bytes;
+  }
+  return cached_workspace;
 }
 
 extern "C" __attribute__((visibility("default")))
@@ -134,6 +154,5 @@ int fi_prefill_bf16_ext(const void* q, const void* k, const void* v, void* out,
       256, 256, flashinfer::PosEncodingMode::kNone,
       /*USE_FP16_QK_REDUCTION=*/false, flashinfer::MaskMode::kNone,
       Variant>(p, tmp, stream);
-  free_workspace(tmp, stream);
   return static_cast<int>(e);
 }

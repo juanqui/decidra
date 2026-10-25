@@ -289,6 +289,21 @@ peak at the sustained clock.
 
 ## 5. Performance on one RTX 4090
 
+2026-10-25 optimization result (600 W, 2,121-token state, 64 genuinely
+distinct questions, 3,334 rows, production W4A8, repeat 20):
+
+| path | p50 | change |
+|---|---:|---:|
+| pre-optimization `92c97f5` | 752.69 ms | — |
+| tiled seeded conv + state-free GDN + compact Q/K + workspace reuse | **708.91 ms** | **-5.81%** |
+| same, opt-in GPU embedding | 689.63 ms | -8.38% |
+
+HTTP duplicate-control 64q c1 improves from 929 ms / 69 q/s to **879.8 ms /
+73 q/s**. The GPU embedding option costs 2.37 GiB and is intentionally not the
+default. The distinct-question fixture and the full experiment log are in
+[`research/2026-10-25-rtx4090-optimization-journal.md`](research/2026-10-25-rtx4090-optimization-journal.md).
+The older 450 W tables below remain historical measurements.
+
 Both GPUs are capped at 450 W. The 4090 draws ~449 W at ~2.82 GHz. Defaults:
 W4A8 g64, gate/up/down/o/q INT8 group, k/v W4A16, register GDN, suffix-only
 question tokenization, 32-row scheduler budget, 16-entry / 5 GiB pinned state cache plus 8 GiB host L2

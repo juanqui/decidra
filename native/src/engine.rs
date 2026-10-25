@@ -2081,91 +2081,32 @@ impl Engine {
         };
         let mut conv_body = None;
         if let Some((cache, layer)) = cascade {
-            // Seed every row's 4-token convolution with the state's last three
-            // pre-conv rows. The rows are laid out `[hist; question]` and the
-            // conv runs over the longer segments; the body is then compacted.
+            // Read the immutable three-row state tail directly instead of
+            // materializing a gapped [hist; question] buffer and copying the
+            // compacted result back for every question.
             let hist = cache
                 .gdn_hist
                 .get(layer)
                 .and_then(|entry| entry.as_ref())
                 .context("state cache has no convolution tail for a GDN layer")?;
-            let rows = b.batch();
-            let mut g_offsets = Vec::with_capacity(rows);
-            let mut g_lens = Vec::with_capacity(rows);
-            let mut goff = 0usize;
-            for &l in &b.lens {
-                g_offsets.push(goff as i32);
-                g_lens.push((l + 3) as i32);
-                goff += l + 3;
-            }
-            let g_offsets_dev = self.gpu.stream.clone_htod(&g_offsets)?;
-            let g_lens_dev = self.gpu.stream.clone_htod(&g_lens)?;
-            let mut gapped = self.alloc_bf16(goff * conv_dim)?;
-            for s in 0..rows {
-                let o = b.offsets[s];
-                let l = b.lens[s];
-                let go = g_offsets[s] as usize;
-                {
-                    let mut dst = gapped
-                        .try_slice_mut(go * conv_dim..(go + 3) * conv_dim)
-                        .context("batched conv history destination")?;
-                    self.gpu.stream.memcpy_dtod(hist, &mut dst)?;
-                }
-                {
-                    let src = qkv
-                        .try_slice(o * conv_dim..(o + l) * conv_dim)
-                        .context("batched conv question view")?;
-                    let mut dst = gapped
-                        .try_slice_mut((go + 3) * conv_dim..(go + 3 + l) * conv_dim)
-                        .context("batched conv question destination")?;
-                    self.gpu.stream.memcpy_dtod(&src, &mut dst)?;
-                }
-            }
-            let mut conv_gapped = self.alloc_bf16(goff * conv_dim)?;
-            let max_len = g_lens.iter().copied().max().unwrap_or(0) as usize;
+            let mut body = self.alloc_bf16(total * conv_dim)?;
             timed!(
                 self,
                 "gdn.conv",
-                if self.conv_tiled.load(Ordering::Relaxed) {
-                    kernels::conv1d_silu_tiled_batched(
-                        &self.gpu,
-                        &self.kernels.conv1d_silu_tiled_batched,
-                        &gapped,
-                        &w.conv1d,
-                        &mut conv_gapped,
-                        &g_offsets_dev,
-                        &g_lens_dev,
-                        rows,
-                        conv_dim,
-                        max_len,
-                    )?
-                } else {
-                    kernels::conv1d_silu_batched(
-                        &self.gpu,
-                        &self.kernels.conv1d_silu_batched,
-                        &gapped,
-                        &w.conv1d,
-                        &mut conv_gapped,
-                        &g_offsets_dev,
-                        &g_lens_dev,
-                        rows,
-                        conv_dim,
-                    )?
-                }
+                kernels::conv1d_silu_seeded_tiled(
+                    &self.gpu,
+                    &self.kernels.conv1d_silu_seeded_tiled_batched,
+                    &qkv,
+                    hist,
+                    &w.conv1d,
+                    &mut body,
+                    &b.offsets_dev,
+                    &b.lens_dev,
+                    b.batch(),
+                    conv_dim,
+                    b.lens.iter().copied().max().unwrap_or(0) as usize,
+                )?
             );
-            let mut body = self.alloc_bf16(total * conv_dim)?;
-            for s in 0..rows {
-                let o = b.offsets[s];
-                let l = b.lens[s];
-                let go = g_offsets[s] as usize;
-                let src = conv_gapped
-                    .try_slice((go + 3) * conv_dim..(go + 3 + l) * conv_dim)
-                    .context("batched conv body view")?;
-                let mut dst = body
-                    .try_slice_mut(o * conv_dim..(o + l) * conv_dim)
-                    .context("batched conv body destination")?;
-                self.gpu.stream.memcpy_dtod(&src, &mut dst)?;
-            }
             conv_body = Some(body);
         } else {
             let max_len = b.lens.iter().copied().max().unwrap_or(0);
@@ -2205,61 +2146,102 @@ impl Engine {
         let bb = timed!(self, "gemm.b", self.gemm(h, total, &w.in_proj_b)?);
         let aa = timed!(self, "gemm.a", self.gemm(h, total, &w.in_proj_a)?);
 
-        let mut qf = self.alloc_f32(total * nv * dk)?;
-        let mut kf = self.alloc_f32(total * nv * dk)?;
+        let compact_qk = cascade.is_some()
+            && dk == 128
+            && dv == 128
+            && b.lens.iter().all(|&l| l <= 256)
+            && std::env::var("DECIDRA_GDN_REG")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+        let qk_heads = if compact_qk { nk } else { nv };
+        let mut qf = self.alloc_f32(total * qk_heads * dk)?;
+        let mut kf = self.alloc_f32(total * qk_heads * dk)?;
         let mut vf = self.alloc_f32(total * nv * dv)?;
         let mut gg = self.alloc_f32(total * nv)?;
         let mut beta = self.alloc_f32(total * nv)?;
-        timed!(
-            self,
-            "gdn.prepare",
-            kernels::gdn_prepare(
-                &self.gpu,
-                &self.kernels.gdn_prepare,
-                conv_rows,
-                &bb,
-                &aa,
-                &w.a_log,
-                &w.dt_bias,
-                &mut qf,
-                &mut kf,
-                &mut vf,
-                &mut gg,
-                &mut beta,
-                total,
-                nk,
-                nv,
-                dk,
-                dv,
-            )?
-        );
+        if compact_qk {
+            timed!(
+                self,
+                "gdn.prepare",
+                kernels::gdn_prepare_compact(
+                    &self.gpu,
+                    &self.kernels.gdn_prepare_compact,
+                    conv_rows,
+                    &bb,
+                    &aa,
+                    &w.a_log,
+                    &w.dt_bias,
+                    &mut qf,
+                    &mut kf,
+                    &mut vf,
+                    &mut gg,
+                    &mut beta,
+                    total,
+                    nk,
+                    nv,
+                    dk,
+                    dv,
+                )?
+            );
+        } else {
+            timed!(
+                self,
+                "gdn.prepare",
+                kernels::gdn_prepare(
+                    &self.gpu,
+                    &self.kernels.gdn_prepare,
+                    conv_rows,
+                    &bb,
+                    &aa,
+                    &w.a_log,
+                    &w.dt_bias,
+                    &mut qf,
+                    &mut kf,
+                    &mut vf,
+                    &mut gg,
+                    &mut beta,
+                    total,
+                    nk,
+                    nv,
+                    dk,
+                    dv,
+                )?
+            );
+        }
         drop(qkv);
         drop(conv_body);
         drop(conv);
         drop(bb);
         drop(aa);
 
-        let mut state = self.alloc_f32(b.batch() * nv * dk * dv)?;
-        if let Some((cache, layer)) = cascade {
-            let seed = cache
-                .gdn_state
-                .get(layer)
-                .and_then(|entry| entry.as_ref())
-                .context("state cache has no recurrent state for a GDN layer")?;
-            let elems = nv * dk * dv;
-            if seed.len() < elems {
-                bail!("state recurrent cache is too small");
-            }
-            kernels::gdn_seed_broadcast(
-                &self.gpu,
-                &self.kernels.gdn_seed_broadcast,
-                seed,
-                &mut *state,
-                elems,
-                b.batch(),
-            )?;
+        let direct_seed = compact_qk;
+        let mut state = if direct_seed {
+            self.alloc_f32(0)?
         } else {
-            self.gpu.stream.memset_zeros(&mut *state)?;
+            self.alloc_f32(b.batch() * nv * dk * dv)?
+        };
+        if !direct_seed {
+            if let Some((cache, layer)) = cascade {
+                let seed = cache
+                    .gdn_state
+                    .get(layer)
+                    .and_then(|entry| entry.as_ref())
+                    .context("state cache has no recurrent state for a GDN layer")?;
+                let elems = nv * dk * dv;
+                if seed.len() < elems {
+                    bail!("state recurrent cache is too small");
+                }
+                kernels::gdn_seed_broadcast(
+                    &self.gpu,
+                    &self.kernels.gdn_seed_broadcast,
+                    seed,
+                    &mut *state,
+                    elems,
+                    b.batch(),
+                )?;
+            } else {
+                self.gpu.stream.memset_zeros(&mut *state)?;
+            }
         }
         let mut core = self.alloc_bf16(total * nv * dv)?;
         let min_seq = self.gdn_split_min_seq.load(Ordering::Relaxed);
@@ -2297,24 +2279,50 @@ impl Engine {
             self,
             "gdn.recurrent",
             if gdn_reg {
-                let f = &self.kernels.gdn_recurrent_reg_split_batched;
-                kernels::gdn_recurrent_reg_split_batched(
-                    &self.gpu,
-                    f,
-                    &*qf,
-                    &*kf,
-                    &*vf,
-                    &*gg,
-                    &*beta,
-                    &mut *state,
-                    &mut *core,
-                    &b.offsets_dev,
-                    &b.lens_dev,
-                    b.batch(),
-                    nv,
-                    dk,
-                    dv,
-                )?
+                if let Some((cache, layer)) = cascade {
+                    let seed = cache
+                        .gdn_state
+                        .get(layer)
+                        .and_then(|entry| entry.as_ref())
+                        .context("state cache has no recurrent state for a GDN layer")?;
+                    kernels::gdn_recurrent_reg_split_seeded_batched(
+                        &self.gpu,
+                        &self.kernels.gdn_recurrent_reg_split_seeded_bf16,
+                        &*qf,
+                        &*kf,
+                        &*vf,
+                        &*gg,
+                        &*beta,
+                        seed,
+                        &mut *core,
+                        &b.offsets_dev,
+                        &b.lens_dev,
+                        b.batch(),
+                        nv,
+                        nk,
+                        dk,
+                        dv,
+                    )?
+                } else {
+                    let f = &self.kernels.gdn_recurrent_reg_split_batched;
+                    kernels::gdn_recurrent_reg_split_batched(
+                        &self.gpu,
+                        f,
+                        &*qf,
+                        &*kf,
+                        &*vf,
+                        &*gg,
+                        &*beta,
+                        &mut *state,
+                        &mut *core,
+                        &b.offsets_dev,
+                        &b.lens_dev,
+                        b.batch(),
+                        nv,
+                        dk,
+                        dv,
+                    )?
+                }
             } else if all_chunked {
                 kernels::gdn_chunked_batched(
                     &self.gpu,

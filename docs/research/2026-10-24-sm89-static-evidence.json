@@ -1,0 +1,109 @@
+{
+  "source_commit": "51757462104342921caf2a4f0c44101d59fad596",
+  "source_sha256": "5a634b99ffcf76e0deae8b2aa59effba8183a08dc2777628bf41df56b3e930ba",
+  "toolchain": "nvidia/cuda:13.1.1-devel-ubuntu24.04",
+  "results": {
+    "fmad_false": {
+      "registers": 127,
+      "static_instructions": 561,
+      "selected_static_instructions": {
+        "FFMA": 4,
+        "FMUL": 130,
+        "FADD": 102,
+        "MUFU": 2,
+        "LDG": 101,
+        "STG": 33,
+        "LDL": 0,
+        "STL": 0
+      },
+      "resources": "Resource usage:\n Common:\n  GLOBAL:0\n Function gdn_recurrent_reg_split_batched:\n  REG:127 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:444 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "928b446ed648bbe79fe32a6f3051959dbecaf036e5b46204517d7eaf32673945"
+    },
+    "fmad_true": {
+      "registers": 128,
+      "static_instructions": 443,
+      "selected_static_instructions": {
+        "FFMA": 100,
+        "FMUL": 34,
+        "FADD": 6,
+        "MUFU": 2,
+        "LDG": 101,
+        "STG": 33,
+        "LDL": 0,
+        "STL": 0
+      },
+      "resources": "Resource usage:\n Common:\n  GLOBAL:0\n Function gdn_recurrent_reg_split_batched:\n  REG:128 STACK:0 SHARED:0 LOCAL:0 CONSTANT[0]:444 TEXTURE:0 SURFACE:0 SAMPLER:0",
+      "cubin_sha256": "e35d3474b93df14e2feb8c8979fc5445dbb5f8782a8eaa2033ed200078efe4f4"
+    }
+  },
+  "marlin_default_large_m_resources": "Resource usage:\n Common:\n  GLOBAL:0\n Function _ZN6marlin6MarlinILl1125899906909952ELl1125899906843648ELl1125899906909960ELl1125899906909960ELi256ELi4ELi16ELi4ELb0ELi4ELi4ELb0ELb1EEEvPK4int4S3_PS1_S4_S3_PKfS3_S6_S3_iiiiPibbbi:\n  REG:230 STACK:0 SHARED:0 LOCAL:0 CONSTANT[2]:8 CONSTANT[0]:456 TEXTURE:0 SURFACE:0 SAMPLER:0",
+  "scope": "Compile-only and static inspection; no GPU execution, runtime benchmark, or numerical validation.",
+  "compiler_flags": [
+    "-std=c++17",
+    "-O3",
+    "-fmad={false,true}",
+    "-lineinfo",
+    "-cubin",
+    "-arch=sm_89"
+  ],
+  "compiler_image_id": "sha256:9cf8694a27722418a1f175d90f85d5afb5a728fd4a9907d7f0565efecfa14d32",
+  "nvcc_version": "nvcc: NVIDIA (R) Cuda compiler driver\nCopyright (c) 2005-2025 NVIDIA Corporation\nBuilt on Tue_Dec_16_07:23:41_PM_PST_2025\nCuda compilation tools, release 13.1, V13.1.115\nBuild cuda_13.1.r13.1/compiler.37061995_0",
+  "marlin_resource_provenance": {
+    "kind": "Existing local cached build, not freshly recompiled during this review",
+    "path": "target/release/build/decidra-native-9e53196644b80002/out/marlin-sm_89.cubin",
+    "cubin_sha256": "b94b1a4a059f64dcb75c96c0711f62644e37dee8dfe5ba0a3e11cc36d7b95930",
+    "rust_launch_threads": 256,
+    "rust_launch_shared_memory_bytes": 101376,
+    "rust_launch_grid_blocks": "device SM count"
+  },
+  "fixtures": {
+    "d3_once_64_2k.json": {
+      "sha256": "db1c325a490a620c2c0655db85d26b0a0c22cc3a3c0839f8b2aa1ad94411e3ed",
+      "question_count": 64,
+      "state_tokens": 2048,
+      "question_tokens": 3236,
+      "length_histogram": {
+        "49": 20,
+        "54": 4,
+        "48": 4,
+        "50": 14,
+        "51": 8,
+        "53": 6,
+        "52": 6,
+        "55": 2
+      },
+      "unique_question_token_blocks": 28
+    },
+    "d3_ticket_2k_64q.json": {
+      "sha256": "ec7c31de3c0c81662a1e4e87575038c61d75b2e384b1c02b5f6847521f90182c",
+      "question_count": 64,
+      "unique_question_objects": 1
+    },
+    "semel_short256_64q.json": {
+      "sha256": "4095cb4c3355a1db4d60bdc6feac859a486415c883613f9d29d2c9ca68513877",
+      "question_count": 64,
+      "unique_question_objects": 1
+    },
+    "semel_short512_64q.json": {
+      "sha256": "a6d8138b24f567ca7f3ab38d83fcbc7841f335cafc5b2d3d32da3e8b05b614f9",
+      "question_count": 64,
+      "unique_question_objects": 1
+    },
+    "semel_long8k_64q.json": {
+      "sha256": "4be9737dea09ec71cbaa8ce74aabb5bf63e7ab72c48c53cbd0cdba4774db75dd",
+      "question_count": 64,
+      "unique_question_objects": 1
+    },
+    "semel_long24k_64q.json": {
+      "sha256": "6d80b5ff4450163380d5d9955486ef6d6c619e501a854c2c5a7e65410c8fede0",
+      "question_count": 64,
+      "unique_question_objects": 1
+    }
+  },
+  "checkpoint_metadata": {
+    "path": "/srv/models/d3-turbo-w4a8-vision-v2",
+    "config_sha256": "83381d2307f884beb83fb518000d4bd8b78af6c0987dc1120b12c92e5d5e1079",
+    "safetensors_header_sha256": "4a3379529f62808e9fcd48aedc24c13b5c8994bf38096f07a1e37ed7cd205e3e",
+    "packed_language_linear_parameters": 24350556160
+  }
+}

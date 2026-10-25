@@ -25,6 +25,12 @@ Start with the [project README](../README.md) for the quick start and API.
 |---|---|
 | [specs/2026-10-21-d3turbo-state-once.md](specs/2026-10-21-d3turbo-state-once.md) | dated state-once design and review record |
 
+## Research
+
+| document | contents |
+|---|---|
+| [research/2026-10-24-rtx4090-performance.md](research/2026-10-24-rtx4090-performance.md) | SM89 kernel review, compiler evidence, performance ceilings, and prioritized experiments |
+
 ## Conventions
 
 - Performance numbers are end-to-end `POST /v1/systemone` measurements.
