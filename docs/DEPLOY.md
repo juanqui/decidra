@@ -55,8 +55,8 @@ source outside the default image.
 ```bash
 # RTX 4090 / L40S (SM89 W4A8)
 CUDA_VISIBLE_DEVICES=0 \
-DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-g64-v4 \
-DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-g64-v4 \
+DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-vision-v1 \
+DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-vision-v1 \
 DECIDRA_NATIVE_GPU_EMBED=false \
 DECIDRA_STATE_CACHE_ENTRIES=16 \
 DECIDRA_STATE_CACHE_BYTES=5368709120 \
@@ -113,7 +113,7 @@ docker build --build-arg CUDA_ARCH=sm_90 -t decidra:0.2.0-h100 .
 
 docker run --rm --gpus '"device=0"' --user "$(id -u):$(id -g)" \
   -p 8899:8080 \
-  -v /srv/models/d3-turbo-w4a8-g64-v4:/models:ro \
+  -v /srv/models/d3-turbo-w4a8-vision-v1:/models:ro \
   decidra:0.2.0
 ```
 
@@ -127,7 +127,7 @@ copies the real cuBLAS/cuBLASLt files.
 |---|---|---|
 | `DECIDRA_BIND_ADDR` | `0.0.0.0:8080` | HTTP bind |
 | `DECIDRA_MODEL` | `vllm-sr/d3-turbo` | client-facing model id |
-| `DECIDRA_CHECKPOINT` | `/srv/models/d3-turbo-w4a8-g64-v4` | package |
+| `DECIDRA_CHECKPOINT` | `/srv/models/d3-turbo-w4a8-vision-v1` | package |
 | `DECIDRA_NATIVE_MODEL` | `$DECIDRA_CHECKPOINT` | engine package |
 | `DECIDRA_TOKENIZER` | `<checkpoint>/tokenizer.json` | tokenizer |
 | `DECIDRA_NATIVE_CACHE` | `true` | resident packed weights |

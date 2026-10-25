@@ -21,6 +21,7 @@ pub trait Backend: Send + Sync {
         &'a self,
         state: &'a Value,
         questions: &'a Map<String, Value>,
+        images: Vec<String>,
     ) -> D3Future<'a>;
 }
 
@@ -48,6 +49,7 @@ impl Backend for MockBackend {
         &'a self,
         _state: &'a Value,
         questions: &'a Map<String, Value>,
+        _images: Vec<String>,
     ) -> D3Future<'a> {
         let answer = self.answer.clone();
         let questions = questions.clone();

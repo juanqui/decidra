@@ -103,15 +103,16 @@ def mappings() -> list[AWQMapping]:
 class BlockCalibration(torch.utils.data.Dataset):
     """Full prompts with the d3-turbo block visibility mask, one row per item."""
 
-    def __init__(self, path: Path, tokenizer, limit: int):
+    def __init__(self, path: Path, tokenizer, limit: int, max_length: int = 2048):
         self.rows = []
+        self.max_length = max_length
         self.pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         for line in path.read_text().splitlines():
             if not line.strip():
                 continue
             row = json.loads(line)
             ids = tokenizer(row["text"], add_special_tokens=False)["input_ids"]
-            if len(ids) > 2048:
+            if len(ids) > self.max_length:
                 continue
             self.rows.append((ids, int(row["state_len"])))
             if len(self.rows) >= limit:
@@ -156,14 +157,27 @@ def collate(batch: list[dict], pad: int) -> dict:
 def post(out: Path) -> None:
     # The decision checkpoint has no lm_head; a CausalLM wrapper adds one.
     # Drop it so HF/vLLM-SR loaders do not see a shape that conflicts with
-    # vocab_size.
+    # vocab_size. Then merge the source vision tower in BF16: the language
+    # model is quantized, but the 27-block image encoder is not.
     from safetensors.torch import load_file, save_file
 
     weights = out / "model.safetensors"
     state = load_file(str(weights))
-    if state.pop("lm_head.weight", None) is not None:
-        save_file(state, str(weights), metadata={"format": "pt"})
-        print("stripped lm_head.weight", flush=True)
+    stripped = state.pop("lm_head.weight", None) is not None
+    visual = {}
+    for shard in sorted(MODEL.glob("model-*.safetensors")):
+        with safe_open(str(shard), "pt") as handle:
+            for key in handle.keys():
+                if key.startswith("visual."):
+                    visual[key] = handle.get_tensor(key)
+    if not visual:
+        raise SystemExit("source checkpoint has no visual.* tensors")
+    state.update(visual)
+    save_file(state, str(weights), metadata={"format": "pt"})
+    print(
+        f"{'stripped lm_head.weight; ' if stripped else ''}merged {len(visual)} BF16 visual tensors",
+        flush=True,
+    )
     shutil.copy(MODEL / "readout.safetensors", out / "readout.safetensors")
     readout = json.loads((MODEL / "decision_config.json").read_text())
     ids = readout["token_ids"]
@@ -195,6 +209,10 @@ def post(out: Path) -> None:
         if source.exists() and not (out / name).exists():
             shutil.copy(source, out / name)
             copied += 1
+    config_path = out / "config.json"
+    config = json.loads(config_path.read_text())
+    config["attention_mode"] = "prefix_bidir"
+    config_path.write_text(json.dumps(config, indent=1))
     print(f"copied {copied} aux files; head {len(ids)} codes T={temperature}", flush=True)
 
 
@@ -214,6 +232,7 @@ def main() -> None:
     )
     parser.add_argument("--calib", type=Path, default=CALIB)
     parser.add_argument("--group", type=int, default=64)
+    parser.add_argument("--max-seq", type=int, default=2048)
     args = parser.parse_args()
 
     tokenizer = AutoTokenizer.from_pretrained(str(MODEL))
@@ -228,7 +247,7 @@ def main() -> None:
         loader = None
         print(f"causal calibration rows: {len(dataset)}", flush=True)
     else:
-        dataset = BlockCalibration(args.calib, tokenizer, args.samples)
+        dataset = BlockCalibration(args.calib, tokenizer, args.samples, args.max_seq)
         pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
         loader = DataLoader(
             dataset,
@@ -302,7 +321,7 @@ def main() -> None:
         dataset=loader if loader is not None else dataset,
         tokenizer=tokenizer,
         output_dir=str(args.out),
-        max_seq_length=2048,
+        max_seq_length=args.max_seq,
         num_calibration_samples=len(dataset),
         pipeline=args.pipeline,
         sequential_targets=(

@@ -20,9 +20,11 @@ use std::time::{Duration, Instant};
 use decidra_native::Engine;
 use decidra_native::HostStateCache;
 use decidra_native::engine::StateCache;
+use decidra_native::vision::{VisionGrid, VisionInput};
 use tokio::sync::oneshot;
 
 use crate::error::EngineError;
+use crate::image_media::ImageMedia;
 
 pub struct BatchHandle {
     tx: SyncSender<Job>,
@@ -31,18 +33,24 @@ pub struct BatchHandle {
 struct Job {
     state: Vec<u32>,
     questions: Vec<Vec<u32>>,
+    images: std::sync::Arc<Vec<ImageMedia>>,
+    state_positions: std::sync::Arc<Vec<[u32; 3]>>,
+    image_spans: std::sync::Arc<Vec<(usize, usize)>>,
+    digest: [u8; 32],
     submitted: Instant,
     reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
 }
 
 struct CachedState {
     state: Vec<u32>,
+    digest: [u8; 32],
     cache: StateCache,
     bytes: usize,
 }
 
 struct HostCachedState {
     state: Vec<u32>,
+    digest: [u8; 32],
     cache: HostStateCache,
     bytes: usize,
 }
@@ -148,11 +156,19 @@ impl BatchHandle {
         &self,
         state: Vec<u32>,
         questions: Vec<Vec<u32>>,
+        images: Vec<ImageMedia>,
+        state_positions: Vec<[u32; 3]>,
+        image_spans: Vec<(usize, usize)>,
+        digest: [u8; 32],
     ) -> Result<oneshot::Receiver<Result<Vec<Vec<f32>>, String>>, EngineError> {
         let (reply, receiver) = oneshot::channel();
         let job = Job {
             state,
             questions,
+            images: std::sync::Arc::new(images),
+            state_positions: std::sync::Arc::new(state_positions),
+            image_spans: std::sync::Arc::new(image_spans),
+            digest,
             submitted: Instant::now(),
             reply,
         };
@@ -177,12 +193,24 @@ fn run_jobs(
     state_cache_bytes: usize,
     host_state_cache_bytes: usize,
 ) {
+    // A client that disconnected before the worker starts must not pay for a
+    // cold image encode or state capture.
+    let jobs: Vec<Job> = jobs
+        .into_iter()
+        .filter(|job| !job.reply.is_closed())
+        .collect();
+    if jobs.is_empty() {
+        return;
+    }
     // Preserve first-seen state order so co-batched replies stay deterministic.
-    let mut groups: Vec<(Vec<u32>, Vec<Job>)> = Vec::new();
+    let mut groups: Vec<(Vec<u32>, [u8; 32], Vec<Job>)> = Vec::new();
     for job in jobs {
-        match groups.iter_mut().find(|(state, _)| *state == job.state) {
-            Some((_, members)) => members.push(job),
-            None => groups.push((job.state.clone(), vec![job])),
+        match groups
+            .iter_mut()
+            .find(|(state, digest, _)| *state == job.state && *digest == job.digest)
+        {
+            Some((_, _, members)) => members.push(job),
+            None => groups.push((job.state.clone(), job.digest, vec![job])),
         }
     }
     // Cost-aware scheduling, opt-in for A/B: shortest estimated GPU work
@@ -191,7 +219,7 @@ fn run_jobs(
         .map(|value| value != "0")
         .unwrap_or(false)
     {
-        groups.sort_by_key(|(state, jobs)| {
+        groups.sort_by_key(|(state, digest, jobs)| {
             let age_ms = jobs
                 .iter()
                 .map(|job| job.submitted.elapsed().as_millis() as usize)
@@ -205,7 +233,10 @@ fn run_jobs(
                 .flat_map(|job| job.questions.iter())
                 .map(|question| question.len())
                 .sum::<usize>();
-            let state_cost = if cache.iter().any(|entry| entry.state == *state) {
+            let state_cost = if cache
+                .iter()
+                .any(|entry| same_state_identity(state, digest, &entry.state, &entry.digest))
+            {
                 0
             } else {
                 state.len()
@@ -213,10 +244,11 @@ fn run_jobs(
             state_cost + questions
         });
     }
-    for (state, jobs) in groups {
+    for (state, digest, jobs) in groups {
         run_group(
             engine,
             &state,
+            digest,
             jobs,
             cache,
             host_cache,
@@ -227,9 +259,19 @@ fn run_jobs(
     }
 }
 
+fn same_state_identity(
+    state: &[u32],
+    digest: &[u8; 32],
+    cached: &[u32],
+    cached_digest: &[u8; 32],
+) -> bool {
+    state == cached && digest == cached_digest
+}
+
 fn run_group(
     engine: &Engine,
     state: &[u32],
+    digest: [u8; 32],
     jobs: Vec<Job>,
     cache: &mut Vec<CachedState>,
     host_cache: &mut Vec<HostCachedState>,
@@ -237,9 +279,13 @@ fn run_group(
     state_cache_bytes: usize,
     host_state_cache_bytes: usize,
 ) {
-    let cached = cache.iter().position(|entry| entry.state == state);
+    let cached = cache
+        .iter()
+        .position(|entry| same_state_identity(state, &digest, &entry.state, &entry.digest));
     let mut host_cached = if cached.is_none() {
-        host_cache.iter().position(|entry| entry.state == state)
+        host_cache
+            .iter()
+            .position(|entry| same_state_identity(state, &digest, &entry.state, &entry.digest))
     } else {
         None
     };
@@ -279,7 +325,9 @@ fn run_group(
         }
         // Offloading other states may have evicted this one from the host L2.
         if host_cached.is_some() {
-            host_cached = host_cache.iter().position(|entry| entry.state == state);
+            host_cached = host_cache
+                .iter()
+                .position(|entry| same_state_identity(state, &digest, &entry.state, &entry.digest));
         }
     }
     let capture_started = Instant::now();
@@ -292,6 +340,7 @@ fn run_group(
         match StateCache::restore(&host_entry.cache, &engine.gpu) {
             Ok(restored) => CachedState {
                 state: state.to_vec(),
+                digest,
                 cache: restored,
                 bytes: entry_bytes,
             },
@@ -304,7 +353,49 @@ fn run_group(
             }
         }
     } else {
-        let mut captured = engine.capture_state(state);
+        let mut vision_features = None;
+        if !jobs[0].images.is_empty() {
+            let inputs: Vec<VisionInput<'_>> = jobs[0]
+                .images
+                .iter()
+                .map(|image| VisionInput {
+                    patches: &image.patches,
+                    grid: VisionGrid {
+                        grid_t: image.grid_t,
+                        grid_h: image.grid_h,
+                        grid_w: image.grid_w,
+                    },
+                })
+                .collect();
+            vision_features = match engine.vision_encode(&inputs) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    let message = format!("image encoding failed: {error}");
+                    for job in jobs {
+                        let _ = job.reply.send(Err(message.clone()));
+                    }
+                    return;
+                }
+            };
+        }
+        let mut captured = match vision_features.as_ref() {
+            Some(v) => {
+                if jobs[0].state_positions.len() != state.len() {
+                    let message = "state positions do not match the state tokens".to_owned();
+                    for job in jobs {
+                        let _ = job.reply.send(Err(message.clone()));
+                    }
+                    return;
+                }
+                engine.capture_state_mm(
+                    state,
+                    &jobs[0].state_positions,
+                    &jobs[0].image_spans,
+                    Some(&v.features),
+                )
+            }
+            None => engine.capture_state(state),
+        };
         if captured
             .as_ref()
             .is_err_and(|error| error.to_string().contains("out of memory"))
@@ -321,11 +412,20 @@ fn run_group(
                 host_state_cache_bytes,
                 "state capture retry",
             );
-            captured = engine.capture_state(state);
+            captured = match vision_features.as_ref() {
+                Some(v) => engine.capture_state_mm(
+                    state,
+                    &jobs[0].state_positions,
+                    &jobs[0].image_spans,
+                    Some(&v.features),
+                ),
+                None => engine.capture_state(state),
+            };
         }
         match captured {
             Ok(captured) => CachedState {
                 state: state.to_vec(),
+                digest,
                 cache: captured,
                 bytes: entry_bytes,
             },
@@ -556,6 +656,7 @@ fn host_insert(
     };
     host_cache.push(HostCachedState {
         state: entry.state,
+        digest: entry.digest,
         cache: host,
         bytes,
     });
@@ -563,5 +664,20 @@ fn host_insert(
     while total > budget && !host_cache.is_empty() {
         let removed = host_cache.remove(0);
         total = total.saturating_sub(removed.bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_state_identity;
+
+    #[test]
+    fn image_identity_includes_the_digest() {
+        let tokens = [1, 2, 3];
+        let red = [7u8; 32];
+        let blue = [8u8; 32];
+        assert!(same_state_identity(&tokens, &red, &tokens, &red));
+        assert!(!same_state_identity(&tokens, &red, &tokens, &blue));
+        assert!(!same_state_identity(&tokens, &red, &[1, 2, 4], &red));
     }
 }

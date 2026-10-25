@@ -19,7 +19,9 @@ use crate::{
     batch::BatchHandle,
     config::{Config, MAX_QUESTIONS, MAX_STATE_TOKENS},
     d3,
+    d3::ImageLayout,
     error::EngineError,
+    image_media::{ImageMedia, MAX_IMAGE_TOKENS, MAX_IMAGES},
 };
 
 #[derive(Clone)]
@@ -32,6 +34,8 @@ pub struct NativeBackend {
     tokenizer: Arc<Tokenizer>,
     queue: BatchHandle,
     d3: D3Config,
+    supports_vision: bool,
+    image_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl NativeBackend {
@@ -117,6 +121,7 @@ impl NativeBackend {
         );
 
         self_test(&engine, &tokenizer, &d3)?;
+        let supports_vision = engine.supports_vision();
         let queue = BatchHandle::spawn(
             engine,
             config.max_queue,
@@ -131,6 +136,8 @@ impl NativeBackend {
             tokenizer,
             queue,
             d3,
+            supports_vision,
+            image_slots: Arc::new(tokio::sync::Semaphore::new(4)),
         })
     }
 }
@@ -227,6 +234,10 @@ struct Prepared {
     counts: Vec<usize>,
     usage: Value,
     question_token_count: usize,
+    images: Vec<ImageMedia>,
+    state_positions: Vec<[u32; 3]>,
+    image_spans: Vec<(usize, usize)>,
+    digest: [u8; 32],
 }
 
 fn prepare_request(
@@ -234,15 +245,30 @@ fn prepare_request(
     codes: &[String],
     state: &Value,
     questions: &Map<String, Value>,
+    images: Vec<ImageMedia>,
 ) -> Result<Prepared, EngineError> {
     let mut state_ids: Option<Vec<u32>> = None;
     let mut blocks = Vec::with_capacity(questions.len());
     let mut counts = Vec::with_capacity(questions.len());
+    let mut state_positions = Vec::new();
+    let mut image_spans = Vec::new();
+    let image_layouts: Vec<ImageLayout> = images
+        .iter()
+        .map(|image| ImageLayout {
+            tokens: image.tokens(),
+            grid_h: image.grid_h,
+            grid_w: image.grid_w,
+        })
+        .collect();
     for (index, (name, question)) in questions.iter().enumerate() {
         let parsed = d3::parse_question(question)
             .map_err(|error| EngineError::Config(format!("question {name}: {error}")))?;
-        let text = d3::render(state, &parsed, codes)
-            .map_err(|error| EngineError::Config(format!("question {name}: {error}")))?;
+        let text = if images.is_empty() {
+            d3::render(state, &parsed, codes)
+        } else {
+            d3::render_image(state, &parsed, codes, images.len())
+        }
+        .map_err(|error| EngineError::Config(format!("question {name}: {error}")))?;
         if text.len() > (1 << 20) {
             return Err(EngineError::Config(format!(
                 "question {name} renders over the 1 MiB cap"
@@ -252,31 +278,54 @@ fn prepare_request(
         // state block is question-independent; subsequent questions tokenize
         // only their suffix and prepend those ids. This removes 63/64 copies
         // of a 2K-token state from a 64-question request.
-        let (head, tail) = if index == 0 {
-            let (ids, split) = d3::encode_split(tokenizer, &text, state)
-                .map_err(|error| EngineError::Config(format!("question {name}: {error}")))?;
-            if split >= ids.len() {
-                return Err(EngineError::Config(format!(
-                    "question {name} has no tokens after the state"
-                )));
+        let (head, tail, positions, spans) = if images.is_empty() {
+            if index == 0 {
+                let (ids, split) = d3::encode_split(tokenizer, &text, state)
+                    .map_err(|error| EngineError::Config(format!("question {name}: {error}")))?;
+                if split >= ids.len() {
+                    return Err(EngineError::Config(format!(
+                        "question {name} has no tokens after the state"
+                    )));
+                }
+                let pos = (0..split as u32).map(|t| [t, t, t]).collect();
+                (
+                    ids[..split].to_vec(),
+                    ids[split..].to_vec(),
+                    pos,
+                    Vec::new(),
+                )
+            } else {
+                let state_ids = state_ids.as_ref().ok_or_else(|| {
+                    EngineError::Internal("state tokens missing for a d3 question".to_owned())
+                })?;
+                let end = d3::state_end_char(&text, state)
+                    .map_err(|error| EngineError::Config(format!("question {name}: {error}")))?;
+                let suffix = tokenizer.encode(&text[end..], false).map_err(|error| {
+                    EngineError::Config(format!("question {name}: tokenizing suffix: {error}"))
+                })?;
+                let tail = suffix.get_ids().to_vec();
+                if tail.is_empty() {
+                    return Err(EngineError::Config(format!(
+                        "question {name} has no tokens after the state"
+                    )));
+                }
+                (state_ids.clone(), tail, Vec::new(), Vec::new())
             }
-            (ids[..split].to_vec(), ids[split..].to_vec())
         } else {
-            let state_ids = state_ids.as_ref().ok_or_else(|| {
-                EngineError::Internal("state tokens missing for a d3 question".to_owned())
-            })?;
-            let end = d3::state_end_char(&text, state)
+            let encoded = d3::encode_image_split(tokenizer, &text, state, &image_layouts)
                 .map_err(|error| EngineError::Config(format!("question {name}: {error}")))?;
-            let suffix = tokenizer.encode(&text[end..], false).map_err(|error| {
-                EngineError::Config(format!("question {name}: tokenizing suffix: {error}"))
-            })?;
-            let tail = suffix.get_ids().to_vec();
-            if tail.is_empty() {
+            let state_len = encoded.state_len;
+            if state_len >= encoded.ids.len() {
                 return Err(EngineError::Config(format!(
-                    "question {name} has no tokens after the state"
+                    "question {name} has no tokens after the image state"
                 )));
             }
-            (state_ids.clone(), tail)
+            (
+                encoded.ids[..state_len].to_vec(),
+                encoded.ids[state_len..].to_vec(),
+                encoded.positions[..state_len].to_vec(),
+                encoded.image_spans,
+            )
         };
         let split = head.len();
         if split > MAX_STATE_TOKENS || split + tail.len() > MAX_STATE_TOKENS {
@@ -291,7 +340,11 @@ fn prepare_request(
                     "the tokenized state differs across questions".to_owned(),
                 ));
             }
-            None => state_ids = Some(head),
+            None => {
+                state_positions = positions;
+                image_spans = spans;
+                state_ids = Some(head);
+            }
             _ => {}
         }
         blocks.push(tail);
@@ -303,12 +356,22 @@ fn prepare_request(
         "input_tokens": state_ids.len() as u64 + question_token_count as u64,
         "output_tokens": 0u64,
     });
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&(images.len() as u64).to_le_bytes());
+    for image in &images {
+        hasher.update(&image.digest);
+    }
+    let digest = *hasher.finalize().as_bytes();
     Ok(Prepared {
         state_ids,
         blocks,
         counts,
         usage,
         question_token_count,
+        images,
+        state_positions,
+        image_spans,
+        digest,
     })
 }
 
@@ -321,8 +384,9 @@ impl Backend for NativeBackend {
         &'a self,
         state: &'a Value,
         questions: &'a Map<String, Value>,
+        images: Vec<String>,
     ) -> D3Future<'a> {
-        Box::pin(async move { self.answers(state, questions).await })
+        Box::pin(async move { self.answers(state, questions, images).await })
     }
 }
 
@@ -331,6 +395,7 @@ impl NativeBackend {
         &self,
         state: &Value,
         questions: &Map<String, Value>,
+        raw_images: Vec<String>,
     ) -> Result<Value, EngineError> {
         if questions.is_empty() {
             return Err(EngineError::Config(
@@ -358,8 +423,38 @@ impl NativeBackend {
         let codes = self.d3.codes.clone();
         let state = state.clone();
         let questions_for_prepare = questions.clone();
+        if !raw_images.is_empty() && !self.supports_vision {
+            return Err(EngineError::Config(
+                "this checkpoint has no vision tower; image inputs are unavailable".to_owned(),
+            ));
+        }
+        let _image_slot = if raw_images.is_empty() {
+            None
+        } else {
+            Some(self.image_slots.clone().try_acquire_owned().map_err(|_| {
+                EngineError::Overloaded("image decoding is busy; retry shortly".to_owned())
+            })?)
+        };
         let prepared = tokio::task::spawn_blocking(move || {
-            prepare_request(&tokenizer, &codes, &state, &questions_for_prepare)
+            if raw_images.len() > MAX_IMAGES {
+                return Err(EngineError::Config(format!(
+                    "at most {MAX_IMAGES} images per request"
+                )));
+            }
+            let mut images = Vec::with_capacity(raw_images.len());
+            let mut image_tokens = 0usize;
+            for (i, value) in raw_images.iter().enumerate() {
+                let image = crate::image_media::decode_data_url(value)
+                    .map_err(|error| EngineError::Config(format!("images[{i}]: {error}")))?;
+                image_tokens += image.tokens();
+                if image_tokens > MAX_IMAGE_TOKENS {
+                    return Err(EngineError::Config(format!(
+                        "images expand to {image_tokens} vision tokens, over the {MAX_IMAGE_TOKENS} image-token budget"
+                    )));
+                }
+                images.push(image);
+            }
+            prepare_request(&tokenizer, &codes, &state, &questions_for_prepare, images)
         })
         .await
         .map_err(|error| EngineError::Internal(format!("tokenizer task failed: {error}")))??;
@@ -372,7 +467,14 @@ impl NativeBackend {
         let submit_started = Instant::now();
         let receiver = self
             .queue
-            .submit_state_once(prepared.state_ids, prepared.blocks)
+            .submit_state_once(
+                prepared.state_ids,
+                prepared.blocks,
+                prepared.images,
+                prepared.state_positions,
+                prepared.image_spans,
+                prepared.digest,
+            )
             .map_err(|error| match error {
                 EngineError::Overloaded(message) => EngineError::Overloaded(message),
                 other => EngineError::Internal(other.to_string()),

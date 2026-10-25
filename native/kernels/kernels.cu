@@ -2267,7 +2267,7 @@ __device__ __forceinline__ float warp_sum4(float x) {
 }
 
 // D is head_dim. Rows in shared memory are padded by PAD bf16 elements.
-template <int D>
+template <int D, bool CAUSAL = true>
 __device__ __forceinline__ void attention_tc_body(
     const bf16* __restrict__ q, const bf16* __restrict__ k,
     const bf16* __restrict__ v, bf16* __restrict__ out, int seq, int n_heads,
@@ -2293,7 +2293,7 @@ __device__ __forceinline__ void attention_tc_body(
   const int row0 = wm * 16;
   const int dim0 = wn * HALF;
 
-  const int nkeys = min(q_start + BLOCK_M, seq);
+  const int nkeys = CAUSAL ? min(q_start + BLOCK_M, seq) : seq;
   const int ntiles = (nkeys + BLOCK_N - 1) / BLOCK_N;
 
   // ---- prologue: Q + first K/V tile -------------------------------------
@@ -2383,15 +2383,20 @@ __device__ __forceinline__ void attention_tc_body(
     }
 
     // ---- causal mask + online softmax -----------------------------------
-    const bool need_mask = ((j + 1) * BLOCK_N - 1) > q_start;
-    if (need_mask) {
+    const bool causal_mask = CAUSAL && ((j + 1) * BLOCK_N - 1) > q_start;
+    const bool tail_mask = (j + 1) * BLOCK_N > seq;
+    if (causal_mask || tail_mask) {
 #pragma unroll
       for (int t = 0; t < 4; ++t) {
         const int col = j * BLOCK_N + t * 8 + lane_c;
-        s[t][0] = (col > qpos0) ? -INFINITY : s[t][0] * scale_l2;
-        s[t][1] = (col + 1 > qpos0) ? -INFINITY : s[t][1] * scale_l2;
-        s[t][2] = (col > qpos1) ? -INFINITY : s[t][2] * scale_l2;
-        s[t][3] = (col + 1 > qpos1) ? -INFINITY : s[t][3] * scale_l2;
+        const bool c0 = col >= seq || (CAUSAL && col > qpos0);
+        const bool c1 = col + 1 >= seq || (CAUSAL && col + 1 > qpos0);
+        const bool c2 = col >= seq || (CAUSAL && col > qpos1);
+        const bool c3 = col + 1 >= seq || (CAUSAL && col + 1 > qpos1);
+        s[t][0] = c0 ? -INFINITY : s[t][0] * scale_l2;
+        s[t][1] = c1 ? -INFINITY : s[t][1] * scale_l2;
+        s[t][2] = c2 ? -INFINITY : s[t][2] * scale_l2;
+        s[t][3] = c3 ? -INFINITY : s[t][3] * scale_l2;
       }
     } else {
 #pragma unroll
@@ -2516,3 +2521,159 @@ __device__ __forceinline__ void attention_tc_body(
 ATTN_TC_WRAPPER(64)
 ATTN_TC_WRAPPER(128)
 ATTN_TC_WRAPPER(256)
+
+extern "C" __global__ void __launch_bounds__(256, 1)
+    attention_tc_nc_bf16_d128(const __nv_bfloat16* __restrict__ q,
+                              const __nv_bfloat16* __restrict__ k,
+                              const __nv_bfloat16* __restrict__ v,
+                              __nv_bfloat16* __restrict__ out, int seq,
+                              int n_heads, int n_kv, float scale) {
+  attention_tc_body<128, false>(q, k, v, out, seq, n_heads, n_kv, scale);
+}
+
+// ===========================================================================
+// Vision tower kernels (BF16, SM89)
+// ===========================================================================
+
+extern "C" __global__ void layernorm_bf16(const bf16* __restrict__ x,
+                                           const bf16* __restrict__ w,
+                                           const bf16* __restrict__ b,
+                                           bf16* __restrict__ out, int rows,
+                                           int cols, float eps) {
+  extern __shared__ float red[];
+  int row = blockIdx.x;
+  int tid = threadIdx.x;
+  float sum = 0.f, sq = 0.f;
+  for (int i = tid; i < cols; i += blockDim.x) {
+    float v = bf2f(x[(long)row * cols + i]);
+    sum += v;
+    sq += v * v;
+  }
+  red[tid] = sum;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  float mean = red[0] / cols;
+  __syncthreads();
+  red[tid] = sq;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) red[tid] += red[tid + s];
+    __syncthreads();
+  }
+  float inv = rsqrtf(fmaxf(red[0] / cols - mean * mean, 0.f) + eps);
+  for (int i = tid; i < cols; i += blockDim.x) {
+    float v = (bf2f(x[(long)row * cols + i]) - mean) * inv;
+    v = v * bf2f(w[i]) + bf2f(b[i]);
+    out[(long)row * cols + i] = f2bf(v);
+  }
+}
+
+extern "C" __global__ void add_bias_bf16(bf16* __restrict__ x,
+                                          const bf16* __restrict__ bias, int rows,
+                                          int cols) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < (long)rows * cols) x[i] = f2bf(bf2f(x[i]) + bf2f(bias[i % cols]));
+}
+
+extern "C" __global__ void gelu_tanh_bf16(bf16* __restrict__ x, long n) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float v = bf2f(x[i]);
+    x[i] = f2bf(0.5f * v * (1.f + tanhf(0.7978845608028654f *
+                                      (v + 0.044715f * v * v * v))));
+  }
+}
+
+extern "C" __global__ void gelu_exact_bf16(bf16* __restrict__ x, long n) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) {
+    float v = bf2f(x[i]);
+    x[i] = f2bf(0.5f * v * (1.f + erff(v * 0.7071067811865476f)));
+  }
+}
+
+// qkv [rows, 3, 16, 72] -> q,k,v [rows, 16, 128], zero padded tail.
+extern "C" __global__ void vision_split_qkv_bf16(
+    const bf16* __restrict__ qkv, bf16* __restrict__ q, bf16* __restrict__ k,
+    bf16* __restrict__ v, int rows, int heads, int hd, int hd_pad) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  long total = (long)rows * 3 * heads * hd;
+  if (i >= total) return;
+  int d = i % hd;
+  long t = i / hd;
+  int h = t % heads;
+  int part = (t / heads) % 3;
+  long row = t / (heads * 3);
+  bf16* dst = part == 0 ? q : (part == 1 ? k : v);
+  dst[((long)row * heads + h) * hd_pad + d] = qkv[i];
+  if (d < hd_pad - hd)
+    dst[((long)row * heads + h) * hd_pad + hd + d] = f2bf(0.f);
+}
+
+extern "C" __global__ void vision_rope_qk_bf16(
+    bf16* __restrict__ q, bf16* __restrict__ k,
+    const bf16* __restrict__ cos, const bf16* __restrict__ sin, int rows,
+    int heads, int hd, int hd_pad, int rotary) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  int half = rotary / 2;
+  long total = (long)rows * heads * half;
+  if (i >= total) return;
+  int j = i % half;
+  long t = i / half;
+  int h = t % heads;
+  long row = t / heads;
+  float c = bf2f(cos[row * rotary + j]);
+  float s = bf2f(sin[row * rotary + j]);
+  bf16* qb = q + ((long)row * heads + h) * hd_pad;
+  bf16* kb = k + ((long)row * heads + h) * hd_pad;
+  float a = bf2f(qb[j]), b = bf2f(qb[j + half]);
+  qb[j] = f2bf(a * c - b * s);
+  qb[j + half] = f2bf(b * c + a * s);
+  a = bf2f(kb[j]); b = bf2f(kb[j + half]);
+  kb[j] = f2bf(a * c - b * s);
+  kb[j + half] = f2bf(b * c + a * s);
+}
+
+extern "C" __global__ void vision_extract_bf16(
+    const bf16* __restrict__ padded, bf16* __restrict__ out, int rows, int heads,
+    int hd, int hd_pad) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (long)rows * heads * hd) return;
+  int d = i % hd;
+  long t = i / hd;
+  int h = t % heads;
+  long row = t / heads;
+  out[i] = padded[((long)row * heads + h) * hd_pad + d];
+}
+
+// Copy normalized patches into 2x2 merge blocks: [rows,1152] -> [rows/4,4608].
+extern "C" __global__ void vision_merge_bf16(const bf16* __restrict__ x,
+                                              bf16* __restrict__ out, int rows,
+                                              int cols) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (long)(rows / 4) * cols * 4) return;
+  int c = i % cols;
+  long t = i / cols;
+  int within = t % 4;
+  long group = t / 4;
+  out[(long)group * cols * 4 + within * cols + c] = x[(group * 4 + within) * cols + c];
+}
+
+extern "C" __global__ void scatter_rows_bf16(
+    const bf16* __restrict__ src, const int* __restrict__ rows,
+    bf16* __restrict__ dst, int n, int cols) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= (long)n * cols) return;
+  int c = i % cols;
+  long r = i / cols;
+  dst[(long)rows[r] * cols + c] = src[i];
+}
+
+extern "C" __global__ void add_rows_bf16(bf16* __restrict__ x,
+                                          const bf16* __restrict__ add, long n) {
+  long i = (long)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) x[i] = f2bf(bf2f(x[i]) + bf2f(add[i]));
+}

@@ -13,3 +13,6 @@ python3 eval/d3_bench.py --url http://127.0.0.1:8899 \
 ```
 
 `requirements.txt` is intentionally empty: both tools use the standard library.
+
+- `image_api.py` smoke-tests the live image API (PNG/JPEG/WebP, edge
+  resolutions, RGBA/L/P, two images, malformed data, and image-cache identity).

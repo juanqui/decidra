@@ -9,7 +9,7 @@ use decidra_native::Engine;
 #[ignore = "requires the quantized d3-turbo checkpoint on GPU1"]
 fn d3_eval() {
     let model = std::env::var("DECIDRA_D3_MODEL")
-        .unwrap_or_else(|_| "/srv/models/d3-turbo-w4a8-g64-v4".to_string());
+        .unwrap_or_else(|_| "/srv/models/d3-turbo-w4a8-vision-v1".to_string());
     let probe =
         std::env::var("DECIDRA_D3_PROBE").unwrap_or_else(|_| "/tmp/d3_probe.json".to_string());
     let out =

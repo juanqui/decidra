@@ -14,6 +14,7 @@ pub mod batch;
 pub mod config;
 pub mod d3;
 pub mod error;
+pub mod image_media;
 #[cfg(feature = "native")]
 pub mod native_backend;
 pub mod pyjson;

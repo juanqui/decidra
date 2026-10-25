@@ -17,7 +17,12 @@ use axum::{
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde_json::{Value, json};
 
-use crate::{backend::Backend, config::Config, error::EngineError};
+use crate::{
+    backend::Backend,
+    config::Config,
+    error::EngineError,
+    image_media::{MAX_ENCODED, MAX_IMAGES},
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -109,9 +114,43 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
         .get("state")
         .cloned()
         .unwrap_or_else(|| Value::String(String::new()));
+    let images: Vec<String> = match object.get("images") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(values)) => {
+            if values.len() > MAX_IMAGES {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    format!("at most {MAX_IMAGES} images per request"),
+                );
+            }
+            let max_encoded = MAX_ENCODED.saturating_mul(4).div_ceil(3) + 128;
+            let mut out = Vec::with_capacity(values.len());
+            for (i, value) in values.iter().enumerate() {
+                let Some(value) = value.as_str() else {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        format!("images[{i}] must be a data URL string"),
+                    );
+                };
+                if value.len() > max_encoded {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        format!("images[{i}] exceeds the encoded image limit"),
+                    );
+                }
+                out.push(value.to_owned());
+            }
+            out
+        }
+        Some(_) => return error(StatusCode::BAD_REQUEST, "images must be an array"),
+    };
 
     metrics::counter!("decidra_systemone_requests_total").increment(1);
-    match state.backend.d3_answers(&state_value, questions).await {
+    match state
+        .backend
+        .d3_answers(&state_value, questions, images)
+        .await
+    {
         Ok(mut value) => {
             if let Some(object) = value.as_object_mut() {
                 object.insert(
@@ -141,10 +180,25 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
         Err(EngineError::Timeout(_)) => {
             error(StatusCode::GATEWAY_TIMEOUT, "d3-turbo request timed out")
         }
-        Err(EngineError::Backend(message)) | Err(EngineError::BadResponse(message)) => {
-            error(StatusCode::BAD_GATEWAY, message)
+        Err(EngineError::Backend(message)) => {
+            tracing::error!(%message, "d3-turbo backend failed");
+            if message.contains("memory") || message.contains("out of capacity") {
+                error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "d3-turbo is out of capacity",
+                )
+            } else {
+                error(StatusCode::BAD_GATEWAY, "d3-turbo backend failed")
+            }
         }
-        Err(EngineError::Internal(message)) => error(StatusCode::INTERNAL_SERVER_ERROR, message),
+        Err(EngineError::BadResponse(message)) => {
+            tracing::error!(%message, "d3-turbo returned an invalid response");
+            error(StatusCode::BAD_GATEWAY, "d3-turbo backend failed")
+        }
+        Err(EngineError::Internal(message)) => {
+            tracing::error!(%message, "d3-turbo internal error");
+            error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+        }
     }
 }
 

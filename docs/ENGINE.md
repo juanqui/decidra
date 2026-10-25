@@ -92,8 +92,8 @@ Build with `--features native` and start with:
 
 ```
 CUDA_VISIBLE_DEVICES=0 DECIDRA_BIND_ADDR=127.0.0.1:8899 \
-DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-g64-v4 \
-DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-g64-v4 \
+DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-vision-v1 \
+DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-vision-v1 \
 DECIDRA_NATIVE_GPU_EMBED=0 ./target/release/decidra
 ```
 
@@ -107,9 +107,16 @@ broken mask, artifact or FlashInfer build refuses to serve. A missing
 `prefix_bidir` config, missing `readout.safetensors`, or non-d3 checkpoint is a
 startup error.
 
-Text only: image/video states return an error until the vision tower is
-ported. Per request: at most 64 questions; each question's state plus its own
-block is at most 32K tokens. The serving worker coalesces requests, keeps an
+Images are supported when the checkpoint carries the 27-block Qwen3.5 vision
+tower. The runtime decodes strict PNG/JPEG/WebP data URLs, applies the Qwen2VL
+`smart_resize` resize and bicubic filter, runs the BF16 vision tower, scatters the
+projected features into the state embeddings, and captures the state with the
+image's mRoPE positions. Requests are capped at 16 images and 8,192 expanded
+vision tokens; image decode is dimension-checked before allocation and limited
+to four concurrent blocking decoders. The vision tower is never quantized: the final
+artifact is W4A8 language weights plus BF16 `visual.*` tensors. Video remains
+unsupported. Per request: at most 64 questions; each question's state plus its
+own block is at most 32K tokens. The serving worker coalesces requests, keeps an
 exact-state cache and host L2, and combines question blocks from all requests sharing a
 state. On H100/H200, `DECIDRA_STATE_ONCE_MAX_ROWS` (default 64) can be raised
 to amortize weight reads across coalesced requests; the engine still splits at
@@ -135,9 +142,13 @@ exported as `semel_state_cache_*`, `semel_host_cache_states`, and
 The shipped recipe is **GPTQ-only, INT4 symmetric group 64, INT8 per-token
 activations with per-64-group scales**, 1,024 block-masked calibration rows.
 AWQ is not shipped: both AWQ+GPTQ test artifacts were far from BF16 (max Δp
-0.50), while GPTQ-only stayed within 0.04 on the same row. The shipped v4
-artifact quantizes `in_proj_a|b` as well; a v5 control kept them BF16 and was
-slightly worse on the 32-row gate (30/32 vs 31/32), so v4 is the artifact.
+0.50), while GPTQ-only stayed within 0.04 on the same row. The vision artifact
+keeps the proven v4 language weights (31/32 on the 32-row gate) and merges the
+333 source `visual.*` tensors in BF16. A fresh GPTQ run with the 1k calibration
+file regressed to 29/32 and was rejected; image decisions still match the BF16
+Python reference 13/13 on the image eval corpus. The quantizer's `post()` step
+now injects `attention_mode=prefix_bidir`, merges the BF16 visual tensors, and
+copies the readout and runtime files.
 
 The previous W4A8 artifact was quantized from **randomly initialized weights**
 because `llmcompressor.oneshot(model=<path>)` loaded `AutoModelForCausalLM`
@@ -154,7 +165,7 @@ bit-exactly, and uses the real block mask for calibration:
 The GDN layers receive the 2-D padding mask. The mask path is
 `Qwen3_5TextModel.forward`'s `attention_mask` dict.
 
-Artifact: `/srv/models/d3-turbo-w4a8-g64-v4` (15 GB after stripping the
+Artifact: `/srv/models/d3-turbo-w4a8-vision-v1` (15 GB after stripping the
 CausalLM `lm_head`). Dequant gate: 496/496 modules pass cosine ≥ 0.95 against
 the BF16 source; the v4 32-row eval passes:
 
@@ -394,13 +405,13 @@ CUDA_VISIBLE_DEVICES=1 DECIDRA_NATIVE_CACHE=0 DECIDRA_GDN_CHUNKED=1 \
 # 2K state, 64 questions
 CUDA_VISIBLE_DEVICES=1 DECIDRA_MARLIN=1 DECIDRA_INT8=1 DECIDRA_INT8_GROUP=1 \
   DECIDRA_PRELOAD=1 DECIDRA_GDN_CHUNKED=1 DECIDRA_GDN_CHUNK_MIN=16 \
-  DECIDRA_D3_MODEL=/srv/models/d3-turbo-w4a8-g64-v4 \
+  DECIDRA_D3_MODEL=/srv/models/d3-turbo-w4a8-vision-v1 \
   DECIDRA_D3_PROBE="$ROOT/eval/data/d3_once_64_2k.json" \
   cargo test --release -p decidra-native --test d3_perf -- --ignored --nocapture
 
 # artifact dequant gate
 python3 quant/d3turbo/verify_quant.py \
-  --quant /srv/models/d3-turbo-w4a8-g64-v4 --group 64
+  --quant /srv/models/d3-turbo-w4a8-vision-v1 --group 64
 ```
 
 ## 7. Remaining work

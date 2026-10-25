@@ -49,6 +49,17 @@ pub struct Kernels {
     pub quant_int8_group_silu_bf16: CudaFunction,
     pub quant_fp8_bf16: CudaFunction,
     pub quant_nvfp4_bf16: CudaFunction,
+    pub attention_tc_nc_128: CudaFunction,
+    pub layernorm_bf16: CudaFunction,
+    pub add_bias_bf16: CudaFunction,
+    pub gelu_tanh_bf16: CudaFunction,
+    pub gelu_exact_bf16: CudaFunction,
+    pub vision_split_qkv_bf16: CudaFunction,
+    pub vision_rope_qk_bf16: CudaFunction,
+    pub vision_extract_bf16: CudaFunction,
+    pub vision_merge_bf16: CudaFunction,
+    pub scatter_rows_bf16: CudaFunction,
+    pub add_rows_bf16: CudaFunction,
     pub scale_fp8_gemm: CudaFunction,
     pub dequant_w4a16: CudaFunction,
     pub gemm_w4a16: CudaFunction,
@@ -178,6 +189,24 @@ impl Kernels {
             quant_int8_group_silu_bf16: gpu.func("quant_int8_group_silu_bf16")?,
             quant_fp8_bf16: gpu.func("quant_fp8_per_token_bf16")?,
             quant_nvfp4_bf16: gpu.func("quant_nvfp4_act_bf16")?,
+            attention_tc_nc_128: {
+                let f = gpu.func("attention_tc_nc_bf16_d128")?;
+                f.set_attribute(
+                    CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+                    52224,
+                )?;
+                f
+            },
+            layernorm_bf16: gpu.func("layernorm_bf16")?,
+            add_bias_bf16: gpu.func("add_bias_bf16")?,
+            gelu_tanh_bf16: gpu.func("gelu_tanh_bf16")?,
+            gelu_exact_bf16: gpu.func("gelu_exact_bf16")?,
+            vision_split_qkv_bf16: gpu.func("vision_split_qkv_bf16")?,
+            vision_rope_qk_bf16: gpu.func("vision_rope_qk_bf16")?,
+            vision_extract_bf16: gpu.func("vision_extract_bf16")?,
+            vision_merge_bf16: gpu.func("vision_merge_bf16")?,
+            scatter_rows_bf16: gpu.func("scatter_rows_bf16")?,
+            add_rows_bf16: gpu.func("add_rows_bf16")?,
             scale_fp8_gemm: gpu.func("scale_fp8_gemm_bf16")?,
             dequant_w4a16: gpu.func("dequant_w4a16_bf16")?,
             marlin_cfgs: {
@@ -2157,5 +2186,246 @@ pub fn gather_rows(
     l.arg(&nr);
     l.arg(&c);
     unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn attention_noncausal_128<Q, K, V, O>(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    q: &Q,
+    kk: &K,
+    v: &V,
+    out: &mut O,
+    seq: usize,
+    n_heads: usize,
+    n_kv: usize,
+    scale: f32,
+) -> Result<()>
+where
+    Q: DevicePtr<bf16>,
+    K: DevicePtr<bf16>,
+    V: DevicePtr<bf16>,
+    O: DevicePtrMut<bf16>,
+{
+    let cfg = LaunchConfig {
+        grid_dim: (seq.div_ceil(64) as u32, n_heads as u32, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 52224,
+    };
+    let (seq_i, nh, nkv) = (seq as i32, n_heads as i32, n_kv as i32);
+    let (qp, _r0) = q.device_ptr(&gpu.stream);
+    let (kp, _r1) = kk.device_ptr(&gpu.stream);
+    let (vp, _r2) = v.device_ptr(&gpu.stream);
+    let (op, _r3) = out.device_ptr_mut(&gpu.stream);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(&qp);
+    l.arg(&kp);
+    l.arg(&vp);
+    l.arg(&op);
+    l.arg(&seq_i);
+    l.arg(&nh);
+    l.arg(&nkv);
+    l.arg(&scale);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+pub fn layernorm(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    w: &CudaSlice<bf16>,
+    b: &CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+    rows: usize,
+    cols: usize,
+    eps: f32,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: (rows as u32, 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 1024,
+    };
+    let (r, c) = (rows as i32, cols as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(w);
+    l.arg(b);
+    l.arg(out);
+    l.arg(&r);
+    l.arg(&c);
+    l.arg(&eps);
+    unsafe { l.launch(cfg) }?;
+    Ok(())
+}
+
+pub fn add_bias(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &mut CudaSlice<bf16>,
+    bias: &CudaSlice<bf16>,
+    rows: usize,
+    cols: usize,
+) -> Result<()> {
+    let n = rows * cols;
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(bias);
+    let (r, c) = (rows as i32, cols as i32);
+    l.arg(&r);
+    l.arg(&c);
+    unsafe { l.launch(cfg_1d(n, 256)) }?;
+    Ok(())
+}
+
+pub fn gelu(gpu: &Gpu, f: &CudaFunction, x: &mut CudaSlice<bf16>, n: usize) -> Result<()> {
+    let nn = n as i64;
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(&nn);
+    unsafe { l.launch(cfg_1d(n, 256)) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn vision_split_qkv(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    qkv: &CudaSlice<bf16>,
+    q: &mut CudaSlice<bf16>,
+    k: &mut CudaSlice<bf16>,
+    v: &mut CudaSlice<bf16>,
+    rows: usize,
+    heads: usize,
+    hd: usize,
+    hd_pad: usize,
+) -> Result<()> {
+    let n = rows * 3 * heads * hd;
+    let (r, h, d, dp) = (rows as i32, heads as i32, hd as i32, hd_pad as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(qkv);
+    l.arg(q);
+    l.arg(k);
+    l.arg(v);
+    l.arg(&r);
+    l.arg(&h);
+    l.arg(&d);
+    l.arg(&dp);
+    unsafe { l.launch(cfg_1d(n, 256)) }?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn vision_rope(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    q: &mut CudaSlice<bf16>,
+    k: &mut CudaSlice<bf16>,
+    cos: &CudaSlice<bf16>,
+    sin: &CudaSlice<bf16>,
+    rows: usize,
+    heads: usize,
+    hd: usize,
+    hd_pad: usize,
+    rotary: usize,
+) -> Result<()> {
+    let n = rows * heads * (rotary / 2);
+    let (r, h, d, dp, ro) = (
+        rows as i32,
+        heads as i32,
+        hd as i32,
+        hd_pad as i32,
+        rotary as i32,
+    );
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(q);
+    l.arg(k);
+    l.arg(cos);
+    l.arg(sin);
+    l.arg(&r);
+    l.arg(&h);
+    l.arg(&d);
+    l.arg(&dp);
+    l.arg(&ro);
+    unsafe { l.launch(cfg_1d(n, 256)) }?;
+    Ok(())
+}
+
+pub fn vision_extract(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    padded: &CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+    rows: usize,
+    heads: usize,
+    hd: usize,
+    hd_pad: usize,
+) -> Result<()> {
+    let n = rows * heads * hd;
+    let (r, h, d, dp) = (rows as i32, heads as i32, hd as i32, hd_pad as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(padded);
+    l.arg(out);
+    l.arg(&r);
+    l.arg(&h);
+    l.arg(&d);
+    l.arg(&dp);
+    unsafe { l.launch(cfg_1d(n, 256)) }?;
+    Ok(())
+}
+
+pub fn vision_merge(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &CudaSlice<bf16>,
+    out: &mut CudaSlice<bf16>,
+    rows: usize,
+    cols: usize,
+) -> Result<()> {
+    let n = (rows / 4) * cols * 4;
+    let (r, c) = (rows as i32, cols as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(out);
+    l.arg(&r);
+    l.arg(&c);
+    unsafe { l.launch(cfg_1d(n, 256)) }?;
+    Ok(())
+}
+
+pub fn scatter_rows(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    src: &CudaSlice<bf16>,
+    rows: &CudaSlice<i32>,
+    dst: &mut CudaSlice<bf16>,
+    n: usize,
+    cols: usize,
+) -> Result<()> {
+    let (nn, c) = (n as i32, cols as i32);
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(src);
+    l.arg(rows);
+    l.arg(dst);
+    l.arg(&nn);
+    l.arg(&c);
+    unsafe { l.launch(cfg_1d(n * cols, 256)) }?;
+    Ok(())
+}
+
+pub fn add_rows(
+    gpu: &Gpu,
+    f: &CudaFunction,
+    x: &mut CudaSlice<bf16>,
+    add: &CudaSlice<bf16>,
+    n: usize,
+) -> Result<()> {
+    let nn = n as i64;
+    let mut l = gpu.stream.launch_builder(f);
+    l.arg(x);
+    l.arg(add);
+    l.arg(&nn);
+    unsafe { l.launch(cfg_1d(n, 256)) }?;
     Ok(())
 }

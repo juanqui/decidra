@@ -17,6 +17,7 @@ use crate::config::{AttentionMode, Config};
 use crate::cuda::Gpu;
 use crate::kernels::{self, Kernels};
 use crate::tensor::Store;
+use crate::vision::VisionModel;
 use crate::weights::{
     Fp8Weight, FullAttentionWeights, GdnWeights, LayerWeights, LinearWeight, Lora, MixerWeights,
     NvFp4Weight, WeightProvider,
@@ -387,6 +388,7 @@ pub struct Engine {
     pub noncausal_full: bool,
     /// Separate F32 decision head (`readout.safetensors`) required by d3-turbo.
     readout: Option<HeadMatrix>,
+    pub(crate) vision: Option<VisionModel>,
     pub store: Store,
     pub kernels: Kernels,
     /// Resident weights. Populated lazily by the CLI layer tests (merged BF16 is
@@ -518,6 +520,8 @@ struct LayerIo<'a> {
     cascade_layer: Option<usize>,
     /// Bit-packed `[seq, seq]` block mask, built once per per-row forward.
     custom_mask: Option<&'a CudaSlice<u8>>,
+    /// Precomputed mRoPE tables shared by every layer in one state capture.
+    rope: Option<&'a (CudaSlice<bf16>, CudaSlice<bf16>)>,
 }
 
 /// A d3-turbo state block, encoded once and forked by every question.
@@ -528,6 +532,8 @@ struct LayerIo<'a> {
 /// invariant: no state token ever sees a question.
 pub struct StateCache {
     pub state_len: usize,
+    /// First text position after the state block (state_len for text-only).
+    pub pos_end: u32,
     kv: Vec<Option<(CudaSlice<bf16>, CudaSlice<bf16>)>>,
     gdn_state: Vec<Option<CudaSlice<f32>>>,
     gdn_hist: Vec<Option<CudaSlice<bf16>>>,
@@ -538,6 +544,7 @@ pub struct StateCache {
 /// full state capture.
 pub struct HostStateCache {
     pub state_len: usize,
+    pub pos_end: u32,
     pub kv: Vec<Option<(Vec<bf16>, Vec<bf16>)>>,
     pub gdn_state: Vec<Option<Vec<f32>>>,
     pub gdn_hist: Vec<Option<Vec<bf16>>>,
@@ -587,6 +594,7 @@ impl StateCache {
             .collect::<Result<Vec<_>>>()?;
         Ok(HostStateCache {
             state_len: self.state_len,
+            pos_end: self.pos_end,
             kv,
             gdn_state,
             gdn_hist,
@@ -632,6 +640,7 @@ impl StateCache {
             .collect::<Result<Vec<_>>>()?;
         Ok(StateCache {
             state_len: host.state_len,
+            pos_end: host.pos_end,
             kv,
             gdn_state,
             gdn_hist,
@@ -774,6 +783,11 @@ impl HeadMatrix {
 }
 
 impl Engine {
+    /// True when the checkpoint carries the visual tower used by image requests.
+    pub fn supports_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
     pub fn new(model_dir: &std::path::Path) -> Result<Self> {
         let cfg = Config::from_dir(model_dir)?;
         if cfg.attention_mode != AttentionMode::BlockCascade {
@@ -824,11 +838,17 @@ impl Engine {
             HeadMatrix::load(&gpu, &readout_path)
                 .with_context(|| format!("loading {}", readout_path.display()))?,
         );
+        let vision = if store.contains("visual.patch_embed.proj.weight") {
+            Some(VisionModel::load(&store, &gpu).context("loading the Qwen3.5 vision tower")?)
+        } else {
+            None
+        };
         let mut engine = Self {
             gpu,
             cfg,
             noncausal_full,
             readout,
+            vision,
             store,
             kernels,
             weight_cache,
@@ -1288,7 +1308,7 @@ impl Engine {
         Ok(w)
     }
 
-    fn alloc_bf16(&self, n: usize) -> Result<Buf> {
+    pub(crate) fn alloc_bf16(&self, n: usize) -> Result<Buf> {
         {
             let mut pool = self.pool.free.lock().unwrap();
             if pool.len() > 128 {
@@ -1861,8 +1881,7 @@ impl Engine {
                 rd / 2,
             )?
         );
-        drop(cos);
-        drop(sin);
+        let _ = (cos, sin);
 
         // Attention resets at every sequence boundary; one launch per sequence
         // (attention is a small fraction of the forward).
@@ -2873,7 +2892,13 @@ impl Engine {
         }
 
         let rd = cfg.rotary_dim();
-        let (cos, sin) = self.rope_tables(seq)?;
+        let owned_rope;
+        let (cos, sin) = if let Some((c, s)) = io.rope {
+            (c, s)
+        } else {
+            owned_rope = self.rope_tables(seq)?;
+            (&owned_rope.0, &owned_rope.1)
+        };
         timed!(
             self,
             "rope",
@@ -2882,8 +2907,8 @@ impl Engine {
                 &self.kernels.rope,
                 &mut qn,
                 &mut kn,
-                &cos,
-                &sin,
+                cos,
+                sin,
                 seq,
                 heads,
                 kv,
@@ -2891,8 +2916,7 @@ impl Engine {
                 rd / 2,
             )?
         );
-        drop(cos);
-        drop(sin);
+        let _ = (cos, sin);
         if capture {
             self.dump_dev("attn_q_rope", &qn, seq, heads * hd)?;
             self.dump_dev("attn_k_rope", &kn, seq, kv * hd)?;
@@ -3115,7 +3139,8 @@ impl Engine {
                 true,
             )?
         );
-        let positions: Vec<usize> = (state_len..state_len + seq).collect();
+        let positions: Vec<usize> =
+            (cache.pos_end as usize..cache.pos_end as usize + seq).collect();
         let (cos, sin) = self.rope_tables_positions(&positions)?;
         timed!(
             self,
@@ -3134,8 +3159,7 @@ impl Engine {
                 cfg.rotary_dim() / 2,
             )?
         );
-        drop(cos);
-        drop(sin);
+        let _ = (cos, sin);
 
         let mut k_all = self.alloc_bf16(kv_len * kv * hd)?;
         let mut v_all = self.alloc_bf16(kv_len * kv * hd)?;
@@ -3602,6 +3626,48 @@ impl Engine {
         ))
     }
 
+    /// Qwen3.5 text mRoPE tables for per-token (T,H,W) positions. The text
+    /// kernel consumes the first half of the 64-wide rotary frequency vector;
+    /// the reference recomposition duplicates it.
+    fn rope_tables_mrope(
+        &self,
+        positions: &[[u32; 3]],
+    ) -> Result<(CudaSlice<bf16>, CudaSlice<bf16>)> {
+        let dim = self.cfg.rotary_dim();
+        let half = dim / 2;
+        let mut inv = vec![0f32; half];
+        for (i, v) in inv.iter_mut().enumerate() {
+            *v = 1.0 / self.cfg.rope_theta.powf((2 * i) as f32 / dim as f32);
+        }
+        let mut cos = vec![bf16::ZERO; positions.len() * half];
+        let mut sin = vec![bf16::ZERO; positions.len() * half];
+        for (t, p) in positions.iter().enumerate() {
+            let mut f = [[0f32; 32]; 3];
+            for axis in 0..3 {
+                for i in 0..half {
+                    f[axis][i] = p[axis] as f32 * inv[i];
+                }
+            }
+            let mut merged = f[0];
+            for axis in 1..3 {
+                let length = (self.cfg.mrope_section[axis] * 3).min(half);
+                let mut idx = axis;
+                while idx < length {
+                    merged[idx] = f[axis][idx];
+                    idx += 3;
+                }
+            }
+            for i in 0..half {
+                cos[t * half + i] = bf16::from_f32(merged[i].cos());
+                sin[t * half + i] = bf16::from_f32(merged[i].sin());
+            }
+        }
+        Ok((
+            self.gpu.stream.clone_htod(&cos)?,
+            self.gpu.stream.clone_htod(&sin)?,
+        ))
+    }
+
     /// C = x @ W^T for row-major bf16 buffers (cuBLAS column-major trick).
     /// Launch the Marlin INT8 tile group(s) for an already-quantized activation
     /// matrix. Split out so the fused SiLU-quant MLP path shares the exact
@@ -3684,7 +3750,7 @@ impl Engine {
         Ok(c)
     }
 
-    fn blas_gemm_bf16(
+    pub(crate) fn blas_gemm_bf16(
         &self,
         x: &CudaSlice<bf16>,
         m: usize,
@@ -4449,9 +4515,34 @@ impl Engine {
     /// and convolution tail. The state runs as one bidirectional row; no state
     /// token can see a question under the block-cascade mask.
     pub fn capture_state(&self, tokens: &[u32]) -> Result<StateCache> {
+        let positions: Vec<[u32; 3]> = (0..tokens.len() as u32).map(|t| [t, t, t]).collect();
+        self.capture_state_mm(tokens, &positions, &[], None)
+    }
+
+    /// Capture a state block that may begin with image tokens. `image_spans`
+    /// are `(token_start, token_count)` in the state tokens; `image_features`
+    /// holds the matching vision rows in order. `positions` are Qwen mRoPE
+    /// (T,H,W) positions for every state token.
+    pub fn capture_state_mm(
+        &self,
+        tokens: &[u32],
+        positions: &[[u32; 3]],
+        image_spans: &[(usize, usize)],
+        image_features: Option<&CudaSlice<bf16>>,
+    ) -> Result<StateCache> {
         let seq = tokens.len();
+        if positions.len() != seq {
+            bail!(
+                "{} state tokens but {} mRoPE positions",
+                seq,
+                positions.len()
+            );
+        }
         if seq < 2 {
             bail!("a state block needs at least two tokens, got {seq}");
+        }
+        if positions.len() != seq {
+            bail!("state positions {} != tokens {}", positions.len(), seq);
         }
         if self.cfg.attention_mode != AttentionMode::BlockCascade {
             bail!("a state cache is only valid for BlockCascade checkpoints");
@@ -4476,6 +4567,35 @@ impl Engine {
         let mut gdn_state: Vec<Option<CudaSlice<f32>>> = (0..layers).map(|_| None).collect();
         let mut gdn_hist: Vec<Option<CudaSlice<bf16>>> = (0..layers).map(|_| None).collect();
         let mut x = self.embed(tokens)?;
+        if let Some(features) = image_features {
+            let mut indices = Vec::new();
+            let mut base = 0usize;
+            for &(start, count) in image_spans {
+                if start + count > seq {
+                    bail!("image span {start}+{count} exceeds state {seq}");
+                }
+                indices.extend((0..count).map(|i| (start + i) as i32));
+                base += count;
+            }
+            if base == 0 || features.len() != base * cfg.hidden_size {
+                bail!(
+                    "image features have {} values, expected {}",
+                    features.len(),
+                    base * cfg.hidden_size
+                );
+            }
+            let idx = self.gpu.stream.clone_htod(&indices)?;
+            kernels::scatter_rows(
+                &self.gpu,
+                &self.kernels.scatter_rows_bf16,
+                features,
+                &idx,
+                &mut x,
+                base,
+                cfg.hidden_size,
+            )?;
+        }
+        let rope = self.rope_tables_mrope(positions)?;
         for i in 0..layers {
             let w = self.layer_weights(i)?;
             let mut captured = None;
@@ -4490,6 +4610,7 @@ impl Engine {
                         .stream
                         .alloc_zeros::<bf16>(seq * cfg.num_key_value_heads * cfg.head_dim)?;
                     let mut io = LayerIo {
+                        rope: Some(&rope),
                         k_out: Some(&mut k),
                         v_out: Some(&mut v),
                         ..LayerIo::default()
@@ -4515,6 +4636,7 @@ impl Engine {
                     let conv_dim = 2 * cfg.gdn_key_dim() + cfg.gdn_value_dim();
                     let mut hist = self.gpu.stream.alloc_zeros::<bf16>(3 * conv_dim)?;
                     let mut io = LayerIo {
+                        rope: Some(&rope),
                         gdn_state_out: Some(&mut state),
                         gdn_hist_out: Some(&mut hist),
                         ..LayerIo::default()
@@ -4535,8 +4657,15 @@ impl Engine {
             }
         }
         self.prof_report();
+        let pos_end = positions
+            .iter()
+            .map(|p| p[0].max(p[1]).max(p[2]))
+            .max()
+            .unwrap_or(0)
+            + 1;
         Ok(StateCache {
             state_len: seq,
+            pos_end,
             kv,
             gdn_state,
             gdn_hist,
@@ -4724,7 +4853,7 @@ impl Engine {
         }
         let flat = self.batch_tokens(questions)?;
         let mut b = BatchInfo::new(&self.gpu, questions)?;
-        b.pos_start = cache.state_len;
+        b.pos_start = cache.pos_end as usize;
         let total = b.total;
         self.prof.entries.lock().unwrap().clear();
         let low_mem = total >= 12_288;

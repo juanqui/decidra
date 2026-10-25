@@ -21,6 +21,7 @@ pub struct Config {
     pub linear_value_head_dim: usize,
     pub rope_theta: f32,
     pub partial_rotary_factor: f32,
+    pub mrope_section: [usize; 3],
     pub attn_output_gate: bool,
     /// Full-attention layers attend with the d3-turbo non-causal mask.
     /// GDN layers remain causal regardless.
@@ -85,6 +86,14 @@ impl Config {
             .as_f64()
             .or_else(|| c.get("partial_rotary_factor").and_then(|x| x.as_f64()))
             .unwrap_or(1.0) as f32;
+        let mut mrope_section = [11usize, 11, 10];
+        if let Some(a) = rope.get("mrope_section").and_then(Value::as_array) {
+            for (i, v) in a.iter().take(3).enumerate() {
+                if let Some(x) = v.as_u64() {
+                    mrope_section[i] = x as usize;
+                }
+            }
+        }
 
         // The d3-turbo contract declares its prompt attention in
         // decision_config.json.
@@ -152,6 +161,7 @@ impl Config {
                 .unwrap_or(128) as usize,
             rope_theta,
             partial_rotary_factor,
+            mrope_section,
             attn_output_gate: c
                 .get("attn_output_gate")
                 .and_then(|x| x.as_bool())

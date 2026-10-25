@@ -11,7 +11,7 @@ use anyhow::{Context, Result, bail};
 
 pub const DEFAULT_BIND_ADDR: &str = "0.0.0.0:8080";
 pub const DEFAULT_MODEL: &str = "vllm-sr/d3-turbo";
-pub const DEFAULT_CHECKPOINT: &str = "/srv/models/d3-turbo-w4a8-g64-v4";
+pub const DEFAULT_CHECKPOINT: &str = "/srv/models/d3-turbo-w4a8-vision-v1";
 pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_MAX_QUEUE: usize = 32;
 pub const DEFAULT_BATCH_REQUESTS: usize = 32;

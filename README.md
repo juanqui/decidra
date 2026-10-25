@@ -64,7 +64,7 @@ The published image targets SM89 (RTX 4090 / L40S):
 docker run --rm --gpus '"device=0"' \
   --user "$(id -u):$(id -g)" \
   -p 8080:8080 \
-  -v /srv/models/d3-turbo-w4a8-g64-v4:/models:ro \
+  -v /srv/models/d3-turbo-w4a8-vision-v1:/models:ro \
   ghcr.io/juanqui/decidra:0.2.0
 ```
 
@@ -83,7 +83,7 @@ docker build --build-arg CUDA_ARCH=sm_120 -t decidra:0.2.0-rtx-pro-6000 .
 Or use the provided compose file:
 
 ```bash
-DECIDRA_MODEL_DIR=/srv/models/d3-turbo-w4a8-g64-v4 \
+DECIDRA_MODEL_DIR=/srv/models/d3-turbo-w4a8-vision-v1 \
 DECIDRA_GPU=0 docker compose up -d --build
 ```
 
@@ -100,8 +100,8 @@ DECIDRA_CUDA_ARCH=sm_90 cargo build --release --locked --features native
 DECIDRA_CUDA_ARCH=sm_120 cargo build --release --locked --features native
 
 CUDA_VISIBLE_DEVICES=0 \
-DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-g64-v4 \
-DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-g64-v4 \
+DECIDRA_CHECKPOINT=/srv/models/d3-turbo-w4a8-vision-v1 \
+DECIDRA_NATIVE_MODEL=/srv/models/d3-turbo-w4a8-vision-v1 \
 ./target/release/decidra
 ```
 
@@ -119,7 +119,8 @@ Run the state-once startup gate before serving:
 
 ## API
 
-`POST /v1/systemone` accepts a state string and a map of typed questions.
+`POST /v1/systemone` accepts a state string, a map of typed questions, and an
+optional top-level `images` list of base64 image data URLs.
 
 ```bash
 curl -fsS http://127.0.0.1:8080/v1/systemone \
@@ -164,6 +165,30 @@ curl -fsS http://127.0.0.1:8080/v1/systemone \
 Question types: `choice`, `noul`, and `score` (2–10 ordered levels). Scores
 return `score`, `probabilities`, `confidence`, and `legend`.
 
+Images are shared by every question in the request:
+
+```json
+{
+  "state": "An image from a catalogue.",
+  "questions": {
+    "object": {
+      "type": "choice",
+      "instructions": "What is in the image?",
+      "criteria": { "panda": "a panda", "box": "a cardboard box" }
+    }
+  },
+  "images": ["data:image/png;base64,iVBORw0KGgo..."]
+}
+```
+
+Accepted formats are PNG, JPEG and WebP data URLs, up to 8 MB encoded, 16 MP
+source pixels, aspect ratio 200, 16 images, and 8,192 expanded vision tokens
+per request. The runtime converts to RGB (alpha is
+dropped, EXIF orientation is not applied), applies the Qwen2VL `smart_resize`
+and bicubic resize, and uses the model's mRoPE image positions. Image states
+are cached by the decoded image identity plus state tokens, so the same text
+with a different image never reuses K/V state.
+
 | endpoint | purpose |
 |---|---|
 | `POST /v1/systemone` | typed decisions |
@@ -172,7 +197,8 @@ return `score`, `probabilities`, `confidence`, and `legend`.
 | `GET /metrics` | Prometheus metrics |
 
 Limits: 64 questions per request, 32,768 tokens per question’s state + block,
-1 MiB rendered state and 1 MiB per question, text/JSON only.
+1 MiB rendered state and 1 MiB per question; 64 MiB request body. Image
+requests add the expanded vision tokens to the state block.
 
 ## Performance: Decidra vs vLLM-SR
 
@@ -240,7 +266,7 @@ The image and compose file carry production defaults. The most important knobs:
 | variable | default | meaning |
 |---|---|---|
 | `DECIDRA_BIND_ADDR` | `0.0.0.0:8080` | HTTP bind |
-| `DECIDRA_CHECKPOINT` | `/srv/models/d3-turbo-w4a8-g64-v4` | model package |
+| `DECIDRA_CHECKPOINT` | `/srv/models/d3-turbo-w4a8-vision-v1` | model package |
 | `DECIDRA_NATIVE_MODEL` | `$DECIDRA_CHECKPOINT` | engine package |
 | `DECIDRA_NATIVE_MARLIN` | `true` | Marlin W4A8 |
 | `DECIDRA_NATIVE_INT8_EXCLUDE` | `self_attn.v_proj,self_attn.k_proj` | modules kept on W4A16 |

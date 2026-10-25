@@ -18,6 +18,7 @@ pub mod engine;
 pub mod flashinfer;
 pub mod kernels;
 pub mod tensor;
+pub mod vision;
 pub mod weights;
 
 pub use engine::{Engine, HostStateCache, LogitsOpts, Stage};
