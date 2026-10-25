@@ -234,6 +234,10 @@ fn extract_state_images(state: &mut Value, images: &mut Vec<String>) -> Result<(
     }
     let mut text = String::new();
     for (index, part) in parts.iter().enumerate() {
+        if let Value::String(value) = part {
+            text.push_str(value);
+            continue;
+        }
         let kind = part
             .get("type")
             .and_then(Value::as_str)
@@ -282,13 +286,14 @@ mod tests {
     #[test]
     fn state_content_parts_hoist_images_and_join_text() {
         let mut state = json!([
-            {"type": "text", "text": "A held part."},
+            "A held part.",
+            {"type": "text", "text": " plus text."},
             {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
             {"type": "text", "text": "Second paragraph."}
         ]);
         let mut images = vec!["data:image/jpeg;base64,BBBB".to_owned()];
         extract_state_images(&mut state, &mut images).unwrap();
-        assert_eq!(state, json!("A held part.Second paragraph."));
+        assert_eq!(state, json!("A held part. plus text.Second paragraph."));
         assert_eq!(
             images,
             vec!["data:image/jpeg;base64,BBBB", "data:image/png;base64,AAAA"]
