@@ -196,7 +196,8 @@ Single 80×60 PNG, one choice question, W4A8 language weights plus the BF16
 | cached image state (same image and state tokens) | **34 ms** |
 | text 64q c1, clean server | **929 ms / 69 q/s** |
 | text 64q c8, clean server | **4.16 s / 69 q/s** |
-| 64 concurrent distinct image states, one choice question each | **64/64 HTTP 200, 9.1 s** |
+| 64 concurrent distinct image states, one choice question each | **64/64 HTTP 200, 8.0 s** |
+| 128 concurrent distinct image states, one choice question each | **128/128 HTTP 200, 12.5 s** |
 
 Image answers match the BF16 Python reference **13/13** on the image eval
 corpus; the fresh v2 text artifact passes **32/32** on the 32-row gate.

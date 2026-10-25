@@ -141,6 +141,7 @@ copies the real cuBLAS/cuBLASLt files.
 | `DECIDRA_NATIVE_GPU_EMBED` | `false` | GPU embedding table (2.4 GiB) |
 | `DECIDRA_MAX_QUEUE` | `64` | queued requests before 503 |
 | `DECIDRA_IMAGE_DECODE_CONCURRENCY` | `64` | concurrent image decode/tokenize tasks; excess waits |
+| in-flight admission | `128` | requests admitted before body allocation |
 | `DECIDRA_BATCH_REQUESTS` | `32` | max requests per pass |
 | `DECIDRA_BATCH_ROWS` | `32` | soft question-row budget per pass |
 | `DECIDRA_BATCH_WINDOW_US` | `2000` | coalescing window |

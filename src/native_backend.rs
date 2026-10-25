@@ -488,6 +488,7 @@ impl NativeBackend {
                 prepared.image_spans,
                 prepared.digest,
             )
+            .await
             .map_err(|error| match error {
                 EngineError::Overloaded(message) => EngineError::Overloaded(message),
                 other => EngineError::Internal(other.to_string()),

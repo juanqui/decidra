@@ -28,6 +28,7 @@ use crate::image_media::ImageMedia;
 
 pub struct BatchHandle {
     tx: SyncSender<Job>,
+    queue_slots: std::sync::Arc<tokio::sync::Semaphore>,
 }
 
 struct Job {
@@ -37,6 +38,7 @@ struct Job {
     state_positions: std::sync::Arc<Vec<[u32; 3]>>,
     image_spans: std::sync::Arc<Vec<(usize, usize)>>,
     digest: [u8; 32],
+    _queue_slot: tokio::sync::OwnedSemaphorePermit,
     submitted: Instant,
     reply: oneshot::Sender<Result<Vec<Vec<f32>>, String>>,
 }
@@ -89,6 +91,7 @@ impl BatchHandle {
         host_state_cache_bytes: usize,
     ) -> Self {
         let (tx, rx) = mpsc::sync_channel::<Job>(max_queue);
+        let queue_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(max_queue));
         thread::Builder::new()
             .name("decidra-cuda".to_owned())
             .spawn(move || {
@@ -147,12 +150,12 @@ impl BatchHandle {
                 }
             })
             .expect("spawning the decidra CUDA worker");
-        Self { tx }
+        Self { tx, queue_slots }
     }
 
     /// Run one state-once request. The receiver resolves when the worker has
     /// finished the request's question batch.
-    pub fn submit_state_once(
+    pub async fn submit_state_once(
         &self,
         state: Vec<u32>,
         questions: Vec<Vec<u32>>,
@@ -161,6 +164,12 @@ impl BatchHandle {
         image_spans: Vec<(usize, usize)>,
         digest: [u8; 32],
     ) -> Result<oneshot::Receiver<Result<Vec<Vec<f32>>, String>>, EngineError> {
+        let queue_slot = self
+            .queue_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| EngineError::Internal("d3-turbo CUDA worker stopped".to_owned()))?;
         let (reply, receiver) = oneshot::channel();
         let job = Job {
             state,
@@ -169,6 +178,7 @@ impl BatchHandle {
             state_positions: std::sync::Arc::new(state_positions),
             image_spans: std::sync::Arc::new(image_spans),
             digest,
+            _queue_slot: queue_slot,
             submitted: Instant::now(),
             reply,
         };

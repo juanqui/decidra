@@ -205,9 +205,10 @@ Both forms can be combined; top-level images precede state content images.
 
 Accepted formats are PNG, JPEG and WebP data URLs, up to 8 MB encoded, 16 MP
 source pixels, aspect ratio 200, 16 images, and 8,192 expanded vision tokens
-per request. Up to 64 image decode/tokenize tasks run concurrently; excess
-requests wait for a decode slot. The single CUDA worker queue can still return
-HTTP 503 under sustained saturation. The runtime converts to RGB (alpha is
+per request. Up to 64 image decode/tokenize tasks run concurrently, and up to
+128 HTTP requests are admitted; excess image requests wait for a decode or CUDA
+queue slot instead of being refused. 128 concurrent distinct image requests
+were verified end-to-end. The runtime converts to RGB (alpha is
 dropped, EXIF orientation is not applied), applies the Qwen2VL `smart_resize`
 and bicubic resize, and uses the model's mRoPE image positions. Image states
 are cached by the decoded image identity plus state tokens, so the same text
@@ -294,6 +295,7 @@ The image and compose file carry production defaults. The most important knobs:
 | `DECIDRA_BIND_ADDR` | `0.0.0.0:8080` | HTTP bind |
 | `DECIDRA_CHECKPOINT` | `/srv/models/d3-turbo-w4a8-vision-v2` | model package |
 | `DECIDRA_IMAGE_DECODE_CONCURRENCY` | `64` | image decode slots; excess waits |
+| in-flight request admission | `128` | bounded outer admission for text and images |
 | `DECIDRA_NATIVE_MODEL` | `$DECIDRA_CHECKPOINT` | engine package |
 | `DECIDRA_NATIVE_MARLIN` | `true` | Marlin W4A8 |
 | `DECIDRA_NATIVE_INT8_EXCLUDE` | `self_attn.v_proj,self_attn.k_proj` | modules kept on W4A16 |

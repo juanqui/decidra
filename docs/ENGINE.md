@@ -116,8 +116,9 @@ runtime decodes strict PNG/JPEG/WebP data URLs, applies the Qwen2VL
 projected features into the state embeddings, and captures the state with the
 image's mRoPE positions. Requests are capped at 16 images and 8,192 expanded
 vision tokens; image decode is dimension-checked before allocation. Up to 64
-decode/tokenize tasks run concurrently and excess requests wait for a decode
-slot; the CUDA worker queue can still return 503 under sustained saturation. The vision tower is never quantized: the final
+decode/tokenize tasks run concurrently under a 128-request outer admission
+gate. The CUDA queue and image slots both use awaited permits, so excess image
+requests queue rather than fail; 128 concurrent distinct image requests pass. The vision tower is never quantized: the final
 artifact is W4A8 language weights plus BF16 `visual.*` tensors. Video remains
 unsupported. Per request: at most 64 questions; each question's state plus its
 own block is at most 32K tokens. The serving worker coalesces requests, keeps an
