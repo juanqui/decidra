@@ -47,3 +47,21 @@ Status: planned. Required evidence:
 The baseline is not complete until these are recorded and compared with the
 matched 4090 accepted path (708.91 ms engine, 879.8 ms duplicate HTTP,
 901.4 ms distinct HTTP, 8K/24K warm 998/1242 ms).
+
+## 2026-10-25 — R0 preparation
+
+- Added distinct-question fixtures for 256/8K/24K states:
+  - engine: state 301/8,234/24,968 tokens, 64 unique questions, 4,039 rows.
+  - HTTP: same states and unique questions.
+- Fixed the `run_group` unpinned-cache eviction hazard identified by Astra:
+  the hit entry is preserved while older entries are removed, the byte total
+  is recomputed after each removal, and the cached index is rebound after
+  reinsertion. Default pinned behavior is unchanged. This is required before
+  the L40S cache-budget round.
+- Built the current engine on the L40S (22 MB binary, sm_89).
+- First hardware microbench at sustained 2520 MHz:
+  - BF16/F32-accumulate 8192^3: 262.8 TFLOPS, 156 W, C[0]=8192 correct.
+  - INT8/INT32 cuBLAS: 151.1 TOPS (cuBLAS path; not the Marlin kernel).
+  - 1 GiB copy: 625.6 GB/s (r+w).
+  - L40S reports 142 SMs, 46,068 MiB, ECC on, 350 W limit.
+- Artifact upload is still in progress; L40S baseline pending.

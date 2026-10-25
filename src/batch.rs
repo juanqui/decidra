@@ -289,7 +289,7 @@ fn run_group(
     state_cache_bytes: usize,
     host_state_cache_bytes: usize,
 ) {
-    let cached = cache
+    let mut cached = cache
         .iter()
         .position(|entry| same_state_identity(state, &digest, &entry.state, &entry.digest));
     let mut host_cached = if cached.is_none() {
@@ -304,13 +304,21 @@ fn run_group(
         .map(|v| v != "0")
         .unwrap_or(true);
     let entry_bytes = state_cache_bytes_for(state.len());
-    let cached_bytes: usize = cache.iter().map(|entry| entry.bytes).sum();
     if !pin_cache {
-        while !cache.is_empty()
-            && (cache.len() >= state_cache_entries
-                || cached_bytes.saturating_add(entry_bytes) > state_cache_bytes)
-        {
-            cache.remove(0);
+        // Preserve the hit itself while evicting older entries. Removing from
+        // the front shifts the hit index, and the byte total must be
+        // recomputed after each removal.
+        let preserved = cached.map(|index| cache.remove(index));
+        let max_len = state_cache_entries.saturating_sub(usize::from(preserved.is_some()));
+        let byte_budget = state_cache_bytes.saturating_sub(entry_bytes);
+        let mut bytes: usize = cache.iter().map(|entry| entry.bytes).sum();
+        while !cache.is_empty() && (cache.len() > max_len || bytes > byte_budget) {
+            let removed = cache.remove(0);
+            bytes = bytes.saturating_sub(removed.bytes);
+        }
+        if let Some(entry) = preserved {
+            cache.push(entry);
+            cached = Some(cache.len() - 1);
         }
     }
     // A question pass allocates substantially more scratch than a cache hit
