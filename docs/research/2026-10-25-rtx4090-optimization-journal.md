@@ -290,3 +290,24 @@ Warm 64q latency is 998 ms at 8K and 1,242 ms at 24K. The accepted kernels
 reduce scratch memory and keep the 24K cache resident within the 24 GiB card.
 This is the relevant large-context path; the old long-context measurements in
 ENGINE §5 were taken under a different release/power configuration.
+
+### E19 — Scoped N=128 attempt (rejected)
+
+Because the N=128 K4 variant was fast but wrong, a K8/N8 tmb4 variant was
+tested by layer range. Text-gate results:
+
+| layers using N128 | top-1 | max Δp | unsafe flip |
+|---|---:|---:|---|
+| 0–15 | 31/32 | 0.0896 | `choice-4dcab9a0` |
+| 16–31 | **32/32** | 0.0830 | none |
+| 32–47 | 31/32 | 0.1018 | `choice-4dcab9a0` |
+| 48–63 | **32/32** | 0.0993 | none |
+| 0–31 | 31/32 | 0.0964 | yes |
+| 32–63 | 31/32 | 0.0974 | yes |
+| all | 31/32 | 0.0874 | yes |
+| 16–31 + 48–63 | **32/32** | 0.0780 | none |
+
+The correctness-safe 16–31+48–63 combination measured **726.01 ms**, slower
+than the 708.91 ms accepted path. The only fast N=128 variant was the invalid
+K4 layout. N=128 is rejected: it is both a layout/quality risk and, in its
+validated K8 form, slower on this workload.
