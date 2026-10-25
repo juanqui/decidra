@@ -155,3 +155,44 @@ GDN recurrence 112.2 ms (13.3%), GDN projections 158.7 ms (18.8%), attention
 37.6 ms (4.5%), GDN prepare/conv/norm 33.9 ms. Attention is not slower than the
 4090; the INT8/Marlin and recurrence portions are. This profile is the target
 for the next kernel round.
+
+## Round 5 — Split shared-state attention (accepted, long contexts)
+
+Implemented `fi_prefill_bf16_ext_lse` + `merge_attn_lse_bf16` and an opt-in
+`DECIDRA_ATTN_SPLIT=1` path. The state K/V is used directly once for all
+question rows; each question's private K/V is attended separately; outputs are
+merged with base-2 LSE weighting. The 2K path keeps the existing cascade
+because total question rows exceed state keys.
+
+- Split parity on 32 long rows: 8K max logit delta 0.1435, 24K 0.1721,
+  zero top-1 flips; 2K/32-row text gate remains 32/32.
+- L40S engine: 8K 1,092.0 -> 1,087.4 ms; 24K **1,342.9 -> 1,279.3 ms**
+  (-4.7%). 4090 24K 1,099.9 -> 1,062.4 ms (-3.4%).
+- Combined with R1 (GPU embedding, 16 GiB/64-state cache, batch caps):
+  HTTP 2K 1,060.9 -> **1,027.5 ms** (-3.1%); 8K warm 1,165.9 -> **1,123.0**
+  (-3.7%); 24K warm **1,474.8 -> 1,350.0 ms (-8.5%)**; 2K c8
+  4,737.5 -> 4,602.9 ms. Cold 24K 9,976 -> 9,654 ms.
+- Final gates with the R5 server: text **32/32**, image **13/13**, image
+  smoke 20/20.
+- Accepted as the L40S long-context production candidate. The 2K split is
+  disabled; 8K/24K split is opt-in via `DECIDRA_ATTN_SPLIT=1`.
+
+## Round summary and decision
+
+| Round | Work | Result |
+|---|---|---|
+| 0 | L40S baseline/gates/ceilings | gates pass; INT8 path ~20% slower than 600 W 4090 |
+| 1 | 48 GB memory/cache/batch policy | 2.6–3.4% HTTP, no 5% gate; capacity retained |
+| 2 | magic-bias/512-thread Marlin | bit-exact but neutral; 512-thread invalid; rejected |
+| 3 | W4A16 MLP | 1q -4.6%, 8q/64q +6–7%; reject static switch |
+| 4 | profile | MLP 46.8%, GDN 13.3%, attention 4.5%; no attention regression |
+| 5 | split shared-state attention | 24K engine -4.7%, HTTP -8.5%; accepted opt-in |
+
+**L40S production candidate:** GPU embedding, 16 GiB GPU state cache/64
+entries, 16 GiB host cache, batch rows 64, state-once rows 128, keys 2^21,
+scores 2^29, image concurrency 64, `DECIDRA_ATTN_SPLIT=1` for long contexts.
+Free VRAM after preload: 28.05 GiB; 24K warm cache leaves ~20 GiB.
+
+Remaining plan rounds (cross-state batching, CUDA graphs, cold GDN VC32,
+FP8/MLP representation, pinned restore) are not complete; the research plan
+remains the source for the next iterations.
