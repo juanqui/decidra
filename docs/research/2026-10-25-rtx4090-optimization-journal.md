@@ -269,3 +269,24 @@ project.
 | Selected W4A16 / coarser activation scales | MLP W4A16 measured 993 ms, down-only 810 ms vs 709 ms. | rejected |
 | Multi-replica Rx4090 | GPU0 currently occupied by vLLM; capacity option, not per-GPU efficiency. | not applicable now |
 
+
+### E17 — Final-layer capture MLP skip (rejected)
+
+Skipping the last layer's post-attention MLP during state capture preserved
+K/V and passed the gate, but state capture measured 417.7–420.9 ms versus
+416.7 ms in the accepted baseline: no repeatable gain above noise, because
+only 1/64 of the MLP work is removed. Reverted to keep the path simple.
+
+### E18 — Long-context check after the accepted changes
+
+Production server, 64 duplicate-control questions, c1 one-shot:
+
+| state | cold request (capture included) | warm exact-state cache | free VRAM after |
+|---|---:|---:|---:|
+| ~8K | 2,936 ms | **998 ms** | — |
+| ~24K | 8,206 ms | **1,242 ms** | 6.1 GiB |
+
+Warm 64q latency is 998 ms at 8K and 1,242 ms at 24K. The accepted kernels
+reduce scratch memory and keep the 24K cache resident within the 24 GiB card.
+This is the relevant large-context path; the old long-context measurements in
+ENGINE §5 were taken under a different release/power configuration.
