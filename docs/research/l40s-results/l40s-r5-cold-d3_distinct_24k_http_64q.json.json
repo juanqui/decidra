@@ -1,0 +1,25 @@
+{
+ "url": "http://127.0.0.1:8899",
+ "request": "/workspace/jev-engine/eval/data/d3_distinct_24k_http_64q.json",
+ "runs": 1,
+ "levels": [
+  {
+   "questions": 64,
+   "concurrency": 1,
+   "runs": 1,
+   "ok": 1,
+   "latency": {
+    "p50_ms": 9653.630510088988,
+    "p80_ms": 9653.630510088988,
+    "p95_ms": 9653.630510088988,
+    "mean_ms": 9653.630510088988,
+    "min_ms": 9653.630510088988,
+    "max_ms": 9653.630510088988
+   },
+   "req_per_s": 0.10358797127722076,
+   "questions_per_s": 6.629630161742129,
+   "input_tokens": 29007,
+   "input_tokens_per_s": 3004.7762828383425
+  }
+ ]
+}

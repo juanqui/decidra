@@ -1,0 +1,43 @@
+{
+ "url": "http://127.0.0.1:8899",
+ "request": "/workspace/jev-engine/eval/data/d3_distinct_http_2k_64q.json",
+ "runs": 3,
+ "levels": [
+  {
+   "questions": 64,
+   "concurrency": 1,
+   "runs": 3,
+   "ok": 3,
+   "latency": {
+    "p50_ms": 1027.5456580566242,
+    "p80_ms": 1027.6223866268992,
+    "p95_ms": 1027.6607509120367,
+    "mean_ms": 1027.267870027572,
+    "min_ms": 1026.584413019009,
+    "max_ms": 1027.6735390070826
+   },
+   "req_per_s": 0.9734559302172665,
+   "questions_per_s": 62.30117953390506,
+   "input_tokens": 18480,
+   "input_tokens_per_s": 5996.488530138361
+  },
+  {
+   "questions": 64,
+   "concurrency": 8,
+   "ok": 8,
+   "errors": 0,
+   "error_samples": [],
+   "latency": {
+    "p50_ms": 4602.852277981583,
+    "p80_ms": 6752.7655427809805,
+    "p95_ms": 7828.000603686086,
+    "mean_ms": 4605.099995736964,
+    "min_ms": 1029.8068289412186,
+    "max_ms": 8185.985553078353
+   },
+   "wall_s": 8.186459303018637,
+   "req_per_s": 0.977223449587066,
+   "questions_per_s": 62.54230077357222
+  }
+ ]
+}
