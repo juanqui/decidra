@@ -65,3 +65,93 @@ matched 4090 accepted path (708.91 ms engine, 879.8 ms duplicate HTTP,
   - 1 GiB copy: 625.6 GB/s (r+w).
   - L40S reports 142 SMs, 46,068 MiB, ECC on, 350 W limit.
 - Artifact upload is still in progress; L40S baseline pending.
+
+## 2026-10-25 — L40S Round 0 baseline
+
+Rental: one L40S 48 GB, 46,068 MiB, ECC on, 350 W, 142 SMs, boost 2520
+MHz, 48 host CPUs, 236 GB RAM. Built exact `sm_89` binary from `c7569c1`;
+artifact SHA-256 prefix `8321ed451da7f5af` matches the 4090 v2 artifact.
+
+### Gates
+
+- Text gate: **32/32**, mean MAE 0.0158, max Δp 0.0984 (same envelope).
+- Image API smoke: 20/20; image decisions **13/13**.
+- State-once self-test passes.
+
+### Engine baseline, distinct questions
+
+| state | capture | question p50 | 4090 accepted p50 |
+|---|---:|---:|---:|
+| 2K (2,121) | 483 ms | **853.2 ms** | 708.9 ms |
+| 2K + GPU embedding | 480 ms | **845.4 ms** | — |
+| 8K (8,234) | 1,748 ms | **1,119.3 ms** | — |
+| 24K (24,968) | 5,868 ms | **1,386.5 ms** | — |
+
+L40S is ~20% slower than the 600 W 4090 on the 2K INT8 path despite 142 SMs;
+measured BF16 tensor was 262.8 TFLOPS and 1 GiB copy 625.6 GB/s at 2520 MHz,
+with only ~156 W during the BF16 microbench. The 350 W cap is not the immediate
+limiter; Marlin/INT8 and memory behavior are.
+
+### HTTP baseline (distinct)
+
+| state | c1 | q/s | c8 |
+|---|---:|---:|---:|
+| 2K | 1,060.9 ms | 60.3 | 4,737.5 ms, 60.8 q/s |
+| 8K cold / warm | 3,573.6 / 1,165.9 ms | 18 / 55 | — |
+| 24K cold / warm | 9,976.4 / 1,474.8 ms | 6 / 43 | — |
+
+Fresh post-preload free VRAM was 30.39 GiB (host embedding) / 28.05 GiB (GPU
+embedding); 24K warm cache left 21.0 GiB. This is the capacity headroom the
+L40S plan targets.
+
+## Round 1 — 48 GB configuration
+
+Configuration: GPU embedding, 16 GiB/64-entry GPU state cache, 16 GiB host
+cache, batch rows 64, state-once rows 128, max keys 2^21, max scores 2^29.
+
+| path | baseline | R1 | delta |
+|---|---:|---:|---:|
+| 2K engine | 853.2 | 845.4 (GPU embed only) | -0.9% |
+| 2K HTTP c1 64q | 1,060.9 | **1,033.0** | -2.6% |
+| 2K HTTP c8 | 4,737.5 | **4,624.2** | -2.4% |
+| 8K warm HTTP | 1,165.9 | **1,133.5** | -2.8% |
+| 24K warm HTTP | 1,474.8 | **1,424.0** | -3.4% |
+| 24K engine (caps only) | 1,379.5 | **1,353.7** | -1.9% |
+
+No OOM. The 5% long-state gate was not met; capacity headroom remains large.
+R1 is retained as an L40S production candidate but not yet accepted as a round
+win.
+
+## Round 2 — Marlin epilogue and thread-resource experiments
+
+- **Magic-bias bit-exact group epilogue** (INT32 fragment biased by `2^23`,
+  FADD instead of I2F): local 4090 logits were **byte-identical** to the
+  reference on all 32 rows. Performance: 710.4 ms versus 708.9 ms accepted;
+  no gain. Reverted.
+- **512-thread Marlin specialization** (N16/K4/tmb4 group-a8): compiled but
+  launch failed with `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`; registers/shared
+  prevent 512 threads. Reverted.
+- Conclusion: L40S Marlin work needs a different resource/tile design, not
+  these two knobs.
+
+## Round 3 — Precision alternatives
+
+Static W4A16 MLP on L40S (first 56 layers; last:8 remains INT8):
+
+| workload | W4A8 R1 | W4A16 MLP |
+|---|---:|---:|
+| 1q c1 | 43.6 ms | **41.6 ms** (-4.6%) |
+| 8q c1 | 135.8 ms | 145.7 ms (+7.3%) |
+| 64q c1 | 1,060.9 ms | 1,125.8 ms (+6.1%) |
+
+W4A16 only wins at 1q; a static switch loses production throughput. A shape-
+dispatched dual representation is possible but costs another MLP weight copy
+and is not accepted without a 1–4q traffic case.
+
+## Round 4 — Current L40S profile
+
+Distinct 2K region sum **842.8 ms** (engine p50 858.8): MLP 394.2 ms (46.8%),
+GDN recurrence 112.2 ms (13.3%), GDN projections 158.7 ms (18.8%), attention
+37.6 ms (4.5%), GDN prepare/conv/norm 33.9 ms. Attention is not slower than the
+4090; the INT8/Marlin and recurrence portions are. This profile is the target
+for the next kernel round.
