@@ -61,14 +61,31 @@ questions ──► one ragged pass ──► [B, 255] readout ──► typed a
 
 ### Docker
 
-The published image targets SM89 (RTX 4090 / L40S):
+Published images are built per GPU architecture. The binary embeds one cubin
+and refuses to start on a different SM family, so select the tag for the target
+GPU:
+
+| GPU | moving tag | version tag |
+|---|---|---|
+| RTX 4090 / L40S (SM89) | `ghcr.io/juanqui/decidra:sm89-latest` | `ghcr.io/juanqui/decidra:sm89-0.2.0` |
+| H100 / H200 (SM90) | `ghcr.io/juanqui/decidra:sm90-latest` | `ghcr.io/juanqui/decidra:sm90-0.2.0` |
+| RTX PRO 6000 Blackwell (SM120) | `ghcr.io/juanqui/decidra:sm120-latest` | `ghcr.io/juanqui/decidra:sm120-0.2.0` |
+
+The unsuffixed `latest`, `0.2.0`, and commit-sha tags remain SM89 aliases.
+Verify a pulled image before deploying:
+
+```bash
+docker image inspect ghcr.io/juanqui/decidra:sm90-latest \
+  --format '{{ index .Config.Labels "ai.decidra.cuda-arch" }}'
+# sm_90
+```
 
 ```bash
 docker run --rm --gpus '"device=0"' \
   --user "$(id -u):$(id -g)" \
   -p 8080:8080 \
   -v /srv/models/d3-turbo-w4a8-vision-v2:/models:ro \
-  ghcr.io/juanqui/decidra:0.2.0
+  ghcr.io/juanqui/decidra:sm89-latest
 ```
 
 ```bash
@@ -79,14 +96,23 @@ curl -fsS http://127.0.0.1:8080/health
 Build a Hopper or Blackwell image from source:
 
 ```bash
-docker build --build-arg CUDA_ARCH=sm_90  -t decidra:0.2.0-h100 .
-docker build --build-arg CUDA_ARCH=sm_120 -t decidra:0.2.0-rtx-pro-6000 .
+docker build --build-arg CUDA_ARCH=sm_90  -t decidra:sm90-0.2.0 .
+docker build --build-arg CUDA_ARCH=sm_120 -t decidra:sm120-0.2.0 .
 ```
 
 Or use the provided compose file:
 
 ```bash
 DECIDRA_MODEL_DIR=/srv/models/d3-turbo-w4a8-vision-v2 \
+DECIDRA_GPU=0 docker compose up -d --build
+```
+
+Compose defaults to the SM89 image. For another architecture, select both the
+build arch and the matching tag:
+
+```bash
+DECIDRA_CUDA_ARCH=sm_90 DECIDRA_IMAGE_TAG=sm90-0.2.0 \
+DECIDRA_MODEL_DIR=/srv/models/d3-turbo \
 DECIDRA_GPU=0 docker compose up -d --build
 ```
 

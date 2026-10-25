@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Publish per-architecture images (`sm89-latest`, `sm90-latest`,
+  `sm120-latest`, plus `sm<arch>-<version>` and `sm<arch>-<sha>`); the
+  unsuffixed tags remain SM89.
 - Fixed state-once OOMs under coalesced and long requests: the batch row
   budget now sums queued question rows, scratch reserves scale with state
   length, cached states are offloaded when needed, and the CUDA

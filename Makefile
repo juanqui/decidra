@@ -30,8 +30,10 @@ run:
 check-config:
 	$(CARGO) run --release --locked --features native -- --check-config
 
-IMAGE ?= ghcr.io/juanqui/decidra:0.2.0
 CUDA_ARCH ?= sm_89
+VERSION ?= 0.2.0
+ARCH_TAG := $(subst _,,$(CUDA_ARCH))
+IMAGE ?= ghcr.io/juanqui/decidra:$(ARCH_TAG)-$(VERSION)
 
 image:
 	docker build --build-arg CUDA_ARCH=$(CUDA_ARCH) -t $(IMAGE) .

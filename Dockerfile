@@ -49,11 +49,14 @@ RUN mkdir -p /out/cudalibs \
 
 FROM ubuntu:24.04
 
+ARG CUDA_ARCH=sm_89
+
 LABEL org.opencontainers.image.title="Decidra" \
       org.opencontainers.image.description="State-once inference engine for vllm-sr/d3-turbo" \
       org.opencontainers.image.source="https://github.com/juanqui/decidra" \
       org.opencontainers.image.version="0.2.0" \
-      org.opencontainers.image.licenses="MIT OR Apache-2.0"
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      ai.decidra.cuda-arch="${CUDA_ARCH}"
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update \

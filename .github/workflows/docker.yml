@@ -7,7 +7,6 @@ on:
       - "**.md"
       - "docs/**"
       - "LICENSE*"
-      - ".github/workflows/**"
   workflow_dispatch:
 
 permissions:
@@ -17,6 +16,17 @@ permissions:
 jobs:
   image:
     runs-on: ubuntu-latest
+    concurrency:
+      group: docker-${{ github.ref }}-${{ matrix.tag }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The default image keeps the unsuffixed tags (latest, 0.2.0, sha).
+          - { tag: sm89, cuda_arch: sm_89, default: true }
+          - { tag: sm90, cuda_arch: sm_90, default: false }
+          - { tag: sm120, cuda_arch: sm_120, default: false }
     steps:
       - name: Free disk space
         run: |
@@ -33,13 +43,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # One image per GPU architecture. A binary embeds exactly one cubin and
+      # refuses a mismatch at startup, so the arch is a build argument, not a
+      # platform variant of a single image.
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=${{ matrix.tag }}-latest
+            type=raw,value=${{ matrix.tag }}-0.2.0
+            type=raw,value=${{ matrix.tag }}-${{ github.sha }}
+            type=raw,value=latest,enable=${{ matrix.default }}
+            type=raw,value=0.2.0,enable=${{ matrix.default }}
+            type=raw,value=${{ github.sha }},enable=${{ matrix.default }}
+
       - uses: docker/build-push-action@v6
         with:
           context: .
           push: true
-          tags: |
-            ghcr.io/${{ github.repository }}:0.2.0
-            ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          build-args: CUDA_ARCH=${{ matrix.cuda_arch }}
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha,scope=${{ matrix.tag }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.tag }}

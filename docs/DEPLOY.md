@@ -44,11 +44,13 @@ DECIDRA_CUTLASS_INCLUDE="/path/cutlass/include:/path/cutlass/tools/util/include"
 DECIDRA_CUDA_ARCH=sm_90 cargo build --release --locked --features native
 ```
 
-The Docker image is SM89 by default. Build an H100 image with
-`--build-arg CUDA_ARCH=sm_90`, or an RTX PRO 6000 image with
-`--build-arg CUDA_ARCH=sm_120`. A binary embeds one cubin and rejects a GPU from
-another SM family at startup. FA3 requires CUTLASS headers and is built from
-source outside the default image.
+Published images are built per GPU architecture: `sm89-latest`,
+`sm90-latest`, and `sm120-latest` (plus `sm<arch>-0.2.0` and
+`sm<arch>-<sha>`). The unsuffixed `latest`, `0.2.0`, and `<sha>` tags are SM89
+aliases. A binary embeds one cubin and rejects a GPU from another SM family at
+startup, so there is no single image that runs on all three. Build one locally
+with `--build-arg CUDA_ARCH=sm_90` or `sm_120`. FA3 requires CUTLASS headers
+and is built from source outside the published images.
 
 ## Run
 
@@ -107,14 +109,16 @@ DECIDRA_BIND_ADDR=0.0.0.0:8899 \
 ## Docker
 
 ```bash
-docker build -t decidra:0.2.0 .
+docker build -t decidra:sm89-0.2.0 .
 # H100/H200:
-docker build --build-arg CUDA_ARCH=sm_90 -t decidra:0.2.0-h100 .
+docker build --build-arg CUDA_ARCH=sm_90 -t decidra:sm90-0.2.0 .
+# RTX PRO 6000 Blackwell:
+docker build --build-arg CUDA_ARCH=sm_120 -t decidra:sm120-0.2.0 .
 
 docker run --rm --gpus '"device=0"' --user "$(id -u):$(id -g)" \
   -p 8899:8080 \
   -v /srv/models/d3-turbo-w4a8-vision-v2:/models:ro \
-  decidra:0.2.0
+  decidra:sm89-0.2.0
 ```
 
 The image embeds the cubins and FlashInfer library, so it needs no build tree

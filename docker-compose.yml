@@ -16,7 +16,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: decidra:0.2.0
+      args:
+        CUDA_ARCH: ${DECIDRA_CUDA_ARCH:-sm_89}
+    image: decidra:${DECIDRA_IMAGE_TAG:-sm89-0.2.0}
     container_name: decidra
     restart: unless-stopped
     # The checkpoint files are usually mode 600. Match the host owner.
