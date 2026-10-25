@@ -161,5 +161,6 @@ The runtime image also carries `LICENSE`, `LICENSE-MIT`, `LICENSE-APACHE`, and
 `NOTICE` under `/usr/share/licenses/decidra/`.
 The server refuses to start unless the package is `prefix_bidir`, the F32
 readout exists, and the state-once self-test agrees with the per-row block
-path. Image requests require a checkpoint with the BF16 `visual.*` tower;
+path. Image requests require a checkpoint with the BF16 `visual.*` tower.
+Images may be top-level `images` or `image_url` parts inside a `state` array;
 text-only checkpoints and videos return HTTP 400.

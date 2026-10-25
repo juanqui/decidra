@@ -110,11 +110,11 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
             "questions must be a non-empty object",
         );
     }
-    let state_value = object
+    let mut state_value = object
         .get("state")
         .cloned()
         .unwrap_or_else(|| Value::String(String::new()));
-    let images: Vec<String> = match object.get("images") {
+    let mut images: Vec<String> = match object.get("images") {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(values)) => {
             if values.len() > MAX_IMAGES {
@@ -144,6 +144,15 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
         }
         Some(_) => return error(StatusCode::BAD_REQUEST, "images must be an array"),
     };
+    if let Err(detail) = extract_state_images(&mut state_value, &mut images) {
+        return error(StatusCode::BAD_REQUEST, detail);
+    }
+    if images.len() > MAX_IMAGES {
+        return error(
+            StatusCode::BAD_REQUEST,
+            format!("at most {MAX_IMAGES} images per request"),
+        );
+    }
 
     metrics::counter!("decidra_systemone_requests_total").increment(1);
     match state
@@ -202,6 +211,119 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
     }
 }
 
+/// OpenRouter/System One content parts may carry images inside `state`:
+/// `[{"type":"text",...},{"type":"image_url","image_url":{"url":"data:..."}}]`.
+/// Hoist those images into the engine's image list and leave the remaining
+/// text as the state body. Arrays without image parts keep their existing
+/// JSON state semantics.
+fn extract_state_images(state: &mut Value, images: &mut Vec<String>) -> Result<(), String> {
+    let Value::Array(parts) = state else {
+        return Ok(());
+    };
+    let has_image = parts
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("image_url"));
+    let has_video = parts
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("video_url"));
+    if !has_image {
+        if has_video {
+            return Err("video content in state is not supported by this engine".to_owned());
+        }
+        return Ok(());
+    }
+    let mut text = String::new();
+    for (index, part) in parts.iter().enumerate() {
+        let kind = part
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("state[{index}] is missing a content type"))?;
+        match kind {
+            "text" => {
+                let value = part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("state[{index}].text must be a string"))?;
+                text.push_str(value);
+            }
+            "image_url" => {
+                let value = match part.get("image_url") {
+                    Some(Value::String(url)) => url,
+                    Some(image) => image
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| format!("state[{index}].image_url.url must be a string"))?,
+                    None => {
+                        return Err(format!("state[{index}].image_url is missing"));
+                    }
+                };
+                images.push(value.to_owned());
+            }
+            other => {
+                return Err(format!(
+                    "state content type {other:?} is not supported by this engine"
+                ));
+            }
+        }
+    }
+    *state = Value::String(text);
+    Ok(())
+}
+
 fn error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({"detail": message.into()}))).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_state_images;
+    use serde_json::json;
+
+    #[test]
+    fn state_content_parts_hoist_images_and_join_text() {
+        let mut state = json!([
+            {"type": "text", "text": "A held part."},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            {"type": "text", "text": "Second paragraph."}
+        ]);
+        let mut images = vec!["data:image/jpeg;base64,BBBB".to_owned()];
+        extract_state_images(&mut state, &mut images).unwrap();
+        assert_eq!(state, json!("A held part.Second paragraph."));
+        assert_eq!(
+            images,
+            vec!["data:image/jpeg;base64,BBBB", "data:image/png;base64,AAAA"]
+        );
+    }
+
+    #[test]
+    fn image_only_state_becomes_empty() {
+        let mut state = json!([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+        ]);
+        let mut images = Vec::new();
+        extract_state_images(&mut state, &mut images).unwrap();
+        assert_eq!(state, json!(""));
+        assert_eq!(images.len(), 1);
+    }
+
+    #[test]
+    fn plain_arrays_keep_their_json_state() {
+        let mut state = json!(["one", 2, {"three": true}]);
+        let original = state.clone();
+        let mut images = Vec::new();
+        extract_state_images(&mut state, &mut images).unwrap();
+        assert_eq!(state, original);
+        assert!(images.is_empty());
+    }
+
+    #[test]
+    fn malformed_and_unsupported_parts_are_rejected() {
+        let mut images = Vec::new();
+        let mut missing = json!([{"type": "image_url"}]);
+        assert!(extract_state_images(&mut missing, &mut images).is_err());
+        let mut unsupported = json!([
+            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AAAA"}}
+        ]);
+        assert!(extract_state_images(&mut unsupported, &mut images).is_err());
+    }
 }

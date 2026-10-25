@@ -108,7 +108,10 @@ broken mask, artifact or FlashInfer build refuses to serve. A missing
 startup error.
 
 Images are supported when the checkpoint carries the 27-block Qwen3.5 vision
-tower. The runtime decodes strict PNG/JPEG/WebP data URLs, applies the Qwen2VL
+tower. They arrive either in the top-level `images` array or as OpenRouter
+`image_url` content parts inside a `state` array; the API hoists embedded
+images, concatenates their text parts, and rejects `video_url` content. The
+runtime decodes strict PNG/JPEG/WebP data URLs, applies the Qwen2VL
 `smart_resize` resize and bicubic filter, runs the BF16 vision tower, scatters the
 projected features into the state embeddings, and captures the state with the
 image's mRoPE positions. Requests are capped at 16 images and 8,192 expanded

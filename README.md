@@ -122,8 +122,9 @@ Run the state-once startup gate before serving:
 
 ## API
 
-`POST /v1/systemone` accepts a state string, a map of typed questions, and an
-optional top-level `images` list of base64 image data URLs.
+`POST /v1/systemone` accepts a state string, a map of typed questions, and
+images either as an optional top-level `images` list or as OpenRouter-style
+`image_url` content parts inside a `state` array.
 
 ```bash
 curl -fsS http://127.0.0.1:8080/v1/systemone \
@@ -168,7 +169,8 @@ curl -fsS http://127.0.0.1:8080/v1/systemone \
 Question types: `choice`, `noul`, and `score` (2–10 ordered levels). Scores
 return `score`, `probabilities`, `confidence`, and `legend`.
 
-Images are shared by every question in the request:
+Images are shared by every question in the request. The direct form uses a
+top-level list:
 
 ```json
 {
@@ -183,6 +185,23 @@ Images are shared by every question in the request:
   "images": ["data:image/png;base64,iVBORw0KGgo..."]
 }
 ```
+
+The controller/OpenRouter form puts the image in the state content array;
+the engine hoists it, concatenates the text parts, and sends the image to the
+vision tower:
+
+```json
+{
+  "state": [
+    { "type": "text", "text": "An image from a catalogue." },
+    { "type": "image_url", "image_url": { "url": "data:image/jpeg;base64,..." } }
+  ],
+  "questions": { "object": { "type": "noul", "instructions": "Is the object held?" } }
+}
+```
+
+Both forms can be combined; top-level images precede state content images.
+`video_url` content is rejected with HTTP 400.
 
 Accepted formats are PNG, JPEG and WebP data URLs, up to 8 MB encoded, 16 MP
 source pixels, aspect ratio 200, 16 images, and 8,192 expanded vision tokens

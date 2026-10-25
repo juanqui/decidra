@@ -47,7 +47,7 @@ def square(color: str, width: int = 80, height: int = 60, mode: str = "RGB"):
     return image
 
 
-def post(url: str, state: str, images: list[str]):
+def post(url: str, state, images: list[str]):
     body = json.dumps(
         {"state": state, "questions": {"q": QUESTION}, "images": images}
     ).encode()
@@ -89,6 +89,16 @@ def main() -> None:
         args.url, state, [data_url(square("red"), "PNG"), data_url(square("blue"), "PNG")]
     )
     assert status == 200 and body["answers"]["q"]["choice"] in ("red", "blue"), body
+    checks += 1
+    status, body = post(
+        args.url,
+        [
+            {"type": "text", "text": state},
+            {"type": "image_url", "image_url": {"url": data_url(square("green"), "PNG")}},
+        ],
+        [],
+    )
+    assert status == 200 and body["answers"]["q"]["choice"] == "green", body
     checks += 1
     status, _ = post(args.url, state, ["data:image/png;base64,!!!!"])
     assert status == 400, status
