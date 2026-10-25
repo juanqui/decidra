@@ -311,3 +311,18 @@ The correctness-safe 16–31+48–63 combination measured **726.01 ms**, slower
 than the 708.91 ms accepted path. The only fast N=128 variant was the invalid
 K4 layout. N=128 is rejected: it is both a layout/quality risk and, in its
 validated K8 form, slower on this workload.
+
+### E20 — Mixed-state concurrency (baseline only)
+
+Eight distinct short states, eight questions each, c8, all states warmed:
+
+| trial | wall | throughput |
+|---|---:|---:|
+| 1 | 1,153 ms | 55.5 q/s |
+| 2 | 1,085 ms | 59.0 q/s |
+
+The single-state 64q c1 path is 73 q/s. The scheduler serializes state groups,
+so mixed-state traffic loses about 19% throughput even when every state is
+cached. Cross-state linear batching is the plausible remedy, but requires
+carrying per-row cache pointers through full attention and GDN. Not implemented
+in this pass; the measured gap is recorded as the follow-up target.
