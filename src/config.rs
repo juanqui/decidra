@@ -189,6 +189,42 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+impl Config {
+    /// Minimal in-process configuration for API and metrics tests.
+    pub(crate) fn for_test() -> Self {
+        Self {
+            bind_addr: "127.0.0.1:0".parse().expect("test bind address"),
+            model_id: "test/model".to_owned(),
+            checkpoint: PathBuf::from("/tmp/checkpoint"),
+            tokenizer: None,
+            native_model: PathBuf::from("/tmp/checkpoint"),
+            native_cache: true,
+            native_marlin: true,
+            native_fused_w4a16: true,
+            native_gdn_chunked: true,
+            native_gdn_chunked_min_seq: 16,
+            native_int8: true,
+            native_int8_clip: 1.0,
+            native_int8_group_scale: true,
+            native_int8_group_exclude: Vec::new(),
+            native_int8_exclude: Vec::new(),
+            native_int8_all_layers: "last:8".to_owned(),
+            native_gpu_embed: false,
+            metrics_enabled: true,
+            max_body_bytes: 1024,
+            max_queue: 4,
+            image_decode_concurrency: 2,
+            batch_requests: 2,
+            batch_rows: 8,
+            batch_window_us: 0,
+            state_cache_entries: 2,
+            state_cache_bytes: 1024 * 1024,
+            host_state_cache_bytes: 2 * 1024 * 1024,
+        }
+    }
+}
+
 fn list_env(name: &str, default: &str) -> Vec<String> {
     env_string(name)
         .unwrap_or_else(|| default.to_owned())

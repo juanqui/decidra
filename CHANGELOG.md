@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Replaced the placeholder `/metrics` endpoint with the reviewed Prometheus
+  contract in `docs/METRICS.md`: explicit text 0.0.4 content type, bounded
+  labels, `decidra_*` names, histogram buckets instead of the exporter's
+  default summaries, request/outcome coverage for admission and body-limit
+  rejections, queue/group/cache tier metrics, worker liveness, CUDA-event
+  capture/vision timing, and 5 s histogram upkeep. **Breaking:** `semel_*`
+  metric names are no longer emitted.
 - Publish per-architecture images (`sm89-latest`, `sm90-latest`,
   `sm120-latest`, plus `sm<arch>-<version>` and `sm<arch>-<sha>`); the
   unsuffixed tags remain SM89.

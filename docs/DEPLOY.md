@@ -158,7 +158,7 @@ copies the real cuBLAS/cuBLASLt files.
 | `DECIDRA_NATIVE_FP8` | off | SM120 approximate FP8 question GEMMs |
 | `DECIDRA_FP8_MODE` | `mlp` | `mlp`, `gate_up`, or `all_linear` |
 | `DECIDRA_FP8_MIN_ROWS` | `512` | FP8 question-row threshold |
-| `DECIDRA_METRICS_ENABLED` | `true` | Prometheus `/metrics` |
+| `DECIDRA_METRICS_ENABLED` | `true` | Prometheus `/metrics`; see `docs/METRICS.md` |
 
 ## Health
 
@@ -170,3 +170,13 @@ readout exists, and the state-once self-test agrees with the per-row block
 path. Image requests require a checkpoint with the BF16 `visual.*` tower.
 Images may be top-level `images` or `image_url` parts inside a `state` array;
 text-only checkpoints and videos return HTTP 400.
+
+## Metrics
+
+`GET /metrics` returns Prometheus text exposition 0.0.4. The endpoint is
+unauthenticated and should stay on the internal network. It bypasses the
+128-request admission gate and caches its rendered body for one second, so a
+saturated API can still be scraped. `DECIDRA_METRICS_ENABLED=false` returns
+404 and disables the recorder; remove or silence the scrape target at the same
+time because Prometheus will mark it `up=0`. The complete metric, label, query,
+and alert contract is in [`METRICS.md`](METRICS.md).

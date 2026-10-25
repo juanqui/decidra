@@ -4,19 +4,22 @@
 //! model-family switch. This server accepts only d3-turbo `prefix_bidir`
 //! packages with a separate F32 readout.
 
-use std::{sync::Arc, time::SystemTime};
+use std::{
+    sync::{Arc, Mutex, PoisonError},
+    time::{Duration, Instant, SystemTime},
+};
 
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Request, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, MatchedPath, Request, State},
+    http::{StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use metrics_exporter_prometheus::PrometheusHandle;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     backend::Backend,
@@ -31,6 +34,12 @@ pub struct AppState {
     pub backend: Arc<dyn Backend>,
     pub metrics: Option<PrometheusHandle>,
     request_slots: Arc<tokio::sync::Semaphore>,
+    metrics_cache: Arc<Mutex<Option<CachedMetrics>>>,
+}
+
+struct CachedMetrics {
+    at: Instant,
+    body: String,
 }
 
 impl AppState {
@@ -40,6 +49,7 @@ impl AppState {
             backend,
             metrics: None,
             request_slots: Arc::new(tokio::sync::Semaphore::new(128)),
+            metrics_cache: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -58,6 +68,8 @@ impl AppState {
             .route("/metrics", get(metrics_endpoint))
             .layer(DefaultBodyLimit::max(body_limit))
             .layer(middleware::from_fn_with_state(state.clone(), admit_request))
+            // Outermost: sees admission 503s and body-limit 413s.
+            .layer(middleware::from_fn(track_http))
             .with_state(state)
     }
 }
@@ -83,16 +95,61 @@ async fn models(State(state): State<AppState>) -> Json<Value> {
 }
 
 async fn metrics_endpoint(State(state): State<AppState>) -> Response {
-    match &state.metrics {
-        Some(handle) => (StatusCode::OK, handle.render()).into_response(),
-        None => (StatusCode::NOT_FOUND, "metrics disabled").into_response(),
+    let Some(handle) = &state.metrics else {
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "metrics disabled\n",
+        )
+            .into_response();
+    };
+    let mut cache = state
+        .metrics_cache
+        .lock()
+        .unwrap_or_else(|error: PoisonError<_>| error.into_inner());
+    if let Some(cached) = cache.as_ref() {
+        if cached.at.elapsed() < Duration::from_secs(1) {
+            return metrics_response(cached.body.clone());
+        }
     }
+    let mut body = handle.render();
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    *cache = Some(CachedMetrics {
+        at: Instant::now(),
+        body: body.clone(),
+    });
+    metrics_response(body)
+}
+
+fn metrics_response(body: String) -> Response {
+    (
+        StatusCode::OK,
+        [
+            (
+                header::CONTENT_TYPE,
+                "text/plain; version=0.0.4; charset=utf-8",
+            ),
+            (header::CACHE_CONTROL, "no-store"),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 /// Bound in-flight requests before the body extractor allocates up to the
 /// 64 MiB body limit. Image waiters retain their parsed bodies, so this is the
-/// outer memory-admission gate; the 64 decoder slots queue behind it.
+/// outer memory-admission gate; decoder slots queue behind it. `/metrics` must
+/// stay scrapeable when the API is saturated, so it bypasses the gate.
 async fn admit_request(State(state): State<AppState>, request: Request, next: Next) -> Response {
+    if request
+        .extensions()
+        .get::<MatchedPath>()
+        .is_some_and(|path| path.as_str() == "/metrics")
+    {
+        return next.run(request).await;
+    }
     let permit = match state.request_slots.clone().try_acquire_owned() {
         Ok(permit) => permit,
         Err(_) => {
@@ -107,32 +164,229 @@ async fn admit_request(State(state): State<AppState>, request: Request, next: Ne
     response
 }
 
-async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
-    let parsed: Value = match serde_json::from_slice(&body) {
-        Ok(value) => value,
-        Err(_) => {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "send a JSON body with state and questions",
-            );
+#[derive(Clone, Copy)]
+enum Outcome {
+    Success,
+    InvalidRequest,
+    Unsupported,
+    Overloaded,
+    Timeout,
+    BackendError,
+    InternalError,
+}
+
+impl Outcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Success => "success",
+            Self::InvalidRequest => "invalid_request",
+            Self::Unsupported => "unsupported",
+            Self::Overloaded => "overloaded",
+            Self::Timeout => "timeout",
+            Self::BackendError => "backend_error",
+            Self::InternalError => "internal_error",
         }
+    }
+
+    fn from_status(status: StatusCode) -> Self {
+        match status {
+            StatusCode::OK => Self::Success,
+            StatusCode::BAD_REQUEST | StatusCode::PAYLOAD_TOO_LARGE => Self::InvalidRequest,
+            StatusCode::SERVICE_UNAVAILABLE => Self::Overloaded,
+            StatusCode::GATEWAY_TIMEOUT => Self::Timeout,
+            StatusCode::BAD_GATEWAY => Self::BackendError,
+            other if other.is_server_error() => Self::InternalError,
+            _ => Self::InternalError,
+        }
+    }
+}
+
+struct InFlightGuard {
+    route: String,
+}
+
+impl InFlightGuard {
+    fn new(route: String) -> Self {
+        metrics::gauge!(
+            "decidra_http_requests_in_flight",
+            "route" => route.clone()
+        )
+        .increment(1.0);
+        Self { route }
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        metrics::gauge!(
+            "decidra_http_requests_in_flight",
+            "route" => self.route.clone()
+        )
+        .decrement(1.0);
+    }
+}
+
+fn method_label(method: &axum::http::Method) -> String {
+    match method.as_str() {
+        "GET" | "POST" | "HEAD" | "OPTIONS" => method.as_str().to_owned(),
+        _ => "other".to_owned(),
+    }
+}
+
+async fn track_http(request: Request, next: Next) -> Response {
+    let method = method_label(request.method());
+    let route = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|path| path.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".to_owned());
+    if route == "/metrics" {
+        return next.run(request).await;
+    }
+    let _in_flight = InFlightGuard::new(route.clone());
+    let started = Instant::now();
+    let response = next.run(request).await;
+    let status = response.status().as_u16().to_string();
+    metrics::counter!(
+        "decidra_http_requests_total",
+        "method" => method.clone(),
+        "route" => route.clone(),
+        "status" => status
+    )
+    .increment(1);
+    metrics::histogram!(
+        "decidra_http_request_duration_seconds",
+        "method" => method.clone(),
+        "route" => route.clone()
+    )
+    .record(started.elapsed().as_secs_f64());
+    if route == "/v1/systemone" && method == "POST" {
+        let outcome = response
+            .extensions()
+            .get::<Outcome>()
+            .copied()
+            .unwrap_or_else(|| Outcome::from_status(response.status()));
+        metrics::counter!(
+            "decidra_systemone_requests_total",
+            "outcome" => outcome.as_str()
+        )
+        .increment(1);
+        metrics::histogram!(
+            "decidra_systemone_request_duration_seconds",
+            "outcome" => outcome.as_str()
+        )
+        .record(started.elapsed().as_secs_f64());
+    }
+    response
+}
+
+async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
+    let (mut response, outcome) = match parse_systemone(&body) {
+        Ok((state_value, questions, images)) => {
+            match state
+                .backend
+                .d3_answers(&state_value, &questions, images)
+                .await
+            {
+                Ok(value) => (success_response(&state.config, value), Outcome::Success),
+                Err(error) => error_response(error),
+            }
+        }
+        Err(message) => (
+            error(StatusCode::BAD_REQUEST, message),
+            Outcome::InvalidRequest,
+        ),
     };
-    drop(body);
-    let body = parsed;
-    let Some(object) = body.as_object() else {
-        return error(StatusCode::BAD_REQUEST, "send a JSON object");
-    };
-    let Some(questions) = object.get("questions").and_then(Value::as_object) else {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "questions must be a non-empty object",
+    response.extensions_mut().insert(outcome);
+    response
+}
+
+fn success_response(config: &Config, mut value: Value) -> Response {
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "object".to_owned(),
+            Value::String("structured_decision".to_owned()),
         );
-    };
+        object.insert("model".to_owned(), Value::String(config.model_id.clone()));
+        object.insert(
+            "created".to_owned(),
+            Value::from(
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .map(|duration| duration.as_secs())
+                    .unwrap_or(0),
+            ),
+        );
+    }
+    Json(value).into_response()
+}
+
+fn error_response(failure: EngineError) -> (Response, Outcome) {
+    match failure {
+        EngineError::Config(message) => (
+            error(StatusCode::BAD_REQUEST, message),
+            Outcome::InvalidRequest,
+        ),
+        EngineError::Unsupported(message) => (
+            error(StatusCode::BAD_REQUEST, message),
+            Outcome::Unsupported,
+        ),
+        EngineError::Overloaded(message) => (
+            error(StatusCode::SERVICE_UNAVAILABLE, message),
+            Outcome::Overloaded,
+        ),
+        EngineError::Timeout(_) => (
+            error(StatusCode::GATEWAY_TIMEOUT, "d3-turbo request timed out"),
+            Outcome::Timeout,
+        ),
+        EngineError::Backend(message) => {
+            tracing::error!(%message, "d3-turbo backend failed");
+            if message.contains("memory") || message.contains("out of capacity") {
+                (
+                    error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "d3-turbo is out of capacity",
+                    ),
+                    Outcome::Overloaded,
+                )
+            } else {
+                (
+                    error(StatusCode::BAD_GATEWAY, "d3-turbo backend failed"),
+                    Outcome::BackendError,
+                )
+            }
+        }
+        EngineError::BadResponse(message) => {
+            tracing::error!(%message, "d3-turbo returned an invalid response");
+            (
+                error(StatusCode::BAD_GATEWAY, "d3-turbo backend failed"),
+                Outcome::BackendError,
+            )
+        }
+        EngineError::Internal(message) => {
+            tracing::error!(%message, "d3-turbo internal error");
+            (
+                error(StatusCode::INTERNAL_SERVER_ERROR, "internal error"),
+                Outcome::InternalError,
+            )
+        }
+    }
+}
+
+type ParsedSystemone = (Value, Map<String, Value>, Vec<String>);
+
+fn parse_systemone(body: &[u8]) -> Result<ParsedSystemone, String> {
+    let parsed: Value = serde_json::from_slice(body)
+        .map_err(|_| "send a JSON body with state and questions".to_owned())?;
+    let object = parsed
+        .as_object()
+        .ok_or_else(|| "send a JSON object".to_owned())?;
+    let questions = object
+        .get("questions")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "questions must be a non-empty object".to_owned())?;
     if questions.is_empty() {
-        return error(
-            StatusCode::BAD_REQUEST,
-            "questions must be a non-empty object",
-        );
+        return Err("questions must be a non-empty object".to_owned());
     }
     let mut state_value = object
         .get("state")
@@ -142,97 +396,28 @@ async fn systemone(State(state): State<AppState>, body: Bytes) -> Response {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(values)) => {
             if values.len() > MAX_IMAGES {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    format!("at most {MAX_IMAGES} images per request"),
-                );
+                return Err(format!("at most {MAX_IMAGES} images per request"));
             }
             let max_encoded = MAX_ENCODED.saturating_mul(4).div_ceil(3) + 128;
             let mut out = Vec::with_capacity(values.len());
             for (i, value) in values.iter().enumerate() {
                 let Some(value) = value.as_str() else {
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        format!("images[{i}] must be a data URL string"),
-                    );
+                    return Err(format!("images[{i}] must be a data URL string"));
                 };
                 if value.len() > max_encoded {
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        format!("images[{i}] exceeds the encoded image limit"),
-                    );
+                    return Err(format!("images[{i}] exceeds the encoded image limit"));
                 }
                 out.push(value.to_owned());
             }
             out
         }
-        Some(_) => return error(StatusCode::BAD_REQUEST, "images must be an array"),
+        Some(_) => return Err("images must be an array".to_owned()),
     };
-    if let Err(detail) = extract_state_images(&mut state_value, &mut images) {
-        return error(StatusCode::BAD_REQUEST, detail);
-    }
+    extract_state_images(&mut state_value, &mut images)?;
     if images.len() > MAX_IMAGES {
-        return error(
-            StatusCode::BAD_REQUEST,
-            format!("at most {MAX_IMAGES} images per request"),
-        );
+        return Err(format!("at most {MAX_IMAGES} images per request"));
     }
-
-    metrics::counter!("decidra_systemone_requests_total").increment(1);
-    match state
-        .backend
-        .d3_answers(&state_value, questions, images)
-        .await
-    {
-        Ok(mut value) => {
-            if let Some(object) = value.as_object_mut() {
-                object.insert(
-                    "object".to_owned(),
-                    Value::String("structured_decision".to_owned()),
-                );
-                object.insert(
-                    "model".to_owned(),
-                    Value::String(state.config.model_id.clone()),
-                );
-                object.insert(
-                    "created".to_owned(),
-                    Value::from(
-                        SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .map(|d| d.as_secs())
-                            .unwrap_or(0),
-                    ),
-                );
-            }
-            Json(value).into_response()
-        }
-        Err(EngineError::Config(message)) | Err(EngineError::Unsupported(message)) => {
-            error(StatusCode::BAD_REQUEST, message)
-        }
-        Err(EngineError::Overloaded(message)) => error(StatusCode::SERVICE_UNAVAILABLE, message),
-        Err(EngineError::Timeout(_)) => {
-            error(StatusCode::GATEWAY_TIMEOUT, "d3-turbo request timed out")
-        }
-        Err(EngineError::Backend(message)) => {
-            tracing::error!(%message, "d3-turbo backend failed");
-            if message.contains("memory") || message.contains("out of capacity") {
-                error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "d3-turbo is out of capacity",
-                )
-            } else {
-                error(StatusCode::BAD_GATEWAY, "d3-turbo backend failed")
-            }
-        }
-        Err(EngineError::BadResponse(message)) => {
-            tracing::error!(%message, "d3-turbo returned an invalid response");
-            error(StatusCode::BAD_GATEWAY, "d3-turbo backend failed")
-        }
-        Err(EngineError::Internal(message)) => {
-            tracing::error!(%message, "d3-turbo internal error");
-            error(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
-        }
-    }
+    Ok((state_value, questions.clone(), images))
 }
 
 /// OpenRouter/System One content parts may carry images inside `state`:
@@ -310,8 +495,147 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_state_images;
-    use serde_json::json;
+    use super::{AppState, extract_state_images};
+    use crate::{
+        backend::MockBackend,
+        config::Config,
+        telemetry::{self, BuildInfo},
+    };
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode, header},
+    };
+    use serde_json::{Value, json};
+    use std::sync::{Arc, LazyLock};
+    use tower::ServiceExt;
+
+    static METRICS: LazyLock<metrics_exporter_prometheus::PrometheusHandle> = LazyLock::new(|| {
+        telemetry::install(
+            &Config::for_test(),
+            &BuildInfo {
+                version: "test",
+                profile: "debug",
+                compiled_arch: "sm_89".to_owned(),
+                native: false,
+            },
+        )
+        .expect("installing test metrics recorder")
+    });
+
+    fn metrics_handle() -> &'static metrics_exporter_prometheus::PrometheusHandle {
+        &METRICS
+    }
+
+    fn state(max_body_bytes: usize, metrics: bool) -> AppState {
+        let mut config = Config::for_test();
+        config.max_body_bytes = max_body_bytes;
+        let backend = Arc::new(MockBackend::new(json!({
+            "choice": "yes",
+            "noul": 0.9,
+            "score": 1.0,
+        })));
+        let state = AppState::new(config, backend);
+        if metrics {
+            state.with_metrics(metrics_handle().clone())
+        } else {
+            state
+        }
+    }
+
+    async fn send(
+        router: axum::Router,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> axum::response::Response {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                body.map_or_else(String::new, |body| body.to_string()),
+            ))
+            .expect("test request");
+        router.oneshot(request).await.expect("router response")
+    }
+
+    async fn text(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        String::from_utf8(bytes.to_vec()).expect("utf-8 response")
+    }
+
+    #[tokio::test]
+    async fn metrics_contract_covers_success_invalid_body_limit_and_admission() {
+        let valid = json!({"state": "ok", "questions": {"q": {"type": "noul"}}});
+
+        let router = state(1024, true).router();
+        let response = send(router.clone(), "POST", "/v1/systemone", Some(valid.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = send(router.clone(), "GET", "/metrics", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/plain; version=0.0.4; charset=utf-8"
+        );
+        let exposition = text(response).await;
+        let cached = text(send(router, "GET", "/metrics", None).await).await;
+        assert_eq!(
+            exposition, cached,
+            "the one-second scrape cache should single-flight"
+        );
+        assert!(exposition.contains(
+            "decidra_systemone_requests_total{model_name=\"test/model\",outcome=\"success\"}"
+        ));
+        assert!(exposition.contains("route=\"/v1/systemone\""));
+        assert!(exposition.contains("status=\"200\""));
+        assert!(exposition.contains("decidra_systemone_request_duration_seconds_count"));
+        assert!(!exposition.contains("route=\"/metrics\""));
+        assert!(exposition.contains("decidra_engine_worker_alive"));
+
+        let router = state(1024, true).router();
+        let response = send(router.clone(), "POST", "/v1/systemone", Some(json!({}))).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let exposition = text(send(router, "GET", "/metrics", None).await).await;
+        assert!(exposition.contains("outcome=\"invalid_request\""));
+
+        let router = state(16, true).router();
+        let response = send(
+            router.clone(),
+            "POST",
+            "/v1/systemone",
+            Some(json!({"state": "x".repeat(64), "questions": {"q": {}}})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let exposition = text(send(router, "GET", "/metrics", None).await).await;
+        assert!(exposition.contains("outcome=\"invalid_request\""));
+
+        let admission_state = state(1024, true);
+        let mut held = Vec::new();
+        for _ in 0..128 {
+            held.push(
+                admission_state
+                    .request_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("test request slot"),
+            );
+        }
+        let router = admission_state.router();
+        let response = send(router.clone(), "POST", "/v1/systemone", Some(valid)).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let response = send(router, "GET", "/metrics", None).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let exposition = text(response).await;
+        assert!(exposition.contains("outcome=\"overloaded\""));
+        drop(held);
+
+        let router = state(1024, false).router();
+        let response = send(router, "GET", "/metrics", None).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
 
     #[test]
     fn state_content_parts_hoist_images_and_join_text() {

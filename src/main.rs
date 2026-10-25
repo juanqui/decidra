@@ -142,18 +142,32 @@ async fn native_check() -> Result<()> {
 
 async fn serve() -> Result<()> {
     let config = Config::from_env()?;
+    let build = telemetry::BuildInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        profile: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+        compiled_arch: compiled_arch(),
+        native: cfg!(feature = "native"),
+    };
+    // Install before the engine loads so startup work and zero-init series are
+    // visible from the first scrape.
+    let metrics = if config.metrics_enabled {
+        Some(telemetry::install(&config, &build)?)
+    } else {
+        None
+    };
     let load_config = config.clone();
     let backend = tokio::task::spawn_blocking(move || load_native(load_config))
         .await
         .context("native backend loader task failed")??;
-    let metrics = if config.metrics_enabled {
-        Some(telemetry::install_recorder()?)
-    } else {
-        None
-    };
     let mut state = AppState::new(config.clone(), backend);
+    let mut upkeep = None;
     if let Some(handle) = metrics {
-        state = state.with_metrics(handle);
+        state = state.with_metrics(handle.clone());
+        upkeep = Some(telemetry::spawn_upkeep(handle));
     }
 
     tracing::info!(
@@ -167,10 +181,27 @@ async fn serve() -> Result<()> {
     let listener = TcpListener::bind(config.bind_addr)
         .await
         .map_err(|error| anyhow::anyhow!("binding {}: {error}", config.bind_addr))?;
-    axum::serve(listener, state.router())
+    let result = axum::serve(listener, state.router())
         .with_graceful_shutdown(shutdown_signal())
-        .await?;
+        .await;
+    if let Some(upkeep) = upkeep {
+        upkeep.abort();
+    }
+    result?;
     Ok(())
+}
+
+fn compiled_arch() -> String {
+    #[cfg(feature = "native")]
+    {
+        decidra_native::arch::GpuArch::from_compile_arch(decidra_native::COMPILED_ARCH)
+            .map(|arch| arch.arch_label())
+            .unwrap_or_else(|| "unknown".to_owned())
+    }
+    #[cfg(not(feature = "native"))]
+    {
+        "none".to_owned()
+    }
 }
 
 async fn shutdown_signal() {

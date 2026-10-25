@@ -4,7 +4,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use cudarc::cublas::CudaBlas;
 use cudarc::cublaslt::safe::CudaBlasLT;
-use cudarc::driver::{CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, sys};
+use cudarc::driver::{
+    CudaContext, CudaEvent, CudaFunction, CudaModule, CudaSlice, CudaStream, sys,
+};
 use cudarc::nvrtc::Ptx;
 
 use crate::arch::{ArchProfile, GpuArch};
@@ -145,5 +147,43 @@ impl Gpu {
         self.ctx
             .compute_capability()
             .context("querying compute capability")
+    }
+
+    /// Start a timing-enabled event pair on the default stream. The end event
+    /// is recorded later with [`PhaseTimer::stop`].
+    pub fn phase_timer(&self) -> Result<PhaseTimer> {
+        let flags = Some(sys::CUevent_flags::CU_EVENT_DEFAULT);
+        let start = self
+            .ctx
+            .new_event(flags)
+            .context("creating phase start event")?;
+        start
+            .record(&self.stream)
+            .context("recording phase start")?;
+        let end = self
+            .ctx
+            .new_event(flags)
+            .context("creating phase end event")?;
+        Ok(PhaseTimer { start, end })
+    }
+}
+
+/// CUDA-event timer for an asynchronous phase (capture, vision, restore).
+/// `seconds` is valid once the stream has synchronized past the end event.
+pub struct PhaseTimer {
+    start: CudaEvent,
+    end: CudaEvent,
+}
+
+impl PhaseTimer {
+    pub fn stop(&mut self, gpu: &Gpu) -> Result<()> {
+        self.end.record(&gpu.stream).context("recording phase end")
+    }
+
+    pub fn seconds(&self) -> Result<f64> {
+        self.start
+            .elapsed_ms(&self.end)
+            .map(|ms| f64::from(ms) / 1000.0)
+            .context("reading phase timer")
     }
 }

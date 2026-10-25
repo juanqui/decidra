@@ -22,3 +22,7 @@ pub mod vision;
 pub mod weights;
 
 pub use engine::{Engine, HostStateCache, LogitsOpts, Stage};
+
+/// CUDA architecture this binary was compiled for (`sm_89`, `sm_90`, `sm_120`,
+/// optionally with an `a` suffix).
+pub const COMPILED_ARCH: &str = env!("DECIDRA_COMPILED_ARCH");

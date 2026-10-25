@@ -57,6 +57,18 @@ impl GpuArch {
         }
     }
 
+    /// Normalized build/runtime label used in metrics (`sm_89`, `sm_120`, ...).
+    /// This is deliberately distinct from [`Self::label`], which is for logs.
+    pub fn arch_label(self) -> String {
+        match self {
+            Self::Sm80 => "sm_80".to_owned(),
+            Self::Sm89 => "sm_89".to_owned(),
+            Self::Sm90 => "sm_90".to_owned(),
+            Self::Sm120 => "sm_120".to_owned(),
+            Self::Other { major, minor } => format!("sm_{major}{minor}"),
+        }
+    }
+
     pub fn profile(self, sms: usize) -> ArchProfile {
         match self {
             Self::Sm80 => sm89::profile(self, sms),

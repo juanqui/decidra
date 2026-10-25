@@ -138,9 +138,9 @@ question pass allocate several per-token scratch buffers in addition to K/V.
 State capture also forces scratch buffers to be released as they are dropped
 for the duration of the capture; retaining them made a 12,192-token state
 exceed 24 GiB while a 12,288-token state passed only because it crossed the old
-low-memory cutoff. A real state-capture or question-pass OOM gets one trim-and-retry attempt. The state cache, host cache, and free-VRAM gauges are
-exported as `semel_state_cache_*`, `semel_host_cache_states`, and
-`semel_gpu_free_bytes`.
+low-memory cutoff. A real state-capture or question-pass OOM gets one trim-and-retry attempt. Prometheus exports the state cache, host cache, queue,
+group, phase, and free-VRAM signals as the `decidra_*` contract in
+[`METRICS.md`](METRICS.md); the previous `semel_*` names are gone.
 
 ## 4. Quantization
 
@@ -341,7 +341,9 @@ Scheduler work: question suffixes are tokenized separately after the first
 question (64q tokenization 95→7 ms), a 32-row budget improves 16q c8 p50 from
 1.60→1.15 s without changing q/s, tokenization runs on the blocking pool, the
 cuBLAS handle is rebound on the CUDA worker (fixes libcublasLt segfaults under
-c16/c32), and `/metrics` exposes tokenize/queue/group/pass/cache counters.
+c16/c32), and `/metrics` exposes the request, queue, group, capture/pass,
+cache-tier, worker-health, and GPU-memory contract documented in
+[`METRICS.md`](METRICS.md).
 
 On one **H200 (143 GB, SM90)** with the published BF16 package, native
 state-once (FA2 cascade) vs vLLM-SR 0.2.0 engine mode (same package, same H200,

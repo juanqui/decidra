@@ -245,7 +245,7 @@ with a different image never reuses K/V state.
 | `POST /v1/systemone` | typed decisions |
 | `GET /health` | readiness and model identity |
 | `GET /v1/models` | model metadata |
-| `GET /metrics` | Prometheus metrics |
+| `GET /metrics` | Prometheus text 0.0.4; see [docs/METRICS.md](docs/METRICS.md) |
 
 Limits: 64 questions per request, 32,768 tokens per question’s state + block,
 1 MiB rendered state and 1 MiB per question; 64 MiB request body. Image
@@ -333,7 +333,7 @@ The image and compose file carry production defaults. The most important knobs:
 | `DECIDRA_NATIVE_FP8` | off | SM120 approximate FP8 GEMMs |
 | `DECIDRA_FP8_MODE` | `mlp` | `mlp`, `gate_up`, or `all_linear` |
 | `DECIDRA_FP8_MIN_ROWS` | `512` | FP8 question-row threshold; capture stays BF16 |
-| `DECIDRA_METRICS_ENABLED` | `true` | Prometheus `/metrics` |
+| `DECIDRA_METRICS_ENABLED` | `true` | Prometheus `/metrics`; contract in [docs/METRICS.md](docs/METRICS.md) |
 
 See [docs/DEPLOY.md](docs/DEPLOY.md) for the full environment reference, H100
 and RTX PRO 6000 settings, and operational notes.

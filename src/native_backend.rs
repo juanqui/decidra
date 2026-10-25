@@ -22,6 +22,7 @@ use crate::{
     d3::ImageLayout,
     error::EngineError,
     image_media::{ImageMedia, MAX_IMAGE_TOKENS, MAX_IMAGES},
+    telemetry::{self, EngineInfo, GpuInfo},
 };
 
 #[derive(Clone)]
@@ -122,6 +123,41 @@ impl NativeBackend {
 
         self_test(&engine, &tokenizer, &d3)?;
         let supports_vision = engine.supports_vision();
+        let gpu_name = match engine.gpu.device_name() {
+            Ok(name) => name,
+            Err(error) => {
+                tracing::warn!(%error, "metrics: failed to read GPU name");
+                "unknown".to_owned()
+            }
+        };
+        let compute_capability = match engine.gpu.compute_capability() {
+            Ok((major, minor)) => format!("{major}.{minor}"),
+            Err(error) => {
+                tracing::warn!(%error, "metrics: failed to read compute capability");
+                "unknown".to_owned()
+            }
+        };
+        telemetry::record_engine_info(
+            &EngineInfo {
+                attention_mode: "prefix_bidir",
+                quantization: quantization_label(config),
+                vision: supports_vision,
+                gpu_embed: config.native_gpu_embed,
+                gdn_chunked: config.native_gdn_chunked,
+                weights_cached: config.native_cache,
+            },
+            &GpuInfo {
+                device: "0",
+                name: gpu_name,
+                arch: engine.gpu.arch.arch_label(),
+                sms: engine.gpu.sms,
+                compute_capability,
+            },
+        );
+        match engine.gpu.mem_info() {
+            Ok((free, total)) => telemetry::set_gpu_memory(free, total),
+            Err(error) => tracing::warn!(%error, "metrics: failed to read GPU memory"),
+        }
         let queue = BatchHandle::spawn(
             engine,
             config.max_queue,
@@ -139,6 +175,22 @@ impl NativeBackend {
             supports_vision,
             image_slots: Arc::new(tokio::sync::Semaphore::new(config.image_decode_concurrency)),
         })
+    }
+}
+
+fn quantization_label(config: &Config) -> &'static str {
+    if config.native_marlin && config.native_int8 {
+        if config.native_int8_group_scale {
+            "w4a8_g64"
+        } else {
+            "w4a8"
+        }
+    } else if config.native_marlin {
+        "w4a16"
+    } else if config.native_fused_w4a16 {
+        "w4a16_fused"
+    } else {
+        "bf16"
     }
 }
 
@@ -428,6 +480,7 @@ impl NativeBackend {
                 "this checkpoint has no vision tower; image inputs are unavailable".to_owned(),
             ));
         }
+        metrics::histogram!("decidra_request_images").record(raw_images.len() as f64);
         let image_slot = if raw_images.is_empty() {
             None
         } else {
@@ -438,6 +491,11 @@ impl NativeBackend {
                 )
                 .await
                 .map_err(|_| {
+                    metrics::counter!(
+                        "decidra_engine_admission_rejections_total",
+                        "reason" => "image_busy"
+                    )
+                    .increment(1);
                     EngineError::Overloaded(
                         "image decoder queue is saturated; retry shortly".to_owned(),
                     )
@@ -445,7 +503,7 @@ impl NativeBackend {
                 .map_err(|_| EngineError::Internal("image decoder stopped".to_owned()))?,
             )
         };
-        let prepared = tokio::task::spawn_blocking(move || {
+        let prepared_result = tokio::task::spawn_blocking(move || {
             // The permit lives in the blocking task: client cancellation must
             // not release a decoder slot while the decode is still running.
             let _image_slot = image_slot;
@@ -457,7 +515,11 @@ impl NativeBackend {
             let mut images = Vec::with_capacity(raw_images.len());
             let mut image_tokens = 0usize;
             for (i, value) in raw_images.iter().enumerate() {
-                let image = crate::image_media::decode_data_url(value)
+                let decode_started = Instant::now();
+                let decoded = crate::image_media::decode_data_url(value);
+                metrics::histogram!("decidra_image_decode_seconds")
+                    .record(decode_started.elapsed().as_secs_f64());
+                let image = decoded
                     .map_err(|error| EngineError::Config(format!("images[{i}]: {error}")))?;
                 image_tokens += image.tokens();
                 if image_tokens > MAX_IMAGE_TOKENS {
@@ -469,16 +531,22 @@ impl NativeBackend {
             }
             prepare_request(&tokenizer, &codes, &state, &questions_for_prepare, images)
         })
-        .await
-        .map_err(|error| EngineError::Internal(format!("tokenizer task failed: {error}")))??;
+        .await;
+        metrics::histogram!("decidra_request_tokenize_seconds")
+            .record(tokenize_started.elapsed().as_secs_f64());
+        let prepared = prepared_result
+            .map_err(|error| EngineError::Internal(format!("tokenizer task failed: {error}")))??;
         let tokenize_ms = tokenize_started.elapsed().as_secs_f64() * 1e3;
         let state_token_count = prepared.state_ids.len();
         let question_token_count = prepared.question_token_count;
         let block_count = prepared.blocks.len();
+        metrics::histogram!("decidra_request_state_tokens").record(state_token_count as f64);
+        metrics::histogram!("decidra_request_question_tokens").record(question_token_count as f64);
+        metrics::histogram!("decidra_request_questions").record(block_count as f64);
         let counts = prepared.counts;
         let usage = prepared.usage;
         let submit_started = Instant::now();
-        let receiver = self
+        let receiver = match self
             .queue
             .submit_state_once(
                 prepared.state_ids,
@@ -489,17 +557,34 @@ impl NativeBackend {
                 prepared.digest,
             )
             .await
-            .map_err(|error| match error {
-                EngineError::Overloaded(message) => EngineError::Overloaded(message),
-                other => EngineError::Internal(other.to_string()),
-            })?;
+        {
+            Ok(receiver) => receiver,
+            Err(error) => {
+                metrics::histogram!("decidra_request_engine_seconds")
+                    .record(submit_started.elapsed().as_secs_f64());
+                return Err(match error {
+                    EngineError::Overloaded(message) => EngineError::Overloaded(message),
+                    other => EngineError::Internal(other.to_string()),
+                });
+            }
+        };
         let queue_submit_ms = submit_started.elapsed().as_secs_f64() * 1e3;
-        let rows = receiver
-            .await
-            .map_err(|_| EngineError::Internal("d3 CUDA worker dropped the reply".to_owned()))?
-            .map_err(EngineError::Backend)?;
-        metrics::counter!("semel_requests_total").increment(1);
-        metrics::histogram!("semel_tokenize_seconds").record(tokenize_ms / 1e3);
+        let reply = receiver.await;
+        metrics::histogram!("decidra_request_engine_seconds")
+            .record(submit_started.elapsed().as_secs_f64());
+        let rows = match reply {
+            Ok(rows) => rows.map_err(EngineError::Backend)?,
+            Err(_) => {
+                metrics::counter!(
+                    "decidra_engine_failures_total",
+                    "stage" => "scheduler"
+                )
+                .increment(1);
+                return Err(EngineError::Internal(
+                    "d3 CUDA worker dropped the reply".to_owned(),
+                ));
+            }
+        };
         tracing::debug!(
             questions = block_count,
             state_tokens = state_token_count,

@@ -38,6 +38,9 @@ blake3 = "1"
 half = "2"
 fast_image_resize = "6.1"
 
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

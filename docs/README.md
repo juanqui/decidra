@@ -9,6 +9,8 @@ Start with the [project README](../README.md) for the quick start and API.
 | [ENGINE.md](ENGINE.md) | `prefix_bidir` semantics, state cache, kernels, correctness invariants |
 | [BENCHMARKS.md](BENCHMARKS.md) | full latency/throughput matrices, profiles, correctness gates |
 | [DEPLOY.md](DEPLOY.md) | build, Docker, operations, environment reference |
+| [METRICS.md](METRICS.md) | Prometheus metric catalog, labels, queries, and alerts |
+| [ops/tinylife-decidra-metrics.md](ops/tinylife-decidra-metrics.md) | tinylife Prometheus/Grafana integration and verification |
 | [../CHANGELOG.md](../CHANGELOG.md) | release history |
 
 ## Development
@@ -24,6 +26,7 @@ Start with the [project README](../README.md) for the quick start and API.
 | document | contents |
 |---|---|
 | [specs/2026-10-21-d3turbo-state-once.md](specs/2026-10-21-d3turbo-state-once.md) | dated state-once design and review record |
+| [specs/2026-10-24-prometheus-metrics.md](specs/2026-10-24-prometheus-metrics.md) | Prometheus metrics design, catalog, and four-pass review log |
 
 ## Research
 

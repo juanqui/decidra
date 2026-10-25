@@ -394,6 +394,7 @@ dependencies = [
  "thiserror",
  "tokenizers",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
